@@ -14,6 +14,9 @@
 //! and, when it returns `true`, drains `Rpc::try_recv()` and redraws. The 33 ms
 //! tick stays for everything else.
 
-// Nothing outside the tests consumes the client until the session wiring lands.
+// Nothing outside the tests consumes the client or the grid until the session
+// wiring lands.
+#[allow(dead_code)]
+pub mod grid;
 #[allow(dead_code)]
 pub mod rpc;
