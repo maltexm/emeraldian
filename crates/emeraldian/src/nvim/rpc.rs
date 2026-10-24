@@ -14,10 +14,14 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
+
+/// Bytes that may wait for a stalled nvim before further calls are refused.
+/// A single frame larger than this is still accepted when nothing else waits.
+const MAX_QUEUED: usize = 8 * 1024 * 1024;
 
 /// Lines of nvim stderr kept for error messages.
 const STDERR_LINES: usize = 50;
@@ -87,7 +91,10 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 
 pub struct Rpc {
     child: Arc<Mutex<Child>>,
-    stdin: Mutex<Option<ChildStdin>>,
+    /// Frames for the writer thread, which owns stdin. `None` once dropped.
+    out: Option<Sender<Vec<u8>>>,
+    /// Bytes handed to the writer thread and not yet written.
+    queued: Arc<AtomicUsize>,
     shared: Arc<Shared>,
     next_id: AtomicU64,
     incoming: Mutex<Receiver<Incoming>>,
@@ -137,6 +144,14 @@ impl Rpc {
                 .name("nvim-stderr".into())
                 .spawn(move || drain_stderr(stderr, &shared))?;
         }
+        let (out, frames) = mpsc::channel();
+        let queued = Arc::new(AtomicUsize::new(0));
+        {
+            let queued = Arc::clone(&queued);
+            std::thread::Builder::new()
+                .name("nvim-write".into())
+                .spawn(move || writer_loop(stdin, &frames, &queued))?;
+        }
         {
             let shared = Arc::clone(&shared);
             let child = Arc::clone(&child);
@@ -148,7 +163,8 @@ impl Rpc {
 
         Ok(Rpc {
             child,
-            stdin: Mutex::new(Some(stdin)),
+            out: Some(out),
+            queued,
             shared,
             next_id: AtomicU64::new(0),
             incoming: Mutex::new(rx),
@@ -256,12 +272,23 @@ impl Rpc {
     fn write(&self, msg: &Value) -> Result<()> {
         let mut buf = Vec::new();
         rmpv::encode::write_value(&mut buf, msg)?;
-        let mut guard = lock(&self.stdin);
-        let stdin = guard.as_mut().ok_or_else(|| anyhow!(self.closed_error()))?;
-        stdin
-            .write_all(&buf)
-            .and_then(|()| stdin.flush())
-            .map_err(|e| anyhow!("{} ({e})", self.closed_error()))
+        let Some(out) = &self.out else {
+            bail!(self.closed_error());
+        };
+        // Never write here: a stalled nvim would block the caller. The writer
+        // thread owns stdin and sends each frame whole, so abandoning a call
+        // (timeout) never leaves half a frame in the stream.
+        let len = buf.len();
+        let before = self.queued.fetch_add(len, Ordering::AcqRel);
+        if before > 0 && before + len > MAX_QUEUED {
+            self.queued.fetch_sub(len, Ordering::AcqRel);
+            bail!("nvim is not accepting input ({before} bytes waiting)");
+        }
+        if out.send(buf).is_err() {
+            self.queued.fetch_sub(len, Ordering::AcqRel);
+            bail!(self.closed_error());
+        }
+        Ok(())
     }
 
     fn forget(&self, id: u64) {
@@ -282,12 +309,27 @@ impl Rpc {
 
 impl Drop for Rpc {
     fn drop(&mut self) {
-        // Closing stdin lets a healthy nvim exit on its own; a stuck one is killed.
-        lock(&self.stdin).take();
+        // Dropping the sender lets the writer finish and close stdin, which
+        // lets a healthy nvim exit on its own; a stuck one is killed, and the
+        // kill also unblocks a writer stuck on a full pipe.
+        self.out.take();
         let mut child = lock(&self.child);
         if !matches!(child.try_wait(), Ok(Some(_))) {
             let _ = child.kill();
             let _ = child.wait();
+        }
+    }
+}
+
+/// Owns nvim's stdin and writes queued frames one after the other. It may block
+/// on a full pipe; nothing else waits for it, and killing nvim ends it with a
+/// broken pipe. After a write error it stops, so later sends fail.
+fn writer_loop(mut stdin: ChildStdin, frames: &Receiver<Vec<u8>>, queued: &AtomicUsize) {
+    while let Ok(frame) = frames.recv() {
+        let written = stdin.write_all(&frame);
+        queued.fetch_sub(frame.len(), Ordering::AcqRel);
+        if written.is_err() {
+            return;
         }
     }
 }

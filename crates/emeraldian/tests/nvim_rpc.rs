@@ -63,6 +63,64 @@ fn channel_id(rpc: &Rpc) -> i64 {
     info.as_array().unwrap()[0].as_i64().unwrap()
 }
 
+fn signal(pid: i64, sig: &str) {
+    std::process::Command::new("kill")
+        .args([sig, &pid.to_string()])
+        .status()
+        .expect("kill");
+}
+
+fn pid_of(rpc: &Rpc) -> i64 {
+    rpc.request("nvim_eval", vec![s("getpid()")], T)
+        .expect("pid")
+        .as_i64()
+        .unwrap()
+}
+
+/// Kills `pid` with SIGKILL after `after` unless dropped first, so a regression
+/// that blocks on a stalled child fails the test instead of hanging it.
+struct Watchdog {
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Watchdog {
+    fn new(pid: i64, after: Duration) -> Watchdog {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&cancel);
+        let handle = std::thread::spawn(move || {
+            let end = Instant::now() + after;
+            while Instant::now() < end {
+                if flag.load(Ordering::Acquire) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            signal(pid, "-9");
+        });
+        Watchdog {
+            cancel,
+            handle: Some(handle),
+        }
+    }
+}
+
+impl Drop for Watchdog {
+    fn drop(&mut self) {
+        self.cancel
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Larger than any pipe buffer (64 KiB by default on Linux).
+fn big() -> Value {
+    s(&"x".repeat(256 * 1024))
+}
+
 #[test]
 fn rpc_eval_returns_value() {
     let Some(rpc) = spawn() else { return };
@@ -324,4 +382,88 @@ fn rpc_stderr_is_kept_for_error_messages() {
     .expect("exit");
     let err = rpc.request("nvim_eval", vec![s("1")], T).unwrap_err();
     assert!(err.to_string().contains("boom"), "got: {err}");
+}
+
+#[test]
+fn rpc_request_times_out_when_stdin_is_full() {
+    let Some(rpc) = spawn() else { return };
+    let pid = pid_of(&rpc);
+    signal(pid, "-STOP");
+    let _dog = Watchdog::new(pid, Duration::from_millis(3000));
+    let started = Instant::now();
+    let err = rpc
+        .request("nvim_eval", vec![big()], Duration::from_millis(100))
+        .expect_err("stalled nvim cannot answer");
+    let took = started.elapsed();
+    assert!(err.to_string().contains("timed out"), "got: {err}");
+    assert!(took < Duration::from_millis(1000), "request took {took:?}");
+}
+
+#[test]
+fn rpc_notify_does_not_block_when_stdin_is_full() {
+    let Some(rpc) = spawn() else { return };
+    let pid = pid_of(&rpc);
+    signal(pid, "-STOP");
+    let _dog = Watchdog::new(pid, Duration::from_millis(3000));
+    let started = Instant::now();
+    rpc.notify("nvim_eval", vec![big()]).expect("queued");
+    rpc.respond(7, Ok(big())).expect("queued");
+    assert!(started.elapsed() < Duration::from_millis(500));
+}
+
+#[test]
+fn rpc_backlog_for_a_stalled_nvim_is_bounded() {
+    let Some(rpc) = spawn() else { return };
+    let pid = pid_of(&rpc);
+    signal(pid, "-STOP");
+    let _dog = Watchdog::new(pid, Duration::from_millis(4000));
+    let started = Instant::now();
+    let mut refused = None;
+    for n in 0..256 {
+        let payload = s(&"x".repeat(1024 * 1024));
+        if let Err(e) = rpc.notify("nvim_eval", vec![payload]) {
+            refused = Some((n, e.to_string()));
+            break;
+        }
+    }
+    let (n, msg) = refused.expect("a stalled nvim must eventually refuse more input");
+    assert!(n < 64, "accepted {n} MiB before refusing");
+    assert!(msg.contains("not accepting input"), "got: {msg}");
+    assert!(started.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn rpc_shutdown_is_bounded_when_stdin_is_full() {
+    let Some(rpc) = spawn() else { return };
+    let pid = pid_of(&rpc);
+    signal(pid, "-STOP");
+    let _dog = Watchdog::new(pid, Duration::from_millis(4000));
+    // Fill the pipe so the qall! queued by shutdown cannot be written either.
+    let started = Instant::now();
+    let _ = rpc.notify("nvim_eval", vec![big()]);
+    rpc.shutdown(Duration::from_millis(300));
+    let took = started.elapsed();
+    assert!(took < Duration::from_millis(1500), "shutdown took {took:?}");
+    assert!(
+        !Path::new(&format!("/proc/{pid}")).exists(),
+        "stalled nvim survived shutdown"
+    );
+}
+
+#[test]
+fn rpc_stream_stays_intact_after_a_timed_out_large_request() {
+    let Some(rpc) = spawn() else { return };
+    let pid = pid_of(&rpc);
+    signal(pid, "-STOP");
+    let _dog = Watchdog::new(pid, Duration::from_millis(6000));
+    let err = rpc
+        .request("nvim_eval", vec![big()], Duration::from_millis(100))
+        .expect_err("stalled");
+    assert!(err.to_string().contains("timed out"), "got: {err}");
+    signal(pid, "-CONT");
+    // The abandoned frame is still delivered whole, so the next call works.
+    let v = rpc
+        .request("nvim_eval", vec![s("1+1")], T)
+        .expect("stream corrupted by the abandoned request");
+    assert_eq!(v.as_i64(), Some(2));
 }
