@@ -24,6 +24,7 @@ mod session;
 mod slash;
 mod state;
 mod tools;
+mod tty;
 mod ui;
 mod vim;
 
@@ -43,6 +44,9 @@ use crate::config::Config;
 /// promptly; long enough that an idle app uses no measurable CPU, since the
 /// loop only redraws when something actually changed.
 const TICK: Duration = Duration::from_millis(33);
+
+/// How often the loop checks that the terminal is still raw.
+const TTY_CHECK_EVERY: Duration = Duration::from_millis(100);
 
 fn main() -> io::Result<()> {
     let raw: Vec<String> = std::env::args().skip(1).collect();
@@ -356,6 +360,14 @@ fn run(app: &mut App) -> io::Result<()> {
             app.config.images.protocol
         ));
     }
+    // Same reasoning as above: an unknown backend word would otherwise just
+    // be the built-in editor with no hint that the setting was ignored.
+    if let Some(word) = app.config.editor.backend_rejected.clone() {
+        app.error(format!(
+            "editor.backend = \"{word}\" is not an editor — using the built-in one. \
+             Try builtin or nvim."
+        ));
+    }
     // Last for the same reason: a shortcut that silently does nothing is
     // the bug this section exists to get people out of.
     if let Some(problem) = app.keymap.problems.first() {
@@ -467,6 +479,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Res
     // Only written when it changes: re-sending the escape on every frame makes
     // some terminals flicker the caret.
     let mut cursor_shape: Option<crossterm::cursor::SetCursorStyle> = None;
+    let mut last_tty_check = Instant::now();
 
     loop {
         // A settling graph animates and streamed agent text arrives between
@@ -491,6 +504,14 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Res
                 }
                 cursor_shape = wanted;
             }
+        }
+
+        // A late reply to the image probe cooks the terminal under the running
+        // UI (see `tty`). Looking is one syscall, so do it a few times a second
+        // for the whole session: the reply can be arbitrarily late.
+        if last_tty_check.elapsed() >= TTY_CHECK_EVERY {
+            last_tty_check = Instant::now();
+            tty::ensure_stdin_raw();
         }
 
         if event::poll(TICK)? {

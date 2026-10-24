@@ -134,6 +134,64 @@ pub struct EditorConfig {
     pub daily_folder: String,
     /// `chrono`-free date format for daily notes: `%Y`, `%m`, `%d` only.
     pub daily_format: String,
+    /// What edits a note: the built-in editor, or an embedded Neovim.
+    pub backend: EditorBackend,
+    /// Neovim executable, looked up on `PATH` when it has no directory.
+    pub nvim: String,
+    /// `NVIM_APPNAME` for the embedded Neovim; empty keeps Neovim's own
+    /// default config.
+    pub nvim_appname: String,
+    /// The `backend` word the file used when it was not one we know, set by
+    /// [`Config::from_toml_str`] so startup can say so. Never read from or
+    /// written to the file.
+    #[serde(skip)]
+    pub backend_rejected: Option<String>,
+}
+
+/// Which editor the note pane runs in edit mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EditorBackend {
+    /// The editor and vim emulation built into emeraldian.
+    #[default]
+    Builtin,
+    /// An embedded `nvim --embed`.
+    Nvim,
+}
+
+impl EditorBackend {
+    /// The word used in the config file.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::Nvim => "nvim",
+        }
+    }
+
+    /// Reads a config word; `None` when it is not a backend.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        match word.trim().to_ascii_lowercase().as_str() {
+            "builtin" => Some(Self::Builtin),
+            "nvim" => Some(Self::Nvim),
+            _ => None,
+        }
+    }
+}
+
+impl Serialize for EditorBackend {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.name())
+    }
+}
+
+/// An unrecognised word is the built-in editor, not a parse error: a typo in
+/// this one key must not cost the user the rest of their config.
+impl<'de> Deserialize<'de> for EditorBackend {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let word = String::deserialize(deserializer)?;
+        Ok(Self::parse(&word).unwrap_or_default())
+    }
 }
 
 impl Default for EditorConfig {
@@ -147,6 +205,10 @@ impl Default for EditorConfig {
             new_note_folder: String::new(),
             daily_folder: "Daily".into(),
             daily_format: "%Y-%m-%d".into(),
+            backend: EditorBackend::Builtin,
+            nvim: "nvim".into(),
+            nvim_appname: String::new(),
+            backend_rejected: None,
         }
     }
 }
@@ -376,10 +438,22 @@ impl Config {
         let Ok(text) = fs::read_to_string(path) else {
             return (Self::default(), None);
         };
-        match toml::from_str::<Self>(&text) {
+        match Self::from_toml_str(&text) {
             Ok(config) => (config, None),
             Err(err) => (Self::default(), Some(format!("{}: {err}", path.display()))),
         }
+    }
+
+    /// Parses config text, remembering an `[editor] backend` it did not
+    /// understand in `editor.backend_rejected`.
+    pub fn from_toml_str(text: &str) -> Result<Self, toml::de::Error> {
+        let mut config = toml::from_str::<Self>(text)?;
+        config.editor.backend_rejected =
+            toml::from_str::<toml::Table>(text).ok().and_then(|table| {
+                let word = table.get("editor")?.get("backend")?.as_str()?.to_string();
+                EditorBackend::parse(&word).is_none().then_some(word)
+            });
+        Ok(config)
     }
 
     /// Writes the config, creating the directory if needed.
@@ -564,6 +638,46 @@ mod tests {
             config.images.protocol, "auto",
             "and the terminal is still the one asked"
         );
+    }
+
+    #[test]
+    fn config_backend_defaults_to_builtin() {
+        let config: Config = toml::from_str("").expect("parse");
+        assert_eq!(config.editor.backend, EditorBackend::Builtin);
+        assert_eq!(config.editor.nvim, "nvim");
+        assert_eq!(config.editor.nvim_appname, "");
+        // An editor section that predates the setting keeps the built-in editor.
+        let older: Config = toml::from_str("[editor]\ntab_width = 2\n").expect("parse");
+        assert_eq!(older.editor.backend, EditorBackend::Builtin);
+    }
+
+    #[test]
+    fn config_backend_parses_nvim() {
+        let text = "[editor]\nbackend = \"nvim\"\nnvim = \"/opt/nvim/bin/nvim\"\nnvim_appname = \"nvim-notes\"\n";
+        let config = Config::from_toml_str(text).expect("parse");
+        assert_eq!(config.editor.backend, EditorBackend::Nvim);
+        assert_eq!(config.editor.nvim, "/opt/nvim/bin/nvim");
+        assert_eq!(config.editor.nvim_appname, "nvim-notes");
+        assert!(config.editor.backend_rejected.is_none());
+
+        // And it survives the app rewriting the file.
+        let written = toml::to_string_pretty(&config).expect("serialize");
+        let reread: Config = toml::from_str(&written).expect("reparse");
+        assert_eq!(reread.editor.backend, EditorBackend::Nvim);
+    }
+
+    #[test]
+    fn config_unknown_backend_falls_back() {
+        let config = Config::from_toml_str("[editor]\nbackend = \"emacs\"\n").expect("parse");
+        assert_eq!(config.editor.backend, EditorBackend::Builtin);
+        assert_eq!(
+            config.editor.backend_rejected.as_deref(),
+            Some("emacs"),
+            "the rejected word is kept so startup can say what it was"
+        );
+        // Plain deserialising never refuses to start over it either.
+        let plain: Config = toml::from_str("[editor]\nbackend = \"emacs\"\n").expect("parse");
+        assert_eq!(plain.editor.backend, EditorBackend::Builtin);
     }
 
     #[test]

@@ -25,6 +25,9 @@ emeraldian-agent = { path = "crates/emeraldian-agent", version = "0.8.0" }
 
 ratatui = "0.30"
 crossterm = "0.29"
+# Reads and resets termios when a late image-probe reply cooks the terminal.
+# Already in the tree through crossterm and ratatui-image, so no new crate.
+rustix = { version = "1", default-features = false, features = ["std", "stdio", "termios"] }
 # Kitty, iTerm2 and sixel with a halfblocks fallback. Default features are off
 # to keep the optional C bindings (libchafa, libsixel) out of the build, so the
 # binary stays pure Rust and cross-compiles.
