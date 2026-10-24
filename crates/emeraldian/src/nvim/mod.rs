@@ -19,4 +19,6 @@
 #[allow(dead_code)]
 pub mod grid;
 #[allow(dead_code)]
+pub mod input;
+#[allow(dead_code)]
 pub mod rpc;
