@@ -19,6 +19,7 @@ mod images;
 mod keymap;
 mod keys;
 mod modal;
+mod nvim;
 mod obsidian;
 mod session;
 mod slash;

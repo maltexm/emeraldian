@@ -53,6 +53,8 @@ anyhow = "1"
 unicode-width = "0.2"
 ureq = { version = "3", features = ["json"] }
 lz-str = "0.2"
+# Msgpack values for the nvim RPC client (crates/emeraldian/src/nvim/rpc.rs).
+rmpv = "1"
 
 [profile.release]
 lto = true
