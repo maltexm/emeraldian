@@ -10,7 +10,8 @@
 //!   goes to nvim except a small set of app keys (see the design spec).
 
 use crossterm::event::{
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 
 use crate::keymap::Keymap;
@@ -24,9 +25,29 @@ pub fn key_to_nvim(key: &KeyEvent) -> Option<String> {
         return None;
     }
 
+    // nvim has no Hyper. Leaving it off would send a different chord than the
+    // one pressed (`Hyper+x` as a bare `x` deletes a character), so the key
+    // is dropped.
+    if key.modifiers.contains(KeyModifiers::HYPER) {
+        return None;
+    }
+
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let meta = key.modifiers.contains(KeyModifiers::META);
+    let sup = key.modifiers.contains(KeyModifiers::SUPER);
+
+    // The Kitty protocol marks keys from the keypad. nvim tells them apart
+    // (`<kEnter>` is not `<CR>`) while giving them the same default meaning,
+    // so a mapping on either one works and a plain keypad still types.
+    if key.state.contains(KeyEventState::KEYPAD)
+        && let Some(name) = keypad_name(key.code)
+    {
+        let mut prefix = String::new();
+        push_modifiers(&mut prefix, ctrl, shift, alt, meta, sup);
+        return Some(format!("<{prefix}{name}>"));
+    }
 
     // The key's name inside `<...>`, and what it is when nothing is held:
     // characters go literally, everything else only has its `<name>`.
@@ -63,6 +84,9 @@ pub fn key_to_nvim(key: &KeyEvent) -> Option<String> {
         KeyCode::PageUp => ("PageUp".to_string(), "<PageUp>".to_string()),
         KeyCode::PageDown => ("PageDown".to_string(), "<PageDown>".to_string()),
         KeyCode::F(n) => (format!("F{n}"), format!("<F{n}>")),
+        // The keypad's middle key (5 without Num Lock) is only reported by
+        // the Kitty protocol, so it is a keypad key even without the flag.
+        KeyCode::KeypadBegin => ("kOrigin".to_string(), "<kOrigin>".to_string()),
         // Locks, media keys, a bare modifier press: no notation, no input.
         _ => return None,
     };
@@ -77,20 +101,56 @@ pub fn key_to_nvim(key: &KeyEvent) -> Option<String> {
     };
 
     let mut prefix = String::new();
-    if ctrl {
-        prefix.push_str("C-");
-    }
-    if shift && !shift_in_name {
-        prefix.push_str("S-");
-    }
-    if alt {
-        prefix.push_str("M-");
-    }
+    push_modifiers(&mut prefix, ctrl, shift && !shift_in_name, alt, meta, sup);
 
     if prefix.is_empty() {
         return Some(bare);
     }
     Some(format!("<{prefix}{name}>"))
+}
+
+/// The `C-S-M-T-D-` part of a chord: Control, Shift, Alt, Meta, Super.
+fn push_modifiers(prefix: &mut String, ctrl: bool, shift: bool, alt: bool, meta: bool, sup: bool) {
+    for (held, name) in [
+        (ctrl, "C-"),
+        (shift, "S-"),
+        (alt, "M-"),
+        (meta, "T-"),
+        (sup, "D-"),
+    ] {
+        if held {
+            prefix.push_str(name);
+        }
+    }
+}
+
+/// nvim's name for a key that came from the keypad, for the keys that have
+/// one. Others (letters, F-keys) are not on a keypad and keep their name.
+fn keypad_name(code: KeyCode) -> Option<String> {
+    let name = match code {
+        KeyCode::Char(digit @ '0'..='9') => return Some(format!("k{digit}")),
+        KeyCode::Char('.') => "kPoint",
+        KeyCode::Char('/') => "kDivide",
+        KeyCode::Char('*') => "kMultiply",
+        KeyCode::Char('-') => "kMinus",
+        KeyCode::Char('+') => "kPlus",
+        KeyCode::Char('=') => "kEqual",
+        KeyCode::Char(',') => "kComma",
+        KeyCode::Enter => "kEnter",
+        KeyCode::Left => "kLeft",
+        KeyCode::Right => "kRight",
+        KeyCode::Up => "kUp",
+        KeyCode::Down => "kDown",
+        KeyCode::Home => "kHome",
+        KeyCode::End => "kEnd",
+        KeyCode::PageUp => "kPageUp",
+        KeyCode::PageDown => "kPageDown",
+        KeyCode::Insert => "kInsert",
+        KeyCode::Delete => "kDel",
+        KeyCode::KeypadBegin => "kOrigin",
+        _ => return None,
+    };
+    Some(name.to_string())
 }
 
 /// One mouse event as `nvim_input_mouse` takes it.
@@ -168,34 +228,46 @@ fn button_name(button: MouseButton) -> &'static str {
 /// nvim in this pane, where `Ctrl` letters are the editor's.
 #[must_use]
 pub fn is_reserved(key: &KeyEvent, keymap: &Keymap) -> bool {
-    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    // A chord is the policy's only if it holds exactly the listed modifiers.
+    // Shift is the one exception where the app already counts it as part of
+    // typing the key (`Ctrl+Shift+E`, `Ctrl+Shift+Tab`). Anything more
+    // (`Ctrl+Alt+Tab`, `Super+F1`) is another chord, and nvim's.
+    let modifiers = key.modifiers;
+    let without_shift = modifiers - KeyModifiers::SHIFT;
+    let ctrl_only = without_shift == KeyModifiers::CONTROL;
 
     let kept = match key.code {
-        // The app treats Shift as part of typing these, so it is not asked for.
-        KeyCode::Char(ch) if ctrl && !alt => matches!(ch.to_ascii_lowercase(), 'q' | 'e'),
+        KeyCode::Char(ch) => ctrl_only && matches!(ch.to_ascii_lowercase(), 'q' | 'e'),
         // Only unmodified F-keys: a modified one is the user asking for
         // something else, and emeraldian's own handlers are plain.
-        KeyCode::F(1 | 2 | 3 | 5 | 8) => key.modifiers.is_empty(),
-        KeyCode::Left | KeyCode::Right => alt && !ctrl,
-        KeyCode::Tab | KeyCode::BackTab | KeyCode::PageUp | KeyCode::PageDown => ctrl,
+        KeyCode::F(1 | 2 | 3 | 5 | 8) => modifiers.is_empty(),
+        KeyCode::Left | KeyCode::Right => modifiers == KeyModifiers::ALT,
+        KeyCode::Tab | KeyCode::BackTab => ctrl_only,
+        KeyCode::PageUp | KeyCode::PageDown => modifiers == KeyModifiers::CONTROL,
         _ => false,
     };
     if kept {
         return true;
     }
 
+    // A `[keys]` chord is Ctrl, Alt and Shift plus a key, and only that. A
+    // press that also holds Super or Meta is a different chord, even though
+    // the keymap would match it.
+    let remappable =
+        (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT).contains(modifiers);
     // Which chord matched is not exposed, but a chord only matches a press
     // with the same Alt flag and the same key code — so the press itself says
     // whether the remap is one that survives in the nvim pane.
-    let alt_or_function_key = alt || matches!(key.code, KeyCode::F(_));
-    alt_or_function_key && keymap.action_for(key).is_some()
+    let alt_or_function_key =
+        modifiers.contains(KeyModifiers::ALT) || matches!(key.code, KeyCode::F(_));
+    remappable && alt_or_function_key && keymap.action_for(key).is_some()
 }
 
 #[cfg(test)]
 mod tests {
     use crossterm::event::{
-        KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     };
 
     use super::*;
@@ -272,6 +344,123 @@ mod tests {
         // And events nvim has no use for are dropped rather than guessed at.
         assert_eq!(notation(KeyCode::CapsLock, none), None);
         assert_eq!(notation(KeyCode::Null, none), None);
+    }
+
+    fn keypad(code: KeyCode, modifiers: KeyModifiers) -> Option<String> {
+        key_to_nvim(&KeyEvent::new_with_kind_and_state(
+            code,
+            modifiers,
+            KeyEventKind::Press,
+            KeyEventState::KEYPAD,
+        ))
+    }
+
+    #[test]
+    fn key_notation_super_meta_and_hyper() {
+        let ctrl = KeyModifiers::CONTROL;
+        let alt = KeyModifiers::ALT;
+        let shift = KeyModifiers::SHIFT;
+        let sup = KeyModifiers::SUPER;
+        let meta = KeyModifiers::META;
+        let hyper = KeyModifiers::HYPER;
+
+        // Super and Meta are chords of their own. Dropping them would turn
+        // `Super+x` into a bare `x`, which is a delete command in Normal mode.
+        let table: &[(KeyCode, KeyModifiers, &str)] = &[
+            (KeyCode::Char('x'), sup, "<D-x>"),
+            (KeyCode::Char('x'), meta, "<T-x>"),
+            (KeyCode::Char('x'), ctrl | sup, "<C-D-x>"),
+            (KeyCode::Char('x'), alt | sup, "<M-D-x>"),
+            (KeyCode::Char('x'), alt | meta, "<M-T-x>"),
+            (KeyCode::Char('x'), ctrl | alt | meta | sup, "<C-M-T-D-x>"),
+            (KeyCode::Char('X'), shift | sup, "<D-X>"),
+            (KeyCode::Char('x'), ctrl | shift | sup, "<C-S-D-x>"),
+            (KeyCode::Char('<'), sup, "<D-lt>"),
+            (KeyCode::Char('\\'), meta, "<T-Bslash>"),
+            (KeyCode::Char('|'), sup, "<D-Bar>"),
+            (KeyCode::Char(' '), sup, "<D-Space>"),
+            (KeyCode::Left, sup, "<D-Left>"),
+            (KeyCode::Enter, meta, "<T-CR>"),
+            (KeyCode::F(5), sup, "<D-F5>"),
+            (KeyCode::BackTab, shift | sup, "<D-S-Tab>"),
+        ];
+        for (code, modifiers, want) in table {
+            assert_eq!(
+                notation(*code, *modifiers).as_deref(),
+                Some(*want),
+                "{code:?} with {modifiers:?}"
+            );
+        }
+
+        // nvim has no Hyper. Sending the key without it would run a different
+        // command than the one pressed, so the key is dropped instead.
+        assert_eq!(notation(KeyCode::Char('x'), hyper), None);
+        assert_eq!(notation(KeyCode::Char('x'), hyper | ctrl), None);
+        assert_eq!(notation(KeyCode::Left, hyper | sup), None);
+    }
+
+    #[test]
+    fn key_notation_keypad_is_not_the_main_block() {
+        let none = KeyModifiers::NONE;
+        let ctrl = KeyModifiers::CONTROL;
+        let alt = KeyModifiers::ALT;
+        let shift = KeyModifiers::SHIFT;
+
+        let table: &[(KeyCode, KeyModifiers, &str)] = &[
+            (KeyCode::Char('0'), none, "<k0>"),
+            (KeyCode::Char('5'), none, "<k5>"),
+            (KeyCode::Char('9'), none, "<k9>"),
+            (KeyCode::Char('.'), none, "<kPoint>"),
+            (KeyCode::Char('/'), none, "<kDivide>"),
+            (KeyCode::Char('*'), none, "<kMultiply>"),
+            (KeyCode::Char('-'), none, "<kMinus>"),
+            (KeyCode::Char('+'), none, "<kPlus>"),
+            (KeyCode::Char('='), none, "<kEqual>"),
+            (KeyCode::Char(','), none, "<kComma>"),
+            (KeyCode::Enter, none, "<kEnter>"),
+            (KeyCode::Left, none, "<kLeft>"),
+            (KeyCode::Right, none, "<kRight>"),
+            (KeyCode::Up, none, "<kUp>"),
+            (KeyCode::Down, none, "<kDown>"),
+            (KeyCode::Home, none, "<kHome>"),
+            (KeyCode::End, none, "<kEnd>"),
+            (KeyCode::PageUp, none, "<kPageUp>"),
+            (KeyCode::PageDown, none, "<kPageDown>"),
+            (KeyCode::Insert, none, "<kInsert>"),
+            (KeyCode::Delete, none, "<kDel>"),
+            (KeyCode::KeypadBegin, none, "<kOrigin>"),
+            // Modifiers stay on the key.
+            (KeyCode::Enter, ctrl, "<C-kEnter>"),
+            (KeyCode::Char('+'), alt, "<M-kPlus>"),
+            (KeyCode::Left, ctrl | shift, "<C-S-kLeft>"),
+            (KeyCode::Char('5'), KeyModifiers::SUPER, "<D-k5>"),
+        ];
+        for (code, modifiers, want) in table {
+            assert_eq!(
+                keypad(*code, *modifiers).as_deref(),
+                Some(*want),
+                "keypad {code:?} with {modifiers:?}"
+            );
+        }
+
+        // The same codes without the keypad flag are the main block's keys.
+        assert_eq!(notation(KeyCode::Enter, none).as_deref(), Some("<CR>"));
+        assert_eq!(notation(KeyCode::Char('+'), none).as_deref(), Some("+"));
+        assert_eq!(notation(KeyCode::Char('5'), none).as_deref(), Some("5"));
+        assert_eq!(notation(KeyCode::Left, none).as_deref(), Some("<Left>"));
+        assert_eq!(notation(KeyCode::Delete, none).as_deref(), Some("<Del>"));
+
+        // Lock state alone does not make a key a keypad key.
+        let locked = KeyEvent::new_with_kind_and_state(
+            KeyCode::Enter,
+            none,
+            KeyEventKind::Press,
+            KeyEventState::NUM_LOCK,
+        );
+        assert_eq!(key_to_nvim(&locked).as_deref(), Some("<CR>"));
+        // The keypad flag on a key that has no keypad twin changes nothing.
+        assert_eq!(keypad(KeyCode::Char('a'), none).as_deref(), Some("a"));
+        assert_eq!(keypad(KeyCode::F(2), none).as_deref(), Some("<F2>"));
     }
 
     #[test]
@@ -356,6 +545,34 @@ mod tests {
             );
         }
 
+        // Extra modifiers are a different chord. `Ctrl+Alt+Tab`, `Ctrl+Alt+PgUp`
+        // and friends are not in the policy, so nvim gets them.
+        let ctrl_alt = ctrl | alt;
+        let sup = KeyModifiers::SUPER;
+        for (code, modifiers) in [
+            (KeyCode::Tab, ctrl_alt),
+            (KeyCode::BackTab, ctrl_alt | KeyModifiers::SHIFT),
+            (KeyCode::PageUp, ctrl_alt),
+            (KeyCode::PageDown, ctrl_alt),
+            (KeyCode::PageUp, ctrl | KeyModifiers::SHIFT),
+            (KeyCode::Tab, ctrl | sup),
+            (KeyCode::PageDown, ctrl | sup),
+            (KeyCode::PageUp, alt),
+            (KeyCode::Tab, alt),
+            (KeyCode::Char('q'), ctrl_alt),
+            (KeyCode::Char('e'), ctrl | sup),
+            (KeyCode::Left, ctrl_alt),
+            (KeyCode::Right, alt | KeyModifiers::SHIFT),
+            (KeyCode::Left, alt | sup),
+            (KeyCode::F(1), alt),
+            (KeyCode::F(8), sup),
+        ] {
+            assert!(
+                !is_reserved(&press(code, modifiers), &defaults),
+                "{code:?} with {modifiers:?} should go to nvim"
+            );
+        }
+
         // A `[keys]` remap reaches the nvim pane only when it needs Alt or an
         // F-key; plain Ctrl remaps belong to nvim there.
         let remapped = keymap(&[
@@ -368,6 +585,17 @@ mod tests {
         assert!(is_reserved(&press(KeyCode::Char('E'), alt), &remapped));
         assert!(!is_reserved(&press(KeyCode::Char('y'), ctrl), &remapped));
         assert!(is_reserved(&press(KeyCode::F(6), none), &remapped));
+        // A remap is a chord of Ctrl/Alt/Shift; a press that also holds Super
+        // is not that chord, even though the keymap would match it.
+        assert!(!is_reserved(
+            &press(KeyCode::Char('e'), alt | KeyModifiers::SUPER),
+            &remapped
+        ));
+        // An explicit Alt remap on a key the policy otherwise leaves alone.
+        let tabs = keymap(&[("toggle_chat", "ctrl+alt+tab")]);
+        assert!(tabs.problems.is_empty());
+        assert!(is_reserved(&press(KeyCode::Tab, ctrl | alt), &tabs));
+        assert!(!is_reserved(&press(KeyCode::PageUp, ctrl | alt), &tabs));
         // The same key without the remap still belongs to nvim.
         assert!(!is_reserved(&press(KeyCode::Char('e'), alt), &defaults));
     }
