@@ -55,6 +55,11 @@ ureq = { version = "3", features = ["json"] }
 lz-str = "0.2"
 # Msgpack values for the nvim RPC client (crates/emeraldian/src/nvim/rpc.rs).
 rmpv = "1"
+# Diagrams: Mermaid source to SVG in pure Rust, Excalidraw scenes to SVG by hand,
+# and resvg to turn either into pixels for the terminal's graphics protocol.
+# No browser, no Node: neither is on every machine that runs a terminal.
+mermaid-rs-renderer = { version = "0.3", default-features = false }
+resvg = { version = "0.48", default-features = false, features = ["text", "system-fonts"] }
 
 [profile.release]
 lto = true

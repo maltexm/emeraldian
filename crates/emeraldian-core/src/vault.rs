@@ -168,7 +168,7 @@ fn walk(
             }
             out.folders.push(rel);
             walk(root, &path, options, out, depth + 1)?;
-        } else if is_markdown(&path) {
+        } else if is_note_file(&path) {
             let metadata = entry.metadata().ok();
             let stamp = |t: std::io::Result<std::time::SystemTime>| {
                 t.ok()
@@ -212,7 +212,23 @@ fn walk(
     Ok(())
 }
 
-/// Whether a path is a note. Obsidian only treats `.md` as notes.
+/// Whether a path is a note emeraldian opens: Markdown, or one of the diagram
+/// formats it draws itself (`.excalidraw`, `.mmd`, `.mermaid`).
+///
+/// Obsidian itself only treats `.md` as notes; the diagram files are plain
+/// attachments there. Here they are listed and opened like notes so the
+/// drawing is one keypress away, but the index never reads links or tags out
+/// of them (see [`note::own_extension`]).
+#[must_use]
+pub fn is_note_file(path: &Path) -> bool {
+    is_markdown(path)
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| note::own_extension(name).is_some())
+}
+
+/// Whether a path is Markdown. Obsidian only treats `.md` as notes.
 #[must_use]
 pub fn is_markdown(path: &Path) -> bool {
     path.extension()
@@ -418,6 +434,26 @@ mod tests {
             .expect("scan");
         assert_eq!(scan.notes.len(), 1);
         assert_eq!(scan.attachments, vec!["image.png"]);
+    }
+
+    #[test]
+    fn diagram_files_are_notes_too() {
+        let dir = TempDir::new("diagrams");
+        dir.write("Note.md", "n");
+        dir.write("Flow.excalidraw", "{}");
+        dir.write("Seq.MMD", "graph TD");
+        dir.write("Other.mermaid", "graph TD");
+        dir.write("data.json", "{}");
+
+        let scan = Vault::from_path(dir.path())
+            .scan(&ScanOptions::default())
+            .expect("scan");
+        let rels: Vec<_> = scan.notes.iter().map(|n| n.rel.as_str()).collect();
+        assert_eq!(
+            rels,
+            vec!["Flow.excalidraw", "Note.md", "Other.mermaid", "Seq.MMD"]
+        );
+        assert_eq!(scan.attachments, vec!["data.json"]);
     }
 
     #[test]

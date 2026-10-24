@@ -212,6 +212,29 @@ fn unquote(s: &str) -> String {
     s.to_string()
 }
 
+/// Extensions of the diagram files emeraldian lists as notes beside Markdown.
+const OWN_EXTENSIONS: [&str; 3] = [".excalidraw", ".mermaid", ".mmd"];
+
+/// The extension of a diagram file, if `name` is one (case-insensitive).
+///
+/// `Flow.excalidraw.md` is Markdown and answers `None`; only a file that is
+/// *just* a drawing or a Mermaid source does not hold Markdown, and so must
+/// not be read for links, tags or headings.
+#[must_use]
+pub fn own_extension(name: &str) -> Option<&'static str> {
+    let lower = name.to_lowercase();
+    OWN_EXTENSIONS
+        .into_iter()
+        .find(|extension| lower.ends_with(extension))
+}
+
+/// The extension a note's file keeps through a rename or a move: its own
+/// diagram extension, else `.md`.
+#[must_use]
+pub fn file_extension(rel: &str) -> &'static str {
+    own_extension(rel).unwrap_or(".md")
+}
+
 /// A note's identity and filesystem facts, without its content.
 ///
 /// The index keeps one of these per note and loads bodies on demand, so opening

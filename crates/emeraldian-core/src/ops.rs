@@ -181,9 +181,10 @@ impl VaultIndex {
         let old_stem = note.meta.stem.clone();
         let old_path = note.meta.path.clone();
 
+        let extension = note::file_extension(&old_rel);
         let new_stem = new_name
             .trim()
-            .strip_suffix(".md")
+            .strip_suffix(extension)
             .unwrap_or_else(|| new_name.trim())
             .to_string();
         validate_name(&new_stem)?;
@@ -193,9 +194,9 @@ impl VaultIndex {
 
         let folder = note.meta.folder().to_string();
         let new_rel = if folder.is_empty() {
-            format!("{new_stem}.md")
+            format!("{new_stem}{extension}")
         } else {
-            format!("{folder}/{new_stem}.md")
+            format!("{folder}/{new_stem}{extension}")
         };
         let new_path = self.resolve_path(&new_rel)?;
         if new_path.exists() {
@@ -222,10 +223,11 @@ impl VaultIndex {
         let stem = note.meta.stem.clone();
 
         let folder = new_folder.trim().trim_matches('/');
+        let extension = note::file_extension(&old_rel);
         let new_rel = if folder.is_empty() {
-            format!("{stem}.md")
+            format!("{stem}{extension}")
         } else {
-            format!("{folder}/{stem}.md")
+            format!("{folder}/{stem}{extension}")
         };
         if new_rel == old_rel {
             return Ok(id);
@@ -264,12 +266,13 @@ impl VaultIndex {
         // Flatten the path so `a/Note.md` and `b/Note.md` can both be trashed,
         // and stamp it so trashing the same note twice doesn't clobber.
         let flattened = rel.replace('/', "_");
-        let stem = flattened.strip_suffix(".md").unwrap_or(&flattened);
+        let extension = note::file_extension(&rel);
+        let stem = flattened.strip_suffix(extension).unwrap_or(&flattened);
         let stamp = std::time::SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let target = trash.join(format!("{stem} {stamp}.md"));
+        let target = trash.join(format!("{stem} {stamp}{extension}"));
 
         fs::rename(&path, &target)?;
         self.remove_note(id);
@@ -497,6 +500,35 @@ mod tests {
         // The link must actually resolve again, not just look right.
         let a = index.id_of_rel("A.md").unwrap();
         assert_eq!(index.note(a).unwrap().outgoing(), vec![new_id]);
+    }
+
+    #[test]
+    fn diagram_files_keep_their_extension_through_rename_move_and_delete() {
+        let vault = TempVault::new("diagram-ops");
+        vault.write("Flow.excalidraw", "{}");
+        vault.write("Seq.mmd", "sequenceDiagram");
+
+        let mut index = vault.index();
+        let flow = index.id_of_rel("Flow.excalidraw").unwrap();
+        let flow = index.rename_note(flow, "Pipeline").expect("rename");
+        assert_eq!(index.note(flow).unwrap().meta.rel, "Pipeline.excalidraw");
+        assert!(vault.exists("Pipeline.excalidraw"));
+        assert!(!vault.exists("Pipeline.md"), "never turned into a note");
+
+        let flow = index.move_note(flow, "drawings").expect("move");
+        assert_eq!(
+            index.note(flow).unwrap().meta.rel,
+            "drawings/Pipeline.excalidraw"
+        );
+
+        let seq = index.id_of_rel("Seq.mmd").unwrap();
+        let trashed = index.delete_note(seq).expect("delete");
+        assert_eq!(
+            trashed.extension().and_then(|e| e.to_str()),
+            Some("mmd"),
+            "{trashed:?}"
+        );
+        assert!(trashed.exists());
     }
 
     #[test]

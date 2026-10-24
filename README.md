@@ -358,11 +358,23 @@ works. Decoding happens off the draw loop, and the space a picture needs is
 worked out before it is decoded, so nothing jumps as it appears. A picture that
 can't be drawn leaves its alt text where it was.
 
-**Excalidraw.** A `.excalidraw.md` note opens as the drawing, not as the wall of
-compressed base64 it is stored as. Shapes, arrows, freehand strokes and labels are
-drawn as vectors on a braille canvas, so a diagram reads the same in every
-terminal whether or not it can show pictures. Scaled to the pane's width and
-scrolled vertically, like the prose it replaces.
+**Excalidraw.** Drawings are pictures in the reading pane, wherever they are:
+a `.excalidraw` file or an Obsidian `.excalidraw.md` note opens as the drawing,
+not as JSON or the wall of compressed base64 it is stored as, and
+`![[Flow.excalidraw]]` or `![](drawings/flow.excalidraw)` shows one inside a
+note. In a terminal with a graphics protocol (Kitty, Ghostty, WezTerm, iTerm2,
+sixel) the scene is written out as SVG and rasterised at the exact pixel size of
+the cells it sits in, in the colours of the theme (dark themes get Excalidraw's
+own dark mode), so text stays sharp at any pane width. Everywhere else it is
+traced as vectors on a braille canvas, scaled to the pane's width and scrolled
+vertically.
+
+**Mermaid.** A ```` ```mermaid ```` block in a note is drawn as a diagram in the
+same way, in the theme's colours, and so is a `.mmd` or `.mermaid` file opened
+on its own or embedded with `![[flow.mmd]]`. It is laid out in-process, with no
+browser and no Node. A diagram that doesn't parse stays as its source, with the
+reason above it; in a terminal without a graphics protocol the source is shown
+as it always was.
 
 **Explorer.** The file tree opens with your most recently edited notes at the
 top, which is usually where you left off. `s` steps through the other orders:

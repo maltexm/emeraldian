@@ -326,9 +326,19 @@ mod tests {
             angle: 0.0,
             stroke: None,
             fill: None,
+            hatched: false,
             dashed: false,
+            dotted: false,
             points: Vec::new(),
             text: String::new(),
+            stroke_width: 1.0,
+            opacity: 1.0,
+            rounded: false,
+            font_size: 20.0,
+            monospace: false,
+            align: emeraldian_core::excalidraw::TextAlign::Left,
+            start_head: None,
+            end_head: None,
         }
     }
 

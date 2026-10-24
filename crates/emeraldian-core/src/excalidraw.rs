@@ -31,12 +31,47 @@ pub struct Element {
     pub stroke: Option<Rgb>,
     /// The fill, if the shape is filled at all.
     pub fill: Option<Rgb>,
+    /// The fill is hatching rather than solid colour, so it reads paler.
+    pub hatched: bool,
     /// A dashed or dotted outline rather than a solid one.
     pub dashed: bool,
+    /// Specifically dotted, a subset of `dashed`.
+    pub dotted: bool,
     /// Vertices of a line, arrow or freehand stroke, relative to `x`/`y`.
     pub points: Vec<(f64, f64)>,
     /// The words of a text element, empty for everything else.
     pub text: String,
+    /// Outline thickness in scene units.
+    pub stroke_width: f64,
+    /// 0 (invisible) to 1.
+    pub opacity: f64,
+    /// Rounded corners on a box, curves through the points of a line.
+    pub rounded: bool,
+    pub font_size: f64,
+    /// Drawn in a monospace face (Excalidraw's "Code" font).
+    pub monospace: bool,
+    pub align: TextAlign,
+    /// The head at the start of an arrow, if any.
+    pub start_head: Option<Head>,
+    /// The head at the end of an arrow, if any.
+    pub end_head: Option<Head>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TextAlign {
+    #[default]
+    Left,
+    Center,
+    Right,
+}
+
+/// What an arrow ends in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Head {
+    Arrow,
+    Bar,
+    Dot,
+    Triangle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +262,53 @@ struct Raw {
     points: Vec<Vec<f64>>,
     #[serde(default)]
     text: String,
+    #[serde(default = "one_f64")]
+    stroke_width: f64,
+    /// Percent, 0 to 100.
+    #[serde(default = "hundred")]
+    opacity: f64,
+    #[serde(default)]
+    roundness: Option<serde_json::Value>,
+    #[serde(default = "default_font_size")]
+    font_size: f64,
+    #[serde(default)]
+    font_family: serde_json::Value,
+    #[serde(default)]
+    text_align: String,
+    #[serde(default)]
+    start_arrowhead: Option<String>,
+    // Absent in files from before arrowheads were a choice; those arrows had
+    // one at the end.
+    #[serde(default = "arrow_head")]
+    end_arrowhead: Option<String>,
+}
+
+fn one_f64() -> f64 {
+    1.0
+}
+
+fn hundred() -> f64 {
+    100.0
+}
+
+fn default_font_size() -> f64 {
+    20.0
+}
+
+fn arrow_head() -> Option<String> {
+    Some("arrow".into())
+}
+
+fn head(name: Option<&str>) -> Option<Head> {
+    match name? {
+        "arrow" => Some(Head::Arrow),
+        "bar" => Some(Head::Bar),
+        "dot" | "circle" | "circle_outline" => Some(Head::Dot),
+        "triangle" | "triangle_outline" => Some(Head::Triangle),
+        // Cardinality marks and anything newer: an arrowhead says more than
+        // none does.
+        _ => Some(Head::Arrow),
+    }
 }
 
 impl From<Raw> for Element {
@@ -258,6 +340,25 @@ impl From<Raw> for Element {
                 .then(|| color(&raw.background_color))
                 .flatten(),
             dashed: !raw.stroke_style.is_empty() && raw.stroke_style != "solid",
+            hatched: !matches!(raw.fill_style.as_str(), "solid" | "none" | ""),
+            dotted: raw.stroke_style == "dotted",
+            stroke_width: raw.stroke_width,
+            opacity: (raw.opacity / 100.0).clamp(0.0, 1.0),
+            rounded: raw.roundness.is_some_and(|value| !value.is_null()),
+            font_size: raw.font_size,
+            // 3 is Cascadia ("Code"), 8 Comic Shanns, the rest are proportional.
+            monospace: matches!(raw.font_family.as_u64(), Some(3 | 8)),
+            align: match raw.text_align.as_str() {
+                "center" => TextAlign::Center,
+                "right" => TextAlign::Right,
+                _ => TextAlign::Left,
+            },
+            start_head: head(raw.start_arrowhead.as_deref()),
+            end_head: if shape == Shape::Arrow {
+                head(raw.end_arrowhead.as_deref())
+            } else {
+                None
+            },
             points: raw
                 .points
                 .iter()

@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Excalidraw drawings and Mermaid diagrams as real pictures.** In a terminal
+  with a graphics protocol, `.excalidraw` files, `.excalidraw.md` notes,
+  ```` ```mermaid ```` blocks and `.mmd` / `.mermaid` files are drawn as
+  vector pictures rasterised at the size of the cells they sit in, in the
+  theme's colours. Drawings and Mermaid files appear in the explorer and open
+  like notes; `![[Flow.excalidraw]]` and `![[flow.mmd]]` embed them in a note.
+  Renaming, moving and deleting them keeps their extension. Other terminals keep
+  the braille drawing and the Mermaid source.
+
 ## [0.8.0] — 2026-10-22
 
 Shortcuts that follow your system, on Windows, Linux and the Mac alike, find

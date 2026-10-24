@@ -13,6 +13,7 @@ mod auth;
 mod cli;
 mod clipboard;
 mod config;
+mod diagram;
 mod editor;
 mod explorer;
 mod images;
@@ -196,9 +197,9 @@ fn locate(path: &Path) -> Result<(PathBuf, Option<String>), String> {
     if !path.exists() {
         return Err(format!("{} does not exist", path.display()));
     }
-    if !emeraldian_core::vault::is_markdown(path) {
+    if !emeraldian_core::vault::is_note_file(path) {
         return Err(format!(
-            "{} is not a folder or a Markdown note",
+            "{} is not a folder, a Markdown note or a diagram",
             path.display()
         ));
     }
@@ -310,6 +311,11 @@ fn run(app: &mut App) -> io::Result<()> {
     // an unusable shell.
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        // A diagram renderer that panics is reported as a diagram that could
+        // not be drawn; the terminal stays as it is.
+        if diagram::in_guarded_render() {
+            return;
+        }
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::DisableMouseCapture,
@@ -1512,7 +1518,7 @@ mod tests {
         let picture = vault.write("chart.png", "not really a png");
         let not_a_note = locate(&picture).expect_err("not a note");
         assert!(
-            not_a_note.contains("not a folder or a Markdown note"),
+            not_a_note.contains("not a folder, a Markdown note or a diagram"),
             "{not_a_note}"
         );
     }
