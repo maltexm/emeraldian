@@ -50,7 +50,7 @@ pub(super) fn render_styled_spans(
             }
             run.retain(|span| !span.text.is_empty());
             let pad = if out.is_empty() { first_pad } else { rest_pad };
-            let styled = style_spans(&run, ctx.palette, ctx.index, base);
+            let styled = style_spans(&run, ctx.palette, ctx.index, base, &mut ctx.links);
             out.extend(wrap_spans(&styled, width, pad, rest_pad));
             run.clear();
             lifted = true;
@@ -78,7 +78,7 @@ pub(super) fn render_styled_spans(
 
         if !run.is_empty() {
             let pad = if out.is_empty() { first_pad } else { rest_pad };
-            let styled = style_spans(&run, ctx.palette, ctx.index, base);
+            let styled = style_spans(&run, ctx.palette, ctx.index, base, &mut ctx.links);
             out.extend(wrap_spans(&styled, width, pad, rest_pad));
             run.clear();
         }
@@ -117,7 +117,7 @@ pub(super) fn render_styled_spans(
 
     if !run.is_empty() || out.is_empty() {
         let pad = if out.is_empty() { first_pad } else { rest_pad };
-        let styled = style_spans(&run, ctx.palette, ctx.index, base);
+        let styled = style_spans(&run, ctx.palette, ctx.index, base, &mut ctx.links);
         out.extend(wrap_spans(&styled, width, pad, rest_pad));
     }
 }
@@ -136,6 +136,7 @@ fn style_spans(
     palette: &Palette,
     index: &emeraldian_core::index::VaultIndex,
     base: Style,
+    links: &mut usize,
 ) -> Vec<(String, Style)> {
     spans
         .iter()
@@ -151,6 +152,8 @@ fn style_spans(
                     } else {
                         style.fg(palette.link_unresolved)
                     };
+                    style = link_tag(style, *links);
+                    *links += 1;
                 }
                 SpanKind::Link { .. } => {
                     style = style
@@ -187,14 +190,52 @@ fn style_spans(
         .collect()
 }
 
+/// The modifiers a link's cells are marked with. They are only ever *removed*
+/// from a style, which changes nothing on screen (no cell here has them to
+/// lose), so the mark rides along with the span through wrapping, indenting
+/// and every prefix the layout puts in front of a row.
+const LINK_BITS: Modifier = Modifier::SLOW_BLINK.union(Modifier::RAPID_BLINK);
+
+/// Marks `style` as that of the `n`-th link laid out.
+///
+/// The rendered rows are the only record of where a link ended up, so the link
+/// says so itself: the mouse reads these marks back instead of searching the
+/// rows for a label, which also finds that label as plain text. Three values
+/// cycle, so two links that touch always differ.
+pub(super) fn link_tag(style: Style, n: usize) -> Style {
+    let bits = match n % 3 {
+        0 => Modifier::SLOW_BLINK,
+        1 => Modifier::RAPID_BLINK,
+        _ => LINK_BITS,
+    };
+    style.remove_modifier(bits)
+}
+
+/// Which link mark a style carries: 0 for none.
+pub(super) fn link_mark(style: &Style) -> u8 {
+    u8::from(style.sub_modifier.contains(Modifier::SLOW_BLINK))
+        | u8::from(style.sub_modifier.contains(Modifier::RAPID_BLINK)) << 1
+}
+
 /// Inline spans as the reading pane shows them, for the places that draw them
 /// as a single run: headings, callout titles and table cells.
 pub(super) fn shown_text(spans: &[markdown::Span]) -> String {
+    shown_segments(spans)
+        .into_iter()
+        .map(|(text, _)| text)
+        .collect()
+}
+
+/// [`shown_text`] in pieces, each saying whether it is a wiki link.
+pub(super) fn shown_segments(spans: &[markdown::Span]) -> Vec<(String, bool)> {
     spans
         .iter()
-        .map(|span| match span.kind {
-            SpanKind::Math { .. } => math::inline(&span.text),
-            _ => span.text.clone(),
+        .map(|span| {
+            let text = match span.kind {
+                SpanKind::Math { .. } => math::inline(&span.text),
+                _ => span.text.clone(),
+            };
+            (text, matches!(span.kind, SpanKind::WikiLink { .. }))
         })
         .collect()
 }

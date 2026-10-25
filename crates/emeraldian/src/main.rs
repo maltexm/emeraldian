@@ -1246,6 +1246,7 @@ mod tests {
         vault.write("Alpha.md", "# Alpha\n");
         vault.write("Beta.md", "# Beta\n");
         vault.write("Gamma.md", "# Gamma\n");
+        vault.write("Delta.md", "# Delta\n");
         let mut app = App::new(vault.vault(), Config::default()).expect("app");
         app.focus_mode = true;
         let x = app.index.id_of_rel("X.md").expect("indexed");
@@ -1493,6 +1494,230 @@ mod tests {
             click(&mut app, x, y);
             assert_eq!(app.active_note(), x_id, "x {x} is not part of the link");
         }
+    }
+
+    // --- hits come from ranges recorded at render time, never from label text ---
+
+    /// Screen column of the `n`-th occurrence of `needle` on row `y`; the rows
+    /// these tests read are ASCII up to that point, so a byte offset is a column.
+    fn col_of(terminal: &Terminal<TestBackend>, y: u16, needle: &str, n: usize) -> u16 {
+        let row = &screen(terminal)[usize::from(y)];
+        let (at, _) = row
+            .match_indices(needle)
+            .nth(n)
+            .unwrap_or_else(|| panic!("no occurrence {n} of {needle:?} in {row:?}"));
+        at as u16
+    }
+
+    /// Every `(column, row)` where ASCII `needle` starts, in reading order.
+    fn all_of(terminal: &Terminal<TestBackend>, needle: &str) -> Vec<(u16, u16)> {
+        let mut found = Vec::new();
+        for (y, row) in screen(terminal).iter().enumerate() {
+            for (at, _) in row.match_indices(needle) {
+                found.push((at as u16, y as u16));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn a_word_before_its_own_link_is_prose_and_the_link_stays_clickable() {
+        let body = "Rust is a word. See [[Gamma|Rust]] for more.\n";
+        let (_vault, mut app) = reading_vault("prose-first", body);
+        let terminal = draw_at(&mut app, 120);
+        let y = row_of(&terminal, "Rust is");
+        let (prose, link) = (
+            col_of(&terminal, y, "Rust", 0),
+            col_of(&terminal, y, "Rust", 1),
+        );
+        let x_id = app.index.id_of_rel("X.md");
+        let gamma = app.index.id_of_rel("Gamma.md");
+        assert_eq!(click_opens(&mut app, 120, prose, y), x_id, "prose");
+        assert_eq!(click_opens(&mut app, 120, link, y), gamma, "link head");
+        assert_eq!(click_opens(&mut app, 120, link + 3, y), gamma, "link end");
+    }
+
+    #[test]
+    fn two_words_before_two_links_with_those_labels_keep_every_target() {
+        let body =
+            "Plain words first: Rust and Alpha. Then [[Gamma|Rust]] and [[Delta|Alpha]] link.\n";
+        let (_vault, mut app) = reading_vault("prose-first-2", body);
+        let terminal = draw_at(&mut app, 120);
+        let y = row_of(&terminal, "Plain words");
+        let x_id = app.index.id_of_rel("X.md");
+        let gamma = app.index.id_of_rel("Gamma.md");
+        let delta = app.index.id_of_rel("Delta.md");
+        let cases = [
+            (col_of(&terminal, y, "Rust", 0), x_id, "prose Rust"),
+            (col_of(&terminal, y, "Alpha", 0), x_id, "prose Alpha"),
+            (col_of(&terminal, y, "Rust", 1), gamma, "link Rust"),
+            (col_of(&terminal, y, "Alpha", 1), delta, "link Alpha"),
+        ];
+        for (x, want, what) in cases {
+            assert_eq!(click_opens(&mut app, 120, x, y), want, "{what}");
+        }
+    }
+
+    #[test]
+    fn same_label_twice_after_the_same_word_as_prose_hits_each_link_only() {
+        let body = "Two same: [[Alpha|same]] then [[Beta|same]] end.\n";
+        let (_vault, mut app) = reading_vault("prose-first-3", body);
+        let terminal = draw_at(&mut app, 120);
+        let y = row_of(&terminal, "Two same");
+        let x_id = app.index.id_of_rel("X.md");
+        let alpha = app.index.id_of_rel("Alpha.md");
+        let beta = app.index.id_of_rel("Beta.md");
+        let cases = [
+            (col_of(&terminal, y, "same", 0), x_id, "prose"),
+            (col_of(&terminal, y, "same", 1), alpha, "first link"),
+            (col_of(&terminal, y, "same", 2), beta, "second link"),
+        ];
+        for (x, want, what) in cases {
+            assert_eq!(click_opens(&mut app, 120, x, y), want, "{what}");
+        }
+    }
+
+    #[test]
+    fn prose_before_same_label_links_in_a_wrapped_paragraph() {
+        let body = "The same old same story goes on and on for a while, and the same thing \
+                    again before [[Alpha|same]] and [[Beta|same]] finally ends here.\n";
+        let (_vault, mut app) = reading_vault("prose-wrapped", body);
+        let terminal = draw_at(&mut app, 60);
+        let found = all_of(&terminal, "same");
+        assert_eq!(found.len(), 5, "{found:?}");
+        assert!(
+            found[0].1 < found[3].1,
+            "the links wrapped onto a later row"
+        );
+        let x_id = app.index.id_of_rel("X.md");
+        let alpha = app.index.id_of_rel("Alpha.md");
+        let beta = app.index.id_of_rel("Beta.md");
+        let want = [x_id, x_id, x_id, alpha, beta];
+        for (&(x, y), want) in found.iter().zip(want) {
+            assert_eq!(click_opens(&mut app, 60, x + 1, y), want, "({x},{y})");
+        }
+    }
+
+    #[test]
+    fn same_label_on_different_wrapped_rows_opens_its_own_target() {
+        let body = "[[Alpha|same]] then a long stretch of plain words that goes on and on until \
+                    the row must wrap around the pane edge, and finally [[Beta|same]] ends it.\n";
+        let (_vault, mut app) = reading_vault("across-rows", body);
+        let terminal = draw_at(&mut app, 60);
+        let found = all_of(&terminal, "same");
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_ne!(found[0].1, found[1].1, "on two rows");
+        let alpha = app.index.id_of_rel("Alpha.md");
+        let beta = app.index.id_of_rel("Beta.md");
+        for (&(x, y), want) in found.iter().zip([alpha, beta]) {
+            assert_eq!(click_opens(&mut app, 60, x + 2, y), want, "({x},{y})");
+        }
+    }
+
+    #[test]
+    fn emoji_labels_are_hit_by_cells_and_stay_separate() {
+        let body = "🦀 rust, then [[Alpha|🦀 rust]] and [[Beta|🦀 rust]]\n";
+        let (_vault, mut app) = reading_vault("emoji", body);
+        let terminal = draw_at(&mut app, 120);
+        let y = row_of(&terminal, "rust");
+        let crabs = columns_of(&terminal, y, "🦀");
+        assert_eq!(crabs.len(), 3, "{crabs:?}");
+        let x_id = app.index.id_of_rel("X.md");
+        let alpha = app.index.id_of_rel("Alpha.md");
+        let beta = app.index.id_of_rel("Beta.md");
+        let cases = [
+            (crabs[0], x_id, "prose crab"),
+            (crabs[1], alpha, "first crab"),
+            (crabs[1] + 3, alpha, "first label, last cell"),
+            (crabs[2], beta, "second crab"),
+            (crabs[2] + 3, beta, "second label, last cell"),
+        ];
+        for (x, want, what) in cases {
+            assert_eq!(click_opens(&mut app, 120, x, y), want, "{what}");
+        }
+    }
+
+    #[test]
+    fn links_in_tables_headings_and_list_items_are_still_clickable() {
+        let body =
+            "# See [[Beta]]\n\n| a | b |\n|---|---|\n| [[Alpha]] | x |\n\n- the Gamma: [[Gamma]]\n";
+        let (_vault, mut app) = reading_vault("containers", body);
+        let terminal = draw_at(&mut app, 120);
+        let alpha = app.index.id_of_rel("Alpha.md");
+        let beta = app.index.id_of_rel("Beta.md");
+        let gamma = app.index.id_of_rel("Gamma.md");
+        let x_id = app.index.id_of_rel("X.md");
+        let heading = row_of(&terminal, "See Beta");
+        let table = row_of(&terminal, "Alpha");
+        let item = row_of(&terminal, "the Gamma");
+        let cases = [
+            (
+                col_of(&terminal, heading, "Beta", 0),
+                heading,
+                beta,
+                "heading",
+            ),
+            (
+                col_of(&terminal, table, "Alpha", 0),
+                table,
+                alpha,
+                "table cell",
+            ),
+            (
+                col_of(&terminal, item, "Gamma", 0),
+                item,
+                x_id,
+                "prose in list",
+            ),
+            (
+                col_of(&terminal, item, "Gamma", 1),
+                item,
+                gamma,
+                "link in list",
+            ),
+        ];
+        for (x, y, want, what) in cases {
+            assert_eq!(click_opens(&mut app, 120, x, y), want, "{what}");
+        }
+    }
+
+    #[test]
+    fn link_marks_are_invisible_on_screen() {
+        let (_vault, mut app) = reading_vault("marks", "[[Alpha]] and [[Beta|b]] and [[Gamma]]\n");
+        let terminal = draw_at(&mut app, 120);
+        let buffer = terminal.backend().buffer();
+        let blink = ratatui::style::Modifier::SLOW_BLINK | ratatui::style::Modifier::RAPID_BLINK;
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                assert!(
+                    !buffer[(x, y)].modifier.intersects(blink),
+                    "cell ({x},{y}) blinks"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_link_cut_short_in_a_table_cell_is_still_that_link() {
+        let body = "| a |\n|---|\n| 12345678901234567890123456789012345 [[Alpha]] tail words |\n| [[Beta]] |\n";
+        let (_vault, mut app) = reading_vault("cut-cell", body);
+        let terminal = draw_at(&mut app, 120);
+        let alpha_row = row_of(&terminal, "1234567890");
+        let beta_row = row_of(&terminal, "Beta");
+        assert!(
+            screen(&terminal)[usize::from(alpha_row)].contains("Alp…"),
+            "cut"
+        );
+        let alpha = app.index.id_of_rel("Alpha.md");
+        let beta = app.index.id_of_rel("Beta.md");
+        let x = col_of(&terminal, alpha_row, "Alp", 0);
+        assert_eq!(click_opens(&mut app, 120, x, alpha_row), alpha, "cut link");
+        let x = col_of(&terminal, beta_row, "Beta", 0);
+        assert_eq!(
+            click_opens(&mut app, 120, x, beta_row),
+            beta,
+            "link after it"
+        );
     }
 
     #[test]

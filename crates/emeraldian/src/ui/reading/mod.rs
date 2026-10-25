@@ -76,6 +76,10 @@ pub struct Ctx<'a> {
     pub reading_width: usize,
     /// Additional room available to lifted content outside the prose measure.
     pub breakout: usize,
+    /// How many wiki links have been laid out so far, in document order. Each
+    /// one is tagged with it (see [`inline::link_tag`]) so that the finished
+    /// rows say where every link is.
+    pub links: usize,
 }
 
 impl<'a> Ctx<'a> {
@@ -93,6 +97,7 @@ impl<'a> Ctx<'a> {
             embeds: Vec::new(),
             reading_width: 0,
             breakout: 0,
+            links: 0,
         }
     }
 }

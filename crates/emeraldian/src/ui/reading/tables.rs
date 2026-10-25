@@ -1,6 +1,6 @@
 //! Natural-width table layout.
 
-use super::inline::shown_text;
+use super::inline::{link_tag, shown_segments, shown_text};
 use super::*;
 use crate::ui::truncate;
 
@@ -11,10 +11,53 @@ use crate::ui::truncate;
 /// of reach.
 const MAX_COLUMN: usize = 40;
 
+/// A cell's text as the spans it is drawn in: `shown` is what is left of the
+/// cell's `segments` once they are joined and cut to the column, and the wiki
+/// links among them keep their mark, so the mouse can tell where each is.
+fn cell_spans(
+    segments: &[(String, bool)],
+    shown: &str,
+    style: Style,
+    links: &mut usize,
+) -> Vec<Span<'static>> {
+    let shown: Vec<char> = shown.chars().collect();
+    let mut at = 0;
+    let mut cut = false;
+    let mut out = Vec::new();
+    for (text, link) in segments {
+        let mut piece = String::new();
+        for ch in text.chars() {
+            if !cut && shown.get(at) == Some(&ch) {
+                piece.push(ch);
+                at += 1;
+            } else {
+                cut = true;
+                break;
+            }
+        }
+        // Counted even when cut away, as a link is one whether or not it fits.
+        let style = if *link {
+            *links += 1;
+            link_tag(style, *links - 1)
+        } else {
+            style
+        };
+        if !piece.is_empty() {
+            out.push(Span::styled(piece, style));
+        }
+    }
+    // What the cut left, the ellipsis, belongs to no link.
+    if at < shown.len() {
+        out.push(Span::styled(shown[at..].iter().collect::<String>(), style));
+    }
+    out
+}
+
 pub(super) fn render_table(
     table: &Table,
     palette: &Palette,
     pad: &str,
+    links: &mut usize,
     out: &mut Vec<Line<'static>>,
 ) {
     let columns = table
@@ -60,7 +103,7 @@ pub(super) fn render_table(
         Line::from(vec![Span::raw(pad.to_string()), Span::styled(text, border)])
     };
 
-    let render_row = |cells: &Vec<Vec<markdown::Span>>, header: bool| -> Line<'static> {
+    let mut render_row = |cells: &Vec<Vec<markdown::Span>>, header: bool| -> Line<'static> {
         let mut spans = vec![Span::raw(pad.to_string()), Span::styled("│", border)];
         for (i, w) in widths.iter().enumerate() {
             let text = truncate(&cell_text(cells, i), *w);
@@ -78,7 +121,8 @@ pub(super) fn render_table(
                 Style::default().fg(palette.text_normal)
             };
             spans.push(Span::raw(format!(" {}", " ".repeat(before))));
-            spans.push(Span::styled(text, style));
+            let segments = cells.get(i).map(|c| shown_segments(c)).unwrap_or_default();
+            spans.extend(cell_spans(&segments, &text, style, links));
             spans.push(Span::raw(format!("{} ", " ".repeat(after))));
             spans.push(Span::styled("│", border));
         }

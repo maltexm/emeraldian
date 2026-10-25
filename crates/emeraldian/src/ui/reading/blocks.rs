@@ -285,7 +285,7 @@ pub(super) fn render_block(
 
         BlockKind::Math(tex) => display_math(tex, palette, inner_width, &pad, out),
 
-        BlockKind::Table(table) => render_table(table, palette, &pad, out),
+        BlockKind::Table(table) => render_table(table, palette, &pad, &mut ctx.links, out),
 
         BlockKind::Rule => out.push(Line::from(Span::styled(
             format!("{pad}{}", "─".repeat(inner_width)),

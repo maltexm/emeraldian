@@ -898,6 +898,7 @@ fn drawing<'a>(palette: &'a Palette, index: &'a VaultIndex, images: &'a mut Imag
         embeds: Vec::new(),
         reading_width: 0,
         breakout: 0,
+        links: 0,
     }
 }
 

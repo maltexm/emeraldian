@@ -138,6 +138,7 @@ pub(in crate::ui) fn draw_reading(
             embeds: note_meta.into_iter().collect(),
             reading_width: app.config.ui.reading_width as usize,
             breakout: 0,
+            links: 0,
         };
         let lines = render_document(&document, &mut ctx, width);
         // Content can be wider than the pane — a table laid out at its
@@ -218,11 +219,12 @@ pub(in crate::ui) fn draw_reading(
 
 /// Link under a reading-mode mouse point.
 ///
-/// The cached rows hold exactly what was drawn, margins included, so a point is
-/// resolved against the cell ranges each link occupies there: the very
-/// occurrence its `]`/`[` position names, on every row it wraps over. Nothing
-/// outside those cells — the centring margin, the selection star, another
-/// link's identical label — can act as the link.
+/// Every link was marked when it was laid out (see [`inline::link_tag`]), so
+/// the cached rows themselves say which cells are links and which are not:
+/// prose that happens to read like a link's label is just prose, a link that
+/// wrapped is one link on both of its rows, and nothing outside its own cells
+/// — the centring margin, the selection star, another link with the same
+/// label — acts as it.
 pub fn link_at(app: &App, point: (u16, u16)) -> Option<usize> {
     let area = app.regions.reading?;
     if !area.contains(ratatui::layout::Position::new(point.0, point.1)) {
@@ -237,59 +239,46 @@ pub fn link_at(app: &App, point: (u16, u16)) -> Option<usize> {
     if row >= lines.len() {
         return None;
     }
-    // Each block is flattened once, however many links it holds.
-    let mut blocks: Vec<(usize, Vec<TextCell>)> = Vec::new();
-    for idx in 0..note.links.len() {
-        let reveal = Reveal::for_link(note, idx)?;
-        let start = anchor_row(anchors, reveal.line);
-        if row < start || row >= block_end(lines.len(), anchors, start) {
-            continue;
-        }
-        let at = match blocks.iter().position(|(first, _)| *first == start) {
-            Some(at) => at,
-            None => {
-                blocks.push((start, block_cells(lines, anchors, start)));
-                blocks.len() - 1
-            }
-        };
-        let nth = nth_in_block(note, idx, anchors);
-        let hit = link_ranges(&blocks[at].1, &reveal.text, nth)
-            .into_iter()
-            .any(|(r, from, to)| r == row && col >= from && col < to);
-        if hit {
-            return Some(idx);
-        }
-    }
-    None
-}
-
-/// How many links before the `idx`-th one show the same label in the same
-/// block. This is the occurrence of the label that the `idx`-th link is: a
-/// paragraph can run over several source lines, and the label is looked for in
-/// the whole of it.
-fn nth_in_block(
-    note: &emeraldian_core::index::IndexedNote,
-    idx: usize,
-    anchors: &[(usize, usize)],
-) -> usize {
-    let block = |idx: usize| anchor_row(anchors, note.body_offset + note.links[idx].raw.line);
-    let label = note.links[idx].display().to_lowercase();
-    (0..idx)
-        .filter(|&earlier| {
-            block(earlier) == block(idx) && note.links[earlier].display().to_lowercase() == label
+    // The block the row belongs to: where the links of the note are told apart.
+    let start = anchors
+        .iter()
+        .map(|(_, first)| *first)
+        .filter(|first| *first <= row)
+        .max()?;
+    let runs = link_runs(lines, start, block_end(lines.len(), anchors, start));
+    let hit = runs.iter().position(|run| {
+        run.ranges
+            .iter()
+            .any(|&(r, from, to)| r == row && col >= from && col < to)
+    })?;
+    // The links the note lists for this block, in the order they were laid out.
+    let listed: Vec<usize> = (0..note.links.len())
+        .filter(|&idx| {
+            Reveal::for_link(note, idx)
+                .is_some_and(|reveal| anchor_row(anchors, reveal.line) == start)
         })
-        .count()
+        .collect();
+    if listed.len() == runs.len() {
+        return listed.get(hit).copied();
+    }
+    // Some link was not laid out as text (a picture) or was cut off (a table
+    // cell): pair by label instead, the n-th link showing a label with the
+    // n-th run showing it.
+    let label = &runs[hit].label;
+    let nth = runs[..hit].iter().filter(|run| run.label == *label).count();
+    listed
+        .into_iter()
+        .filter(|&idx| note.links[idx].display().to_lowercase() == *label)
+        .nth(nth)
 }
 
-/// One character of a block's text, with the cells it occupies on its row.
-struct TextCell {
-    /// Lowercased, so that labels match as `row_showing` matches them. A
-    /// character that lowercases to several is several cells sharing a place.
-    ch: char,
-    /// `None` for the space standing in for a line break.
-    row: Option<usize>,
-    from: usize,
-    to: usize,
+/// One link as drawn: its label, and the cells it takes, one `(row, from,
+/// to)` per row it wraps over.
+struct LinkRun {
+    mark: u8,
+    /// Lowercased, to compare with a link's display text.
+    label: String,
+    ranges: Vec<(usize, usize, usize)>,
 }
 
 /// The row after the last of the block starting at `start`.
@@ -302,87 +291,50 @@ fn block_end(total: usize, anchors: &[(usize, usize)], start: usize) -> usize {
         .min(total)
 }
 
-/// The text of the block starting at `start`, as the cells it was drawn in.
-/// Rows are joined the way the wrap split them: the blanks around a break
-/// make one space.
-fn block_cells(lines: &[Line], anchors: &[(usize, usize)], start: usize) -> Vec<TextCell> {
-    let end = block_end(lines.len(), anchors, start);
-    let mut out = Vec::new();
+/// The links drawn on the rows `start..end`, in reading order.
+///
+/// A run of cells with one mark is a link; a wrapped link goes on over the
+/// blanks the next row starts with, and ends at anything else that is not a
+/// link. Cell columns are display widths, as drawn.
+fn link_runs(lines: &[Line], start: usize, end: usize) -> Vec<LinkRun> {
+    let mut runs: Vec<LinkRun> = Vec::new();
+    // The run that the next marked cell may carry on.
+    let mut open: Option<usize> = None;
     for (row, line) in lines.iter().enumerate().take(end).skip(start) {
-        let mut cells: Vec<(char, usize, usize)> = Vec::new();
         let mut col = 0;
-        for ch in line.spans.iter().flat_map(|span| span.content.chars()) {
-            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-            cells.push((ch, col, col + width));
-            col += width;
-        }
-        if row > start {
-            let blank = cells
-                .iter()
-                .take_while(|(ch, ..)| ch.is_whitespace())
-                .count();
-            cells.drain(..blank);
-        }
-        if row + 1 < end {
-            while cells.last().is_some_and(|(ch, ..)| ch.is_whitespace()) {
-                cells.pop();
+        for span in &line.spans {
+            let mark = inline::link_mark(&span.style);
+            for ch in span.content.chars() {
+                let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+                if mark == 0 {
+                    if !ch.is_whitespace() {
+                        open = None;
+                    }
+                } else {
+                    let at = match open {
+                        Some(at) if runs[at].mark == mark => at,
+                        _ => {
+                            runs.push(LinkRun {
+                                mark,
+                                label: String::new(),
+                                ranges: Vec::new(),
+                            });
+                            open = Some(runs.len() - 1);
+                            runs.len() - 1
+                        }
+                    };
+                    let run = &mut runs[at];
+                    run.label.extend(ch.to_lowercase());
+                    match run.ranges.last_mut() {
+                        Some((r, _, to)) if *r == row && *to == col => *to = col + width,
+                        _ => run.ranges.push((row, col, col + width)),
+                    }
+                }
+                col += width;
             }
         }
-        for (ch, from, to) in cells {
-            for lower in ch.to_lowercase() {
-                out.push(TextCell {
-                    ch: lower,
-                    row: Some(row),
-                    from,
-                    to,
-                });
-            }
-        }
-        if row + 1 < end {
-            out.push(TextCell {
-                ch: ' ',
-                row: None,
-                from: 0,
-                to: 0,
-            });
-        }
     }
-    out
-}
-
-/// The cells the `nth` occurrence of `text` takes in a block, one `(row, from,
-/// to)` run per row it wraps over. Short of `nth`, the last occurrence.
-fn link_ranges(cells: &[TextCell], text: &str, nth: usize) -> Vec<(usize, usize, usize)> {
-    let needle: Vec<char> = text.to_lowercase().chars().collect();
-    if needle.is_empty() || text.trim().is_empty() {
-        return Vec::new();
-    }
-    let mut found = Vec::new();
-    let mut at = 0;
-    while at + needle.len() <= cells.len() {
-        if cells[at..at + needle.len()]
-            .iter()
-            .map(|c| c.ch)
-            .eq(needle.iter().copied())
-        {
-            found.push(at);
-            at += needle.len();
-        } else {
-            at += 1;
-        }
-    }
-    let Some(&first) = found.get(nth).or(found.last()) else {
-        return Vec::new();
-    };
-    let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
-    for cell in &cells[first..first + needle.len()] {
-        let Some(row) = cell.row else { continue };
-        match ranges.last_mut() {
-            Some((last, _, to)) if *last == row => *to = (*to).max(cell.to),
-            _ => ranges.push((row, cell.from, cell.to)),
-        }
-    }
-    ranges
+    runs
 }
 
 /// Draws the pictures whose rows are on screen, over the blanks left for them.
