@@ -455,7 +455,7 @@ optional: a Markdown file dropped in from anywhere shows up.
 
 **Editing.** Long lines wrap, so nothing is ever cut off at the edge of the pane,
 and the arrow keys follow the rows you can see. Markdown is styled as you type it
-— headings coloured, bullets drawn as `•`, tasks as `[☑]`, quotes as `▎` — but
+— headings coloured, bullets drawn as `•`, tasks as a tick box, quotes as `▎` — but
 nothing is hidden and nothing moves: each glyph is exactly as wide as the
 character it stands for, so the cursor is always on the character it looks like
 it's on. The line you're editing shows its syntax at full contrast. Because

@@ -100,14 +100,10 @@ pub(super) fn render_block(
                     Style::default().fg(palette.list_marker),
                 ),
                 Marker::Ordered(n) => (format!("{n}."), Style::default().fg(palette.list_marker)),
-                Marker::Task(true) => (
-                    icons::TASK_DONE.to_string(),
-                    Style::default().fg(palette.checkbox_done),
-                ),
-                Marker::Task(false) => (
-                    icons::TASK_TODO.to_string(),
-                    Style::default().fg(palette.checkbox_todo),
-                ),
+                Marker::Task(state) => {
+                    let look = task_look(*state, palette);
+                    (look.glyph.to_string(), look.glyph_style)
+                }
             };
 
             let prefix_width = glyph.chars().count() + 1;
@@ -125,14 +121,21 @@ pub(super) fn render_block(
                 "",
                 &mut wrapped,
             );
-            // Completed tasks are struck through, as in Obsidian.
-            if matches!(marker, Marker::Task(true)) {
-                for line in &mut wrapped {
-                    for span in &mut line.spans {
-                        span.style = span
-                            .style
-                            .add_modifier(Modifier::CROSSED_OUT)
-                            .fg(palette.text_faint);
+            // Done and cancelled tasks are struck through, as in Obsidian, and
+            // a cancelled one is dimmer still.
+            if let Marker::Task(state) = marker {
+                let look = task_look(*state, palette);
+                if look.struck {
+                    for line in &mut wrapped {
+                        for span in &mut line.spans {
+                            span.style = span
+                                .style
+                                .add_modifier(Modifier::CROSSED_OUT)
+                                .fg(palette.text_faint);
+                            if look.dim {
+                                span.style = span.style.add_modifier(Modifier::DIM);
+                            }
+                        }
                     }
                 }
             }
@@ -296,5 +299,55 @@ fn capitalize(text: &str) -> String {
     match chars.next() {
         Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
         None => String::new(),
+    }
+}
+
+/// How a task's box, and the text after it, look for one state character.
+struct TaskLook {
+    glyph: char,
+    glyph_style: Style,
+    /// The text is struck through and drawn in the faint colour.
+    struck: bool,
+    /// The text is dimmed on top of that.
+    dim: bool,
+}
+
+/// The look of `- [<state>]`: Obsidian's `x` and `-` end a task, the rest of
+/// the common sets (`>` forwarded, `<` scheduled, `?`, `!`, `/` in progress)
+/// each get a box and a colour of their own, and any other character is a
+/// custom state, which Obsidian counts as complete. Only the palette's roles
+/// are used for colour, so every theme draws them in its own.
+fn task_look(state: char, palette: &Palette) -> TaskLook {
+    let plain = |glyph: char, colour| TaskLook {
+        glyph,
+        glyph_style: Style::default().fg(colour),
+        struck: false,
+        dim: false,
+    };
+    match state {
+        ' ' => plain(icons::TASK_TODO, palette.checkbox_todo),
+        'x' | 'X' => TaskLook {
+            struck: true,
+            ..plain(icons::TASK_DONE, palette.checkbox_done)
+        },
+        '-' => TaskLook {
+            struck: true,
+            dim: true,
+            glyph_style: Style::default()
+                .fg(palette.text_faint)
+                .add_modifier(Modifier::DIM),
+            ..plain(icons::TASK_CANCELLED, palette.text_faint)
+        },
+        '>' => plain(icons::TASK_FORWARDED, palette.text_info),
+        '<' => plain(icons::TASK_SCHEDULED, palette.callout_tip),
+        '?' => plain(icons::TASK_QUESTION, palette.callout_question),
+        '!' => TaskLook {
+            glyph_style: Style::default()
+                .fg(palette.callout_danger)
+                .add_modifier(Modifier::BOLD),
+            ..plain(icons::TASK_IMPORTANT, palette.callout_danger)
+        },
+        '/' => plain(icons::TASK_PROGRESS, palette.text_warning),
+        _ => plain(icons::TASK_OTHER, palette.text_accent),
     }
 }

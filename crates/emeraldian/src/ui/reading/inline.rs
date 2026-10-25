@@ -41,6 +41,21 @@ pub(super) fn render_styled_spans(
     // shouldn't start it with the space that separated them.
     let mut lifted = false;
     for span in spans {
+        // A hard break ends the row: what came before it is laid out now, and
+        // what follows starts a row of its own, without the space it began
+        // with. Two in a row leave a blank row, as they do in HTML.
+        if span.kind == SpanKind::Break {
+            if let Some(last) = run.last_mut() {
+                last.text = last.text.trim_end().to_string();
+            }
+            run.retain(|span| !span.text.is_empty());
+            let pad = if out.is_empty() { first_pad } else { rest_pad };
+            let styled = style_spans(&run, ctx.palette, ctx.index, base);
+            out.extend(wrap_spans(&styled, width, pad, rest_pad));
+            run.clear();
+            lifted = true;
+            continue;
+        }
         let lifted_out = match span.kind {
             // `$$…$$` written mid-paragraph is lifted out the same way, since
             // Obsidian sets it apart from the text around it.
@@ -155,7 +170,16 @@ fn style_spans(
                         emphasis(style, span.style, palette),
                     );
                 }
-                SpanKind::Text => {}
+                // A key cap: dim text on the tag chip's background, padded
+                // with no-break spaces so that a row never splits it.
+                SpanKind::Kbd => {
+                    style = style.fg(palette.text_muted).bg(palette.tag_bg);
+                    return (
+                        format!("\u{a0}{}\u{a0}", span.text),
+                        emphasis(style, span.style, palette),
+                    );
+                }
+                SpanKind::Text | SpanKind::Break => {}
             }
 
             (span.text.clone(), emphasis(style, span.style, palette))

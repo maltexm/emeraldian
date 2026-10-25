@@ -1,0 +1,3 @@
+# The reading-view showcase note has a line that must end in two spaces: it is
+# the Markdown hard break the tests and the live check look at.
+crates/emeraldian/src/ui/reading/showcase.md whitespace=-trailing-space

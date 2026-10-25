@@ -41,15 +41,15 @@ Screenshots, attached to the card:
 | Footnotes `[^1]`, `^[…]` | ❌ raw | `A footnote here[^1] and an inline one^[Inline footnote text.]`; definition line shown raw at the end: `[^1]: The footnote definition text.` |
 | Tables | ✅ box drawing, column alignment, horizontal pan | `│ code      │ #tag  │    22 │` |
 | Table cell formatting | ❌ bold, links, tags and code lose their style; cells truncated at 40 columns, no wrap | `│ Bold cell │ Other │` in plain body colour (`shown_text`, `MAX_COLUMN = 40` in `note.rs`) |
-| Task lists | ⚠️ `[ ]`/`[x]` work; custom states broken | `☑ Cancelled task`, `☑ Forwarded task` and `☑ Question task` are all green and struck through (`list_item`: any non-space char is `Task(true)`) |
-| Task glyphs in Malte's font | ❌ `☐`/`☑` (U+2610/2611) are not in CaskaydiaMono Nerd Font (`fc-list ':charset=2611'` lists no Caskaydia). Kitty falls back, and the done box draws as a green blob | shots 02, 12 |
+| Task lists | ✅ fixed in R3b: nine states, each with its own Nerd Font box and palette colour (`[x]`/`[-]` struck, `[-]` also dim) | was: `☑ Cancelled task`, `☑ Forwarded task` and `☑ Question task` all green and struck through. Now `reading::tests::every_task_state_has_its_own_glyph_colour_and_style`, live SGR in `docs/reading-view/shots/r3-showcase-*.png` |
+| Task glyphs in Malte's font | ✅ fixed in R3b: `nf-md` code points U+F0131, F0132, F06F2, F0736, F0733, F078B, F0027, F0856, F0134, each checked with `fc-list ':charset=<hex>'` (all 15 CaskaydiaMono Nerd Font files) | was: `☐`/`☑` (U+2610/2611) not in CaskaydiaMono Nerd Font; Kitty fell back and the done box drew as a green blob (shots 02, 12) |
 | Heading folding | ❌ none | `handle_reading` in `keys.rs` has no fold key; no fold state in `note.rs` |
 | TOC / outline jump | ✅ outline panel; Enter jumps | moving 9 rows down + Enter landed on `Table` with `┌───────────┬…` at the top |
 | Frontmatter / properties | ⚠️ plain `key: value` lines + a 60-column rule; lists joined; no types, no hide option | `tags: projekt/emeraldian, lesen` |
 | Tags | ✅ inline chips | dark themes fine. On catppuccin-latte the chip is magenta `#ea76cb` on muted `#acb0be` = **1.22:1** contrast (computed) |
 | Note embeds `![[note]]`, `![[note#heading]]`, `![[note#^id]]` | ❌ shown as a link only | `Other › Section` / `Other › ^blk7` / `Other`; deliberate, test `an_obsidian_embed_of_an_image_is_a_picture_but_of_a_note_is_not` |
 | Image / Excalidraw / Mermaid embeds | ✅ | the image is drawn with Kitty unicode placeholders (screen text is U+10EEEE cells), the braille drawing and the Mermaid boxes as cells |
-| Block references | ⚠️ the link renders; the block id stays visible; following it does not scroll | `A block with an id. ^para1` |
+| Block references | ⚠️ the link renders and the trailing `^id` is hidden since R3b; following the link still does not scroll | was: `A block with an id. ^para1` visible |
 | Heading/block anchors when following a link in reading mode | ❌ the target opens at the top | `[[Other#Later]]` + Enter shows `Other` / `Intro paragraph…` at the top. `App::jump_to_anchor` returns unless nvim is editing; `follow_first_link` builds `LinkTarget::plain` |
 | Maths | ✅ inline and display, centred | `Inline E = mc² …`, `∫₀¹ x² dx = ─` with a stacked fraction |
 | Code highlighting | ⚠️ keyword highlighter for rust/python/js/ts/sh/go only; toml, yaml, lua and the rest are plain | `toml` block plain in all themes (shots) |
@@ -61,7 +61,7 @@ Screenshots, attached to the card:
 | Zoom | ❌ in the app (Kitty's own font-size keys only) | — |
 | Search in note | ⚠️ Ctrl+F picker lists matching *source* lines and Enter scrolls there; no match highlight, no n/N | `› #### Fourth level   line 21`; after Enter the match is coloured as a heading only |
 | Scroll memory per note | ⚠️ kept while the tab stays open; lost on close/reopen and on restart | Showcase scrolled to `Callouts`, then follow + Alt+Left kept `Callouts`; F3 + Ctrl+Shift+T reopened at `title: Showcase`; `state.rs` stores only expanded folders |
-| Extra leaks found | ❌ | `%%secret comment%%` visible; `***both***` shows `*both*`; a two-space hard break is lost (`push_str(candidate.trim())`); `<kbd>`/`<br>` are shown raw |
+| Extra leaks found | ✅ fixed in R3b (`%%comments%%`, `***both***`, hard breaks, `<kbd>`/`<br>`; `<mark>`, `<sub>`, `<sup>` too) | was: `%%secret comment%%` visible; `***both***` shown as `*both*`; a two-space hard break lost (`push_str(candidate.trim())`); `<kbd>`/`<br>` shown raw. Now `markdown.rs` tests and `the_showcase_note_reads_without_leaks_and_is_never_changed` |
 
 Not settled: `kitten send-key ctrl+bracketright` did not toggle the outline in my run, while the palette entry "Toggle outline sidebar Ctrl+]" did. I did not check whether Malte's real Ctrl+] works.
 

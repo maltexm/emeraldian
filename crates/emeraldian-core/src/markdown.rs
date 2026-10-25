@@ -69,8 +69,9 @@ pub enum BlockKind {
 pub enum Marker {
     Bullet,
     Ordered(u64),
-    /// A `- [ ]` / `- [x]` task; `true` when checked.
-    Task(bool),
+    /// A `- [ ]` / `- [x]` task, with the character between the brackets: a
+    /// space is open, `x` done, and Obsidian's other sets use `-`, `>`, `?`.
+    Task(char),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -144,6 +145,11 @@ pub enum SpanKind {
     Math {
         display: bool,
     },
+    /// A hard line break: two trailing spaces, a trailing backslash or a
+    /// `<br>`. Its text is a single space, for the places that flatten spans.
+    Break,
+    /// `<kbd>key</kbd>`, with the key as its text.
+    Kbd,
 }
 
 /// Parses a full note, frontmatter included.
@@ -179,14 +185,169 @@ pub fn parse_body(body: &str, line_offset: usize) -> Document {
     Document { blocks }
 }
 
+/// Stands in for a line that lies inside a `%%` comment, so that the lines of
+/// everything after it keep their numbers. A Unicode noncharacter: it cannot
+/// be typed into a note on purpose.
+const HIDDEN: &str = "\u{fdd0}";
+
+/// Blanks out the `%%comments%%` that run across lines, as Obsidian hides them.
+///
+/// Whole lines inside one become [`HIDDEN`]; text before an opener and after a
+/// closer stays. A comment that opens and closes on one line is left for
+/// [`parse_inline`], which is also where `%%` in a table cell or a heading is
+/// dealt with. One that never closes hides the rest of the note, as it does in
+/// Obsidian, and by the same token `%%` stays visible inside fenced code and
+/// inline code. Quote lines are left alone: their body is parsed again
+/// without the `>`, and that pass does this for itself.
+///
+/// `None` when no line has a `%%`, which is nearly every note.
+fn hide_comments(lines: &[&str]) -> Option<Vec<String>> {
+    if !lines.iter().any(|line| line.contains("%%")) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(lines.len());
+    let mut fence: Option<(char, usize)> = None;
+    let mut open = false;
+
+    for &line in lines {
+        let mut rest = line;
+        let mut stripped = false;
+        if open {
+            let Some(at) = rest.find("%%") else {
+                out.push(HIDDEN.to_string());
+                continue;
+            };
+            rest = &rest[at + 2..];
+            open = false;
+            stripped = true;
+        } else {
+            let trimmed = line.trim_start();
+            if let Some((ch, len)) = fence {
+                if is_closing_fence(trimmed, ch, len) {
+                    fence = None;
+                }
+                out.push(line.to_string());
+                continue;
+            }
+            if let Some(opening) = opening_fence(trimmed) {
+                fence = Some(opening);
+                out.push(line.to_string());
+                continue;
+            }
+            if trimmed.starts_with('>') {
+                out.push(line.to_string());
+                continue;
+            }
+        }
+
+        let mut kept = String::new();
+        let mut i = 0;
+        while i < rest.len() {
+            let here = &rest[i..];
+            let skip = if let Some(after) = here.strip_prefix("%%") {
+                if let Some(end) = after.find("%%") {
+                    // Closed on this line: the inline parser hides it.
+                    2 + end + 2
+                } else {
+                    open = true;
+                    stripped = true;
+                    break;
+                }
+            } else if let Some(escaped) = here.strip_prefix('\\') {
+                1 + escaped.chars().next().map_or(0, char::len_utf8)
+            } else if here.starts_with('`') {
+                delimited_text(here, "`").map_or(1, |(consumed, _)| consumed)
+            } else {
+                here.chars().next().map_or(1, char::len_utf8)
+            };
+            kept.push_str(&here[..skip]);
+            i += skip;
+        }
+        out.push(if stripped && kept.trim().is_empty() {
+            HIDDEN.to_string()
+        } else {
+            kept
+        });
+    }
+    Some(out)
+}
+
+/// How a paragraph line ends, for hard line breaks.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LineEnd {
+    Soft,
+    /// Two or more trailing spaces.
+    Spaces,
+    /// An odd number of trailing backslashes: the last one is the break.
+    Backslash,
+}
+
+/// Splits a paragraph line from the way it ends.
+fn line_end(line: &str) -> (&str, LineEnd) {
+    let line = line.trim_start();
+    let content = line.trim_end();
+    if line.len() - content.len() >= 2 && line.ends_with("  ") {
+        return (content, LineEnd::Spaces);
+    }
+    let slashes = content.bytes().rev().take_while(|&b| b == b'\\').count();
+    if slashes % 2 == 1 {
+        return (content[..content.len() - 1].trim_end(), LineEnd::Backslash);
+    }
+    (content, LineEnd::Soft)
+}
+
+/// Cuts a trailing ` ^block-id` off a line of text. The id stays a valid link
+/// target in the file; reading mode has nothing to show for it. A bare `^id`
+/// on a line of its own labels the block above and leaves nothing.
+fn strip_block_id(text: &str) -> &str {
+    let text = text.trim_end();
+    if let Some(at) = text.rfind('^') {
+        let id = &text[at + 1..];
+        let spaced = text[..at]
+            .chars()
+            .next_back()
+            .is_none_or(char::is_whitespace);
+        if spaced && !id.is_empty() && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            return text[..at].trim_end();
+        }
+    }
+    text
+}
+
 fn parse_blocks(lines: &[&str], offset: usize, out: &mut Vec<Block>) {
+    let hidden = hide_comments(lines);
+    let refs: Vec<&str>;
+    let lines = match &hidden {
+        Some(hidden) => {
+            refs = hidden.iter().map(String::as_str).collect();
+            &refs[..]
+        }
+        None => lines,
+    };
+
     let mut i = 0;
+    // Set when the last thing consumed was a comment, so that the blank line
+    // after it does not stack on the one before it.
+    let mut after_comment = false;
     while i < lines.len() {
         let line = lines[i];
         let trimmed = line.trim_start();
         let file_line = offset + i;
+        let follows_comment = std::mem::take(&mut after_comment);
+
+        if line == HIDDEN {
+            after_comment = true;
+            i += 1;
+            continue;
+        }
 
         if trimmed.is_empty() {
+            if follows_comment
+                && matches!(out.last().map(|b| &b.kind), None | Some(BlockKind::Blank))
+            {
+                i += 1;
+                continue;
+            }
             out.push(Block {
                 line: file_line,
                 kind: BlockKind::Blank,
@@ -273,7 +434,7 @@ fn parse_blocks(lines: &[&str], offset: usize, out: &mut Vec<Block>) {
                 kind: BlockKind::ListItem {
                     depth,
                     marker,
-                    spans: parse_inline(text),
+                    spans: parse_inline(strip_block_id(text)),
                 },
             });
             i += 1;
@@ -291,10 +452,17 @@ fn parse_blocks(lines: &[&str], offset: usize, out: &mut Vec<Block>) {
 
         // A paragraph runs until a blank line or a line that starts some other
         // block, so reading mode reflows it as one unit the way a renderer
-        // would rather than showing the author's hard wraps.
-        let mut text = String::new();
+        // would rather than showing the author's hard wraps. A line that ends
+        // in two spaces or a backslash is the exception: it stays a break.
+        let mut parts: Vec<(&str, LineEnd)> = Vec::new();
         while i < lines.len() {
             let candidate = lines[i];
+            // A comment line inside a paragraph does not end it.
+            if candidate == HIDDEN {
+                after_comment = true;
+                i += 1;
+                continue;
+            }
             let ct = candidate.trim_start();
             if ct.is_empty()
                 || opening_fence(ct).is_some()
@@ -306,15 +474,28 @@ fn parse_blocks(lines: &[&str], offset: usize, out: &mut Vec<Block>) {
             {
                 break;
             }
-            if !text.is_empty() {
-                text.push(' ');
-            }
-            text.push_str(candidate.trim());
+            parts.push(line_end(candidate));
             i += 1;
+        }
+        let mut text = String::new();
+        for (at, (content, end)) in parts.iter().enumerate() {
+            text.push_str(content);
+            if at + 1 < parts.len() {
+                text.push(if *end == LineEnd::Soft { ' ' } else { '\n' });
+            } else if *end == LineEnd::Backslash {
+                // Nothing follows, so it was only ever a backslash.
+                text.push('\\');
+            }
+        }
+        let spans = parse_inline(strip_block_id(&text));
+        if spans.is_empty() {
+            // All comment or block id: nothing to show, not even a row.
+            after_comment = true;
+            continue;
         }
         out.push(Block {
             line: file_line,
-            kind: BlockKind::Paragraph(parse_inline(&text)),
+            kind: BlockKind::Paragraph(spans),
         });
     }
 }
@@ -452,13 +633,15 @@ fn list_item(line: &str) -> Option<(usize, Marker, &str)> {
             .strip_prefix(bullet)
             .and_then(|r| r.strip_prefix(' '))
         {
-            if let Some(task) = rest.strip_prefix('[')
-                && task.len() >= 2
-                && task.as_bytes()[1] == b']'
-            {
-                let state = task.as_bytes()[0];
-                let text = task[2..].strip_prefix(' ').unwrap_or(&task[2..]);
-                return Some((depth, Marker::Task(state != b' ' && state != b'\t'), text));
+            if let Some(task) = rest.strip_prefix('[') {
+                let mut chars = task.chars();
+                if let (Some(state), Some(']')) = (chars.next(), chars.next()) {
+                    let text = chars.as_str();
+                    let text = text.strip_prefix(' ').unwrap_or(text);
+                    // A tab between the brackets is as open as a space is.
+                    let state = if state == '\t' { ' ' } else { state };
+                    return Some((depth, Marker::Task(state), text));
+                }
             }
             return Some((depth, Marker::Bullet, rest));
         }
@@ -557,9 +740,28 @@ pub fn parse_inline(text: &str) -> Vec<Span> {
     while i < text.len() {
         let rest = &text[i..];
 
+        // A hard break the block parser left as a newline: soft ones are
+        // already spaces by now.
+        if rest.starts_with('\n') {
+            if !buffer.is_empty() {
+                spans.push(Span::plain(std::mem::take(&mut buffer)));
+            }
+            spans.push(Span {
+                text: " ".to_string(),
+                style: Style::default(),
+                kind: SpanKind::Break,
+            });
+            i += 1;
+            continue;
+        }
+
         // Escapes are handled here rather than in `match_inline` because they
         // contribute a character to the plain-text run instead of a span.
-        if let Some(escaped) = rest.strip_prefix('\\').and_then(|r| r.chars().next()) {
+        if let Some(escaped) = rest
+            .strip_prefix('\\')
+            .and_then(|r| r.chars().next())
+            .filter(|&c| c != '\n')
+        {
             buffer.push(escaped);
             i += 1 + escaped.len_utf8();
             continue;
@@ -571,12 +773,31 @@ pub fn parse_inline(text: &str) -> Vec<Span> {
             .next_back()
             .is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '-'));
 
-        if let Some((consumed, produced)) = match_inline(rest, !after_word) {
+        if let Some((consumed, mut produced)) = match_inline(rest, !after_word) {
+            i += consumed;
+            if produced.is_empty() {
+                // A comment. Dropping it must not leave two spaces, or one at
+                // the start of the line, where it stood between words.
+                let lead = if buffer.is_empty() {
+                    spans.last().is_none_or(|s| s.text.ends_with(' '))
+                } else {
+                    buffer.ends_with(' ')
+                };
+                if lead && text[i..].starts_with(' ') {
+                    i += 1;
+                }
+                continue;
+            }
             if !buffer.is_empty() {
                 spans.push(Span::plain(std::mem::take(&mut buffer)));
             }
+            // A hard break inside a link label or a code span is a space.
+            for span in &mut produced {
+                if span.kind != SpanKind::Break && span.text.contains('\n') {
+                    span.text = span.text.replace('\n', " ");
+                }
+            }
             spans.extend(produced);
-            i += consumed;
             continue;
         }
 
@@ -617,6 +838,21 @@ const DOUBLE_DELIMITERS: &[Delimiter] = &[
 /// construct starts here. Every branch requires a closing delimiter before it
 /// commits, so an unterminated one falls through to literal text.
 fn match_inline(rest: &str, tag_boundary: bool) -> Option<(usize, Vec<Span>)> {
+    // `%%comment%%` is hidden. The span list it produces is empty, which is
+    // how the caller tells it from every other construct. One that is not
+    // closed on the line is literal here: the block parser has already
+    // dealt with the ones that run on past it.
+    if let Some(after) = rest.strip_prefix("%%") {
+        let end = after.find("%%")?;
+        return Some((2 + end + 2, Vec::new()));
+    }
+
+    if rest.starts_with('<')
+        && let Some(found) = html(rest)
+    {
+        return Some(found);
+    }
+
     // Embeds and wikilinks are checked before Markdown links, since `![[x]]`
     // and `[[x]]` both start with characters a Markdown link also uses.
     if let Some(after) = rest.strip_prefix("![[") {
@@ -662,6 +898,25 @@ fn match_inline(rest: &str, tag_boundary: bool) -> Option<(usize, Vec<Span>)> {
                 kind: SpanKind::Math { display },
             }],
         ));
+    }
+
+    // Three delimiters first, so `***x***` is bold and italic at once rather
+    // than a bold `*x` and a stray `*`.
+    for delim in ["***", "___"] {
+        if rest.starts_with(delim)
+            && (tag_boundary || delim != "___")
+            && let Some((consumed, inner)) = emphasis_text(rest, delim)
+        {
+            let spans = parse_inline(inner)
+                .into_iter()
+                .map(|mut span| {
+                    span.style.bold = true;
+                    span.style.italic = true;
+                    span
+                })
+                .collect();
+            return Some((consumed, spans));
+        }
     }
 
     for (delim, apply) in DOUBLE_DELIMITERS {
@@ -723,6 +978,86 @@ fn match_inline(rest: &str, tag_boundary: bool) -> Option<(usize, Vec<Span>)> {
         }
     }
 
+    None
+}
+
+/// Whether `rest` starts with `tag`, ignoring ASCII case, as HTML tag names do.
+fn tag_at(rest: &str, tag: &str) -> bool {
+    rest.as_bytes()
+        .get(..tag.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(tag.as_bytes()))
+}
+
+/// The digits (and `n` above) that have a super- or subscript form in
+/// CaskaydiaMono Nerd Font, which has no `+`, `-`, `=`, parentheses or letters
+/// other than `ⁿ`. The others would come from a fallback font a cell off.
+fn script(text: &str, sup: bool) -> Option<String> {
+    const SUP: [char; 10] = [
+        '\u{2070}', '\u{b9}', '\u{b2}', '\u{b3}', '\u{2074}', '\u{2075}', '\u{2076}', '\u{2077}',
+        '\u{2078}', '\u{2079}',
+    ];
+    text.chars()
+        .map(|c| match (c.to_digit(10), sup) {
+            (Some(d), true) => Some(SUP[d as usize]),
+            (Some(d), false) => char::from_u32(0x2080 + d),
+            (None, true) if c == 'n' => Some('\u{207f}'),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The raw HTML Obsidian renders and a terminal can: `<br>`, `<kbd>`,
+/// `<mark>`, `<sub>` and `<sup>`. Anything else, and any of these without its
+/// closing tag, is not matched and stays on the page as the text it was typed
+/// as, so nothing a note says is lost to a tag.
+fn html(rest: &str) -> Option<(usize, Vec<Span>)> {
+    for br in ["<br>", "<br/>", "<br />"] {
+        if tag_at(rest, br) {
+            let span = Span {
+                text: " ".to_string(),
+                style: Style::default(),
+                kind: SpanKind::Break,
+            };
+            return Some((br.len(), vec![span]));
+        }
+    }
+
+    for name in ["kbd", "mark", "sub", "sup"] {
+        let open = format!("<{name}>");
+        if !tag_at(rest, &open) {
+            continue;
+        }
+        let close = format!("</{name}>");
+        let after = &rest[open.len()..];
+        // Lowercasing ASCII keeps every byte offset where it was.
+        let end = after.to_ascii_lowercase().find(&close)?;
+        let inner = &after[..end];
+        if inner.is_empty() {
+            return None;
+        }
+        let consumed = open.len() + end + close.len();
+        let spans = match name {
+            "kbd" => vec![Span {
+                text: inner.to_string(),
+                style: Style::default(),
+                kind: SpanKind::Kbd,
+            }],
+            "mark" => parse_inline(inner)
+                .into_iter()
+                .map(|mut span| {
+                    span.style.highlight = true;
+                    span
+                })
+                .collect(),
+            _ => {
+                let sup = name == "sup";
+                let text = script(inner, sup)
+                    .unwrap_or_else(|| format!("{}({inner})", if sup { '^' } else { '_' }));
+                vec![Span::plain(text)]
+            }
+        };
+        return Some((consumed, spans));
+    }
     None
 }
 
@@ -892,6 +1227,7 @@ impl Ink {
             SpanKind::Image { .. } => Self::Link,
             SpanKind::Tag(_) => Self::Tag,
             SpanKind::Math { .. } => Self::Math,
+            SpanKind::Break | SpanKind::Kbd => Self::Text,
         }
     }
 }
@@ -926,21 +1262,36 @@ pub fn scan_inline(line: &str) -> Vec<Paint> {
 
     let mut at = 0;
     for span in parse_inline(line) {
+        // A break is not a character of the line, and neither is a `<sub>`
+        // rewritten to a subscript digit: such a span matches nothing, and
+        // whatever it stood for stays syntax.
+        if span.kind == SpanKind::Break {
+            continue;
+        }
         let paint = Paint {
             style: span.style,
             ink: Ink::of(&span.kind),
         };
-        // Span text is always a subsequence of the line: the parser either
-        // copies a character through or drops it.
+        // Span text is a subsequence of the line, or it is a rewrite of a
+        // construct and not. Try it, and put the cursor back if it isn't.
+        let start = at;
+        let mut hits = Vec::new();
         for want in span.text.chars() {
             while at < chars.len() && chars[at] != want {
                 at += 1;
             }
             if at == chars.len() {
-                return out;
+                break;
             }
-            out[at] = paint;
+            hits.push(at);
             at += 1;
+        }
+        if hits.len() == span.text.chars().count() {
+            for hit in hits {
+                out[hit] = paint;
+            }
+        } else {
+            at = start;
         }
     }
     out
@@ -1054,8 +1405,8 @@ mod tests {
         assert_eq!(items[0], (0, Marker::Bullet, "one".into()));
         assert_eq!(items[1], (1, Marker::Bullet, "nested".into()));
         assert_eq!(items[2], (0, Marker::Ordered(1), "first".into()));
-        assert_eq!(items[3], (0, Marker::Task(false), "todo".into()));
-        assert_eq!(items[4], (0, Marker::Task(true), "done".into()));
+        assert_eq!(items[3], (0, Marker::Task(' '), "todo".into()));
+        assert_eq!(items[4], (0, Marker::Task('x'), "done".into()));
     }
 
     #[test]
@@ -1487,5 +1838,345 @@ mod tests {
         assert_eq!(scan_inline("a $x_1$ b")[4].ink, Ink::Math);
         assert_eq!(shape("$$x$$"), "##.##");
         assert_eq!(shape("$5 and $10"), "..........", "a price is text");
+    }
+
+    // ---- Obsidian syntax hygiene -------------------------------------------
+
+    /// What each block shows as text, for tables of source -> display. Blank
+    /// lines are `""`, code is `code:<lines joined by />`, quotes are `> `.
+    fn texts(source: &str) -> Vec<String> {
+        fn walk(blocks: &[Block], out: &mut Vec<String>) {
+            for block in blocks {
+                match &block.kind {
+                    BlockKind::Blank => out.push(String::new()),
+                    BlockKind::Paragraph(spans)
+                    | BlockKind::Heading { spans, .. }
+                    | BlockKind::ListItem { spans, .. } => {
+                        out.push(spans_to_text(spans).trim_end().to_string());
+                    }
+                    BlockKind::Code { lines, .. } => out.push(format!("code:{}", lines.join("/"))),
+                    BlockKind::Quote(body) => {
+                        let mut inner = Vec::new();
+                        walk(body, &mut inner);
+                        out.extend(inner.into_iter().map(|line| format!("> {line}")));
+                    }
+                    _ => out.push("?".into()),
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&parse_body(source, 0).blocks, &mut out);
+        out
+    }
+
+    /// Spans as one line of text with the constructs marked: `⏎` a line
+    /// break, `[kbd:x]` a key, `{hl:x}` a highlight, backticks code.
+    fn describe(spans: &[Span]) -> String {
+        spans
+            .iter()
+            .map(|span| match span.kind {
+                SpanKind::Break => "⏎".to_string(),
+                SpanKind::Kbd => format!("[kbd:{}]", span.text),
+                _ if span.style.highlight => format!("{{hl:{}}}", span.text),
+                _ if span.style.code => format!("`{}`", span.text),
+                _ => span.text.clone(),
+            })
+            .collect()
+    }
+
+    fn paragraph(source: &str) -> String {
+        match parse_body(source, 0).blocks.first().map(|b| &b.kind) {
+            Some(BlockKind::Paragraph(spans)) => describe(spans),
+            other => panic!("{source:?}: expected a paragraph, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn comments_are_not_shown() {
+        let table: &[(&str, &[&str])] = &[
+            ("a %%c%% b", &["a b"]),
+            ("%%c%% a", &["a"]),
+            ("a %%c%%", &["a"]),
+            ("a %%1%% b %%2%% c", &["a b c"]),
+            ("# Title %%c%%", &["Title"]),
+            ("- item %%c%% x", &["item x"]),
+            ("> quote %%c%% x", &["> quote x"]),
+            // A paragraph that is only a comment is not a paragraph.
+            ("%%only a comment%%", &[]),
+            ("para\n\n%%only a comment%%\n\nnext", &["para", "", "next"]),
+            // Code keeps its percent signs, inline and fenced.
+            ("`%%kept%%` x", &["%%kept%% x"]),
+            ("```\n%%kept\nstill%%\n```", &["code:%%kept/still%%"]),
+            ("\\%%kept\\%%", &["%%kept%%"]),
+            // Spanning lines: a block between paragraphs leaves one gap.
+            (
+                "para\n\n%%\nhidden\nmore\n%%\n\nnext",
+                &["para", "", "next"],
+            ),
+            ("before %% start\nhidden\nend %% after", &["before after"]),
+            ("text\n%% x\ny %%\nmore", &["text more"]),
+            ("%% a\nb %% shown %% c", &["shown"]),
+            ("> a\n> %%\n> hidden\n> %%\n> b", &["> a b"]),
+            // Never closed: Obsidian hides the rest of the note, so do we.
+            ("a\n\n%% never closed\nhidden\n\nalso hidden", &["a", ""]),
+            ("a %% never closed\nhidden", &["a"]),
+            // A code fence after an opener is comment text too.
+            ("%%\n```\ncode\n```\n%%\nafter", &["after"]),
+        ];
+        for (source, expected) in table {
+            assert_eq!(texts(source), *expected, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn a_comment_does_not_move_the_lines_of_what_follows() {
+        let doc = parse_body("%%\nhidden\n%%\n# Real\n", 0);
+        let heading = doc
+            .blocks
+            .iter()
+            .find(|b| matches!(b.kind, BlockKind::Heading { .. }))
+            .expect("the heading");
+        assert_eq!(heading.line, 3, "a file line, comment lines included");
+    }
+
+    #[test]
+    fn trailing_block_ids_are_not_shown() {
+        let table: &[(&str, &[&str])] = &[
+            ("para ^id1", &["para"]),
+            ("para ^abc-12  ", &["para"]),
+            ("- item ^abc-12", &["item"]),
+            ("1. item ^x", &["item"]),
+            ("- [ ] task ^x", &["task"]),
+            ("> quote ^x", &["> quote"]),
+            // On a line of its own, after a block, it labels that block.
+            ("para\n\n^own", &["para", ""]),
+            ("> quote\n\n^own", &["> quote", ""]),
+            ("- one\n- two\n\n^own", &["one", "two", ""]),
+            // Not a block id: no space before it, something after it, a bare
+            // caret, characters an id cannot have, and a link to one.
+            ("para^id1", &["para^id1"]),
+            ("a ^id more", &["a ^id more"]),
+            ("para ^", &["para ^"]),
+            ("para ^a_b", &["para ^a_b"]),
+            ("2^10 is big", &["2^10 is big"]),
+            ("see [[Note#^id]]", &["see Note › ^id"]),
+            ("see [x](Note.md#^id)", &["see x"]),
+        ];
+        for (source, expected) in table {
+            assert_eq!(texts(source), *expected, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn hard_line_breaks_become_break_spans() {
+        let table: &[(&str, &str)] = &[
+            ("one  \ntwo", "one⏎two"),
+            ("one   \ntwo", "one⏎two"),
+            ("one\\\ntwo", "one⏎two"),
+            ("one\ntwo", "one two"),
+            ("one \ntwo", "one two"),
+            ("a  \nb  \nc", "a⏎b⏎c"),
+            ("a<br>b", "a⏎b"),
+            ("a<br/>b", "a⏎b"),
+            ("a<br />b", "a⏎b"),
+            ("a<BR>b", "a⏎b"),
+            ("a <br> b", "a ⏎ b"),
+            // An escaped backslash is a backslash, not a break.
+            ("one\\\\\ntwo", "one\\ two"),
+            ("one\\\\\\\ntwo", "one\\⏎two"),
+            // Nothing follows, so nothing breaks.
+            ("end  ", "end"),
+            ("end\\", "end\\"),
+            // Inside code a break is just a space.
+            ("x `a  \nb` y", "x `a b` y"),
+            // Inside emphasis the break stays inside it.
+            ("**a  \nb**", "a⏎b"),
+        ];
+        for (source, expected) in table {
+            assert_eq!(&paragraph(source), expected, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn bold_italic_forms_render_without_asterisks() {
+        type Run = (&'static str, bool, bool);
+        let table: &[(&str, &[Run])] = &[
+            ("***both***", &[("both", true, true)]),
+            ("___both___", &[("both", true, true)]),
+            ("*__mixed__*", &[("mixed", true, true)]),
+            ("**_mixed_**", &[("mixed", true, true)]),
+            ("_**mixed**_", &[("mixed", true, true)]),
+            ("__*mixed*__", &[("mixed", true, true)]),
+            (
+                "a ***b*** c",
+                &[
+                    ("a ", false, false),
+                    ("b", true, true),
+                    (" c", false, false),
+                ],
+            ),
+            (
+                "**bold *it* tail**",
+                &[
+                    ("bold ", true, false),
+                    ("it", true, true),
+                    (" tail", true, false),
+                ],
+            ),
+            ("***not closed", &[("***not closed", false, false)]),
+            ("snake___case", &[("snake___case", false, false)]),
+        ];
+        for (source, expected) in table {
+            let got: Vec<(String, bool, bool)> = parse_inline(source)
+                .into_iter()
+                .map(|s| (s.text, s.style.bold, s.style.italic))
+                .collect();
+            let want: Vec<(String, bool, bool)> = expected
+                .iter()
+                .map(|(t, b, i)| ((*t).to_string(), *b, *i))
+                .collect();
+            assert_eq!(got, want, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn html_tags_that_have_a_rendering_are_rendered() {
+        let table: &[(&str, &str)] = &[
+            ("press <kbd>Ctrl+C</kbd> now", "press [kbd:Ctrl+C] now"),
+            ("<KBD>x</KBD>", "[kbd:x]"),
+            ("H<sub>2</sub>O", "H₂O"),
+            ("x<sup>2</sup>", "x²"),
+            ("x<sup>10</sup>", "x¹⁰"),
+            ("x<sup>1</sup>", "x¹"),
+            ("x<sup>n</sup>", "xⁿ"),
+            ("a<sub>12</sub>", "a₁₂"),
+            // Without a Unicode form in the font, plain text carries it.
+            ("a<sub>i+1</sub>", "a_(i+1)"),
+            ("e<sup>-x</sup>", "e^(-x)"),
+            ("<mark>hot</mark> word", "{hl:hot} word"),
+            ("<Mark>hot</Mark>", "{hl:hot}"),
+        ];
+        for (source, expected) in table {
+            assert_eq!(&paragraph(source), expected, "{source:?}");
+        }
+    }
+
+    #[test]
+    fn any_other_html_stays_visible_as_text() {
+        for source in [
+            "<span>x</span>",
+            "a <b>bold</b> c",
+            "<div class=\"a\">y</div>",
+            "<details><summary>s</summary></details>",
+            "<img src=\"a.png\">",
+            "<kbd>never closed",
+            "<sup>never closed",
+            "<mark>never closed",
+            "3 < 4 and 5 > 2",
+            "<!-- an html comment -->",
+        ] {
+            assert_eq!(
+                &paragraph(source),
+                source,
+                "{source:?} must not be swallowed"
+            );
+        }
+        // Code wins over a tag it contains.
+        assert_eq!(&paragraph("`<kbd>x</kbd>`"), "`<kbd>x</kbd>`");
+    }
+
+    #[test]
+    fn task_markers_keep_their_state_character() {
+        let table: &[(&str, Marker, &str)] = &[
+            ("- [ ] a", Marker::Task(' '), "a"),
+            ("- [x] a", Marker::Task('x'), "a"),
+            ("- [X] a", Marker::Task('X'), "a"),
+            ("- [-] a", Marker::Task('-'), "a"),
+            ("- [>] a", Marker::Task('>'), "a"),
+            ("- [<] a", Marker::Task('<'), "a"),
+            ("- [?] a", Marker::Task('?'), "a"),
+            ("- [!] a", Marker::Task('!'), "a"),
+            ("- [/] a", Marker::Task('/'), "a"),
+            ("- [D] a", Marker::Task('D'), "a"),
+            ("- [✓] a", Marker::Task('✓'), "a"),
+            ("* [x] a", Marker::Task('x'), "a"),
+            ("  + [-] a", Marker::Task('-'), "a"),
+            ("- [x]", Marker::Task('x'), ""),
+            // Not tasks.
+            ("- [] a", Marker::Bullet, "[] a"),
+            ("- [xx] a", Marker::Bullet, "[xx] a"),
+            ("- [é a", Marker::Bullet, "[é a"),
+            ("1. [x] a", Marker::Ordered(1), "[x] a"),
+        ];
+        for (source, marker, text) in table {
+            let doc = parse_body(source, 0);
+            match &doc.blocks[0].kind {
+                BlockKind::ListItem {
+                    marker: got, spans, ..
+                } => {
+                    assert_eq!(got, marker, "{source:?}");
+                    assert_eq!(spans_to_text(spans), *text, "{source:?}");
+                }
+                other => panic!("{source:?}: expected a list item, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn awkward_input_never_panics_and_scan_inline_keeps_its_length() {
+        for source in [
+            "<",
+            "<k",
+            "<kbd",
+            "<kbd>",
+            "<kbd></kbd>",
+            "<kbd>é</kbd>é",
+            "<sup>é</sup>",
+            "<SUB>٣</SUB>",
+            "%",
+            "%%",
+            "%%%",
+            "%%%%",
+            "é%%é",
+            "%%é%%é%%",
+            "`%%",
+            "``%%``",
+            "\\",
+            "\\\n",
+            "a\\\n",
+            "^",
+            "x ^é",
+            "é ^id",
+            "a  \n  b  \n",
+            "- [é] x",
+            "- [",
+            "- []",
+            "***",
+            "******",
+            "___",
+            "**_*",
+            "%%\n```\n",
+            "```\n%%\n",
+            "> %%\n> x",
+            "|a|\n|-|\n|%%|",
+        ] {
+            let _ = parse_body(source, 0);
+            for line in source.lines() {
+                assert_eq!(scan_inline(line).len(), line.chars().count(), "{line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn scan_inline_survives_rewritten_html_and_dims_comments() {
+        // The editor shows source. A `<sub>` whose text is not in the line
+        // must not stop the characters after it being painted.
+        assert_eq!(scan_inline("H<sub>2</sub> **b**").len(), 19);
+        let scan = scan_inline("H<sub>2</sub> **b**");
+        assert!(scan[16].style.bold, "the b after the rewritten tag");
+        let scan = scan_inline("a <br> **b**");
+        assert!(scan[9].style.bold, "the b after a break");
+        let scan = scan_inline("a %%c%% b");
+        assert!(scan[2..7].iter().all(|p| p.ink == Ink::Marker), "comment");
     }
 }

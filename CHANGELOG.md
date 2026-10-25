@@ -42,6 +42,20 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **Obsidian syntax no longer leaks into the reading view.** `%%comments%%`
+  (inline, and across lines; one that never closes hides the rest of the note,
+  as in Obsidian) and trailing `^block-ids` are hidden, and a link to an id
+  still works. Two trailing spaces, a trailing backslash and `<br>` break the
+  line. `***bold italic***` and `*__mixed__*` render. `<kbd>` is a dim key
+  chip, `<mark>` a highlight, `<sub>`/`<sup>` use Unicode where the font has it
+  (digits, `ⁿ`) and `_(…)`/`^(…)` otherwise; any other HTML shows as the text it
+  is. `%%` stays visible in code.
+- **Task states.** `- [x]`, `[-]` (cancelled, dim and struck), `[>]`, `[<]`,
+  `[?]`, `[!]`, `[/]` and any other character each get their own box and
+  palette colour, instead of one green struck-through box for every non-space
+  character. The boxes are Nerd Font glyphs (`󰄱 󰄲 󰛲 …`), because `☐`/`☑` are not in
+  CaskaydiaMono Nerd Font and drew as a blob. Counting a task as done is
+  unchanged. The built-in editor's tick uses the same glyph.
 - Renaming a note no longer rewrites `[[Name]]` inside Mermaid and Excalidraw
   files, where `A[[Name]]` is a subroutine node and not a link.
 - A bare `[[Flow]]` means the Markdown note `Flow.md`, never a `Flow.excalidraw`

@@ -46,8 +46,28 @@ pub mod icons {
     // exactly as wide as the source it came from.
     pub const BULLET: char = '•';
     pub const QUOTE_BAR: char = '▎';
-    pub const TASK_DONE: char = '☑';
-    pub const TASK_TODO: char = '☐';
+    // Task boxes, one per state. Nerd Font Material Design glyphs, because
+    // `☐`/`☑` (U+2610/2611) are not in CaskaydiaMono Nerd Font and the
+    // terminal falls back to a font that draws them as a blob. Each code point
+    // here was checked with `fc-list ':charset=<hex>'`; keep it that way.
+    /// `[ ]` nf-md-checkbox-blank-outline
+    pub const TASK_TODO: char = '\u{f0131}';
+    /// `[x]` nf-md-checkbox-marked
+    pub const TASK_DONE: char = '\u{f0132}';
+    /// `[-]` nf-md-minus-box-outline
+    pub const TASK_CANCELLED: char = '\u{f06f2}';
+    /// `[>]` nf-md-arrow-right-bold-box-outline
+    pub const TASK_FORWARDED: char = '\u{f0736}';
+    /// `[<]` nf-md-arrow-left-bold-box-outline
+    pub const TASK_SCHEDULED: char = '\u{f0733}';
+    /// `[?]` nf-md-help-box
+    pub const TASK_QUESTION: char = '\u{f078b}';
+    /// `[!]` nf-md-alert-box
+    pub const TASK_IMPORTANT: char = '\u{f0027}';
+    /// `[/]` nf-md-checkbox-intermediate
+    pub const TASK_PROGRESS: char = '\u{f0856}';
+    /// Any other character between the brackets: nf-md-checkbox-marked-circle-outline
+    pub const TASK_OTHER: char = '\u{f0134}';
     /// Marks a row that continues the one above it, drawn in the gutter.
     pub const WRAP: char = '⤷';
     pub const SCROLL_THUMB: &str = "│";

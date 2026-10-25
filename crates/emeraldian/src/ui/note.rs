@@ -512,7 +512,7 @@ fn fenced_lines(lines: &[String]) -> Vec<Fence> {
 ///
 /// Markers are dimmed and given the glyph the reading pane would use, but only
 /// where that glyph is exactly as wide as what it replaces — a `-` becomes a
-/// `•`, an `x` inside `[x]` becomes a `☑`. Nothing is hidden and nothing moves,
+/// `•`, an `x` inside `[x]` becomes the done glyph. Nothing is hidden and nothing moves,
 /// so the caret is always where the character is, and `on_cursor_line` can show
 /// the line exactly as typed without the text shifting underneath.
 fn paint_line(

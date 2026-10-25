@@ -1181,6 +1181,293 @@ fn tasks_render_with_checkboxes_and_strike_completed_ones() {
     );
 }
 
+/// The style of the first span whose text contains `needle`.
+fn style_of(lines: &[Line<'_>], needle: &str) -> Style {
+    lines
+        .iter()
+        .flat_map(|line| &line.spans)
+        .find(|span| span.content.contains(needle))
+        .unwrap_or_else(|| panic!("no span holds {needle:?}"))
+        .style
+}
+
+#[test]
+fn every_task_state_has_its_own_glyph_colour_and_style() {
+    let vault = TempVault::new("task-states");
+    let index = vault.index();
+    for theme in ["obsidian-dark", "terminal", "catppuccin-latte"] {
+        let p = Palette::from(&presets::builtin_by_name(theme).expect("theme"));
+        // (state, glyph, colour of the glyph, struck through)
+        let table = [
+            (' ', icons::TASK_TODO, p.checkbox_todo, false),
+            ('x', icons::TASK_DONE, p.checkbox_done, true),
+            ('X', icons::TASK_DONE, p.checkbox_done, true),
+            ('-', icons::TASK_CANCELLED, p.text_faint, true),
+            ('>', icons::TASK_FORWARDED, p.text_info, false),
+            ('<', icons::TASK_SCHEDULED, p.callout_tip, false),
+            ('?', icons::TASK_QUESTION, p.callout_question, false),
+            ('!', icons::TASK_IMPORTANT, p.callout_danger, false),
+            ('/', icons::TASK_PROGRESS, p.text_warning, false),
+            ('D', icons::TASK_OTHER, p.text_accent, false),
+        ];
+        let mut glyphs = Vec::new();
+        let mut colours = Vec::new();
+        for (state, glyph, colour, struck) in table {
+            let source = format!("- [{state}] word\n");
+            let lines = render_document(&markdown::parse(&source), &mut Ctx::text(&p, &index), 40);
+            assert_eq!(lines.len(), 1, "{theme} {state:?}");
+
+            let shown = glyph.to_string();
+            let glyph_style = style_of(&lines, &shown);
+            assert_eq!(
+                glyph_style.fg,
+                Some(colour),
+                "{theme} {state:?} glyph colour"
+            );
+            let text = style_of(&lines, "word");
+            assert_eq!(
+                text.add_modifier.contains(Modifier::CROSSED_OUT),
+                struck,
+                "{theme} {state:?} struck"
+            );
+            let text_colour = if struck { p.text_faint } else { p.text_normal };
+            assert_eq!(text.fg, Some(text_colour), "{theme} {state:?} text colour");
+            glyphs.push(glyph);
+            if state != 'X' {
+                colours.push(format!("{colour:?}"));
+            }
+        }
+        glyphs.sort_unstable();
+        glyphs.dedup();
+        assert_eq!(glyphs.len(), 9, "{theme}: nine states, nine glyphs");
+        colours.sort();
+        colours.dedup();
+        assert_eq!(colours.len(), 9, "{theme}: nine states, nine colours");
+
+        let cancelled = render_document(
+            &markdown::parse("- [-] gone\n- [x] done\n- [!] now\n"),
+            &mut Ctx::text(&p, &index),
+            40,
+        );
+        assert!(
+            style_of(&cancelled, "gone")
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(
+            !style_of(&cancelled, "done")
+                .add_modifier
+                .contains(Modifier::DIM)
+        );
+        assert!(
+            style_of(&cancelled, &icons::TASK_IMPORTANT.to_string())
+                .add_modifier
+                .contains(Modifier::BOLD)
+        );
+    }
+}
+
+#[test]
+fn task_glyphs_are_nerd_font_material_design_boxes_not_the_missing_ballot_box() {
+    let all = [
+        icons::TASK_TODO,
+        icons::TASK_DONE,
+        icons::TASK_CANCELLED,
+        icons::TASK_FORWARDED,
+        icons::TASK_SCHEDULED,
+        icons::TASK_QUESTION,
+        icons::TASK_IMPORTANT,
+        icons::TASK_PROGRESS,
+        icons::TASK_OTHER,
+    ];
+    for glyph in all {
+        // nf-md lives in the supplementary private use area. `fc-list
+        // ':charset=<hex>'` confirmed each one is in CaskaydiaMono Nerd Font.
+        assert!(
+            ('\u{f0001}'..='\u{f1af0}').contains(&glyph),
+            "U+{:X} is not a Material Design glyph",
+            u32::from(glyph)
+        );
+        assert!(!matches!(glyph, '\u{2610}'..='\u{2612}'));
+    }
+}
+
+#[test]
+fn hard_breaks_start_a_new_row() {
+    let table: &[(&str, &[&str])] = &[
+        ("one  \ntwo\n", &["one", "two"]),
+        ("one\\\ntwo\n", &["one", "two"]),
+        ("a<br>b\n", &["a", "b"]),
+        ("a <br/> b\n", &["a", "b"]),
+        ("a<br><br>b\n", &["a", "", "b"]),
+        ("one\ntwo\n", &["one two"]),
+        ("- a<br>b\n", &["• a", "  b"]),
+        ("**a  \nb**\n", &["a", "b"]),
+    ];
+    for (source, expected) in table {
+        assert_eq!(shown(source, 40), *expected, "{source:?}");
+    }
+    // A break is not a newline in a table cell, which is one row.
+    let cell = shown("| a<br>b | c |\n|---|---|\n| 1 | 2 |\n", 40);
+    assert!(cell.iter().any(|row| row.contains("a b")), "{cell:?}");
+}
+
+#[test]
+fn kbd_is_a_dim_chip_mark_is_a_highlight_and_sub_sup_are_unicode() {
+    let vault = TempVault::new("render-html");
+    let index = vault.index();
+    let p = palette();
+    let lines = render_document(
+        &markdown::parse(
+            "Press <kbd>Ctrl</kbd> and <mark>this</mark>: H<sub>2</sub>O, m<sup>2</sup>.\n",
+        ),
+        &mut Ctx::text(&p, &index),
+        60,
+    );
+    let row = text_of(&lines).join("\n").replace('\u{a0}', " ");
+    assert!(row.contains("Press  Ctrl  and"), "{row:?}");
+    assert!(row.contains("H₂O, m²."), "{row:?}");
+    assert!(!row.contains('<'), "no tag shows: {row:?}");
+
+    let chip = style_of(&lines, "\u{a0}Ctrl\u{a0}");
+    assert_eq!(chip.fg, Some(p.text_muted), "a dim key");
+    assert_eq!(chip.bg, Some(p.tag_bg), "on a chip");
+    let mark = style_of(&lines, "this");
+    assert_eq!(mark.bg, Some(p.text_highlight_bg), "as ==highlight== is");
+    assert_eq!(mark.fg, Some(p.text_highlight_fg));
+}
+
+#[test]
+fn other_html_shows_as_the_text_it_is() {
+    let rows = shown("<span>a</span> <div>b</div> <details>c</details>\n", 60);
+    assert_eq!(rows, ["<span>a</span> <div>b</div> <details>c</details>"]);
+}
+
+fn screen_rows_in(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    let backend = ratatui::backend::TestBackend::new(width, height);
+    let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| crate::ui::draw(frame, app))
+        .expect("draw");
+    let buffer = terminal.backend().buffer();
+    buffer
+        .content
+        .chunks(usize::from(width))
+        .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+        .collect()
+}
+
+const SHOWCASE: &str = include_str!("showcase.md");
+const SHOWCASE_ALPHA: &str = "# Alpha\n\nThe target. ^para1\n";
+
+#[test]
+fn the_showcase_note_reads_without_leaks_and_is_never_changed() {
+    let vault = TempVault::new("showcase-hygiene");
+    vault.write("Showcase.md", SHOWCASE);
+    vault.write("Alpha.md", SHOWCASE_ALPHA);
+    let mut app = open(&vault, "Showcase.md");
+    let rows = screen_rows_in(&mut app, 120, 80);
+    let screen = rows.join("\n");
+
+    // Nothing of the syntax is left on the page.
+    for leak in [
+        "inline comment",
+        "never shows",
+        "runs over lines",
+        "^item1",
+        "<br",
+        "<kbd>",
+        "</kbd>",
+        "<mark>",
+        "<sub>",
+        "<sup>",
+        "***",
+        "*both",
+        "*__",
+        "__*",
+    ] {
+        assert!(!screen.contains(leak), "{leak:?} leaks:\n{screen}");
+    }
+    // Comments hid text, not the words around them.
+    assert!(screen.contains("Before after it."), "{screen}");
+    assert!(
+        screen.contains("Text before and text after it."),
+        "{screen}"
+    );
+    // Code keeps what it holds: the only `%%` left are the two in code.
+    assert!(screen.contains("%% stays in code"), "{screen}");
+    assert!(screen.contains("%% not a comment here"), "{screen}");
+    assert_eq!(screen.matches("%%").count(), 2, "{screen}");
+
+    // Hard breaks are rows of their own.
+    let at = |needle: &str| {
+        rows.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no row with {needle:?}:\n{screen}"))
+    };
+    assert_eq!(at("break the line.") - at("Two trailing spaces"), 1);
+    assert_eq!(
+        at("breaks it too, and so does") - at("A trailing backslash"),
+        1
+    );
+    assert_eq!(at("an HTML break") - at("breaks it too, and so does"), 1);
+    assert_eq!(at("of either kind.") - at("an HTML break"), 1);
+
+    // The block id is not shown, though a link to it is (as Obsidian does).
+    let id_row = &rows[at("A paragraph you can link to.")];
+    assert!(!id_row.contains('^'), "{id_row:?}");
+    assert!(screen.contains("Alpha › ^para1"), "{screen}");
+
+    // HTML with a rendering, and HTML without one.
+    assert!(screen.contains("\u{a0}Ctrl\u{a0}"), "{screen}");
+    assert!(
+        screen.contains("Water is H₂O and an area is m²."),
+        "{screen}"
+    );
+    assert!(screen.contains("Powers: 2¹⁰ is 1024."), "{screen}");
+    assert!(screen.contains("x^(n+1) and a_(i)"), "{screen}");
+    assert!(
+        screen.contains("Tags stay text: <span>x</span> <b>y</b>."),
+        "{screen}"
+    );
+
+    // Nine task glyphs, none of the ones the font lacks.
+    for glyph in [
+        icons::TASK_TODO,
+        icons::TASK_DONE,
+        icons::TASK_CANCELLED,
+        icons::TASK_FORWARDED,
+        icons::TASK_SCHEDULED,
+        icons::TASK_QUESTION,
+        icons::TASK_IMPORTANT,
+        icons::TASK_PROGRESS,
+        icons::TASK_OTHER,
+    ] {
+        assert!(screen.contains(glyph), "U+{:X} missing", u32::from(glyph));
+    }
+    assert!(!screen.contains(['\u{2610}', '\u{2611}', '\u{2612}']));
+
+    // Reading is display only: no edit, nothing to save, the file as it was.
+    assert_eq!(app.unsaved_count(), 0);
+    assert_eq!(
+        std::fs::read_to_string(vault.path().join("Showcase.md")).expect("note"),
+        SHOWCASE
+    );
+
+    // The block id still names its paragraph, and the link to it still goes
+    // to the note that holds it.
+    let index = vault.index();
+    assert!(index.resolve("Alpha").is_some());
+    let mut alpha = open(&vault, "Alpha.md");
+    let alpha_screen = screen_rows_in(&mut alpha, 80, 20).join("\n");
+    assert!(alpha_screen.contains("The target."), "{alpha_screen}");
+    assert!(!alpha_screen.contains("^para1"), "{alpha_screen}");
+    assert_eq!(
+        std::fs::read_to_string(vault.path().join("Alpha.md")).expect("note"),
+        SHOWCASE_ALPHA
+    );
+}
+
 #[test]
 fn callouts_render_with_a_colored_bar_and_title() {
     let vault = TempVault::new("render-callout");
