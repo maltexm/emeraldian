@@ -458,9 +458,22 @@ and the arrow keys follow the rows you can see. Markdown is styled as you type i
 — headings coloured, bullets drawn as `•`, tasks as `[☑]`, quotes as `▎` — but
 nothing is hidden and nothing moves: each glyph is exactly as wide as the
 character it stands for, so the cursor is always on the character it looks like
-it's on. The line you're editing shows its syntax at full contrast. Because both
-modes lay prose out in the same column at the same width, `Ctrl+E` restyles the
-page instead of reflowing it. Set `editor.wrap = false` to pan sideways instead.
+it's on. The line you're editing shows its syntax at full contrast. Because
+reading mode uses a configurable prose measure, switching with `Ctrl+E` can
+reflow the page. Set `editor.wrap = false` to pan sideways in the built-in editor.
+
+**Reading width.** Prose wraps in a centred column of 100 terminal cells by
+default, in both normal view and F8 focus mode. Focus mode hides the other panes;
+it does not impose a second width limit. Tables, code, display maths, images and
+Mermaid/Excalidraw drawings are not wrapped: when they fit the column they line up
+with the prose, when they need more they are centred on the note pane up to its
+full width, and beyond that they pan. Narrow panes shrink the
+column to the available width after margins. This does not resize the editor.
+
+```toml
+[ui]
+reading_width = 100        # maximum prose width; 0 uses the full note pane
+```
 
 **Maths.** `$…$` and `$$…$$` are typeset in the reading pane rather than shown
 as TeX: Greek letters and operators, `x²` and `aᵢ`, `ℝ` and `𝔼`, all spaced the

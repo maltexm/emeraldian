@@ -8,6 +8,7 @@ mod blocks;
 mod code;
 mod embeds;
 mod inline;
+mod layout;
 mod tables;
 mod view;
 
@@ -20,8 +21,8 @@ use embeds::{Lift, is_mermaid_file, lift, mermaid_document};
 pub use inline::wrap_spans;
 use inline::{display_math, render_spans, render_styled_spans, shift};
 use tables::render_table;
-pub use view::ReadingCache;
 pub(super) use view::draw_reading;
+pub use view::{ReadingCache, link_at};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -71,6 +72,10 @@ pub struct Ctx<'a> {
     /// embed that names one of them can be refused instead of followed into a
     /// cycle. Obsidian keeps the same stack for the same reason.
     pub embeds: Vec<String>,
+    /// Prose measure inside the available pane; zero leaves it unrestricted.
+    pub reading_width: usize,
+    /// Additional room available to lifted content outside the prose measure.
+    pub breakout: usize,
 }
 
 impl<'a> Ctx<'a> {
@@ -86,6 +91,8 @@ impl<'a> Ctx<'a> {
             pictures: Vec::new(),
             anchors: Vec::new(),
             embeds: Vec::new(),
+            reading_width: 0,
+            breakout: 0,
         }
     }
 }
@@ -123,7 +130,7 @@ pub fn render_document(
     let mut lines = Vec::new();
     for block in &document.blocks {
         ctx.anchors.push((block.line, lines.len()));
-        render_block(block, ctx, width, 0, &mut lines);
+        layout::render_column_block(block, ctx, width, ctx.reading_width, &mut lines);
     }
     lines
 }

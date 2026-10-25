@@ -72,7 +72,7 @@ pub fn draw(
     };
 
     match app.active().map(|t| t.mode) {
-        Some(Mode::Reading) => draw_reading(frame, app, palette, body, gutter, regions),
+        Some(Mode::Reading) => draw_reading(frame, app, palette, body, 0, regions),
         Some(Mode::Editing) => draw_editing(frame, app, palette, body, gutter, regions),
         None => {}
     }

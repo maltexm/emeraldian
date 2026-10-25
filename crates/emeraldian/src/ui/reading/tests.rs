@@ -3,6 +3,292 @@ use super::*;
 use emeraldian_core::test_support::TempVault;
 use emeraldian_theme::{Palette, presets};
 
+#[test]
+fn prose_wraps_in_a_centred_hundred_column_measure() {
+    let vault = TempVault::new("reading-column");
+    vault.write("A.md", &"word ".repeat(80));
+    let mut app = open(&vault, "A.md");
+    app.focus_mode = true;
+    let rows = screen_rows(&mut app);
+    let row = rows.iter().find(|row| row.contains("word")).unwrap();
+    assert_eq!(row.find("word"), Some(50));
+    assert!(row.trim().len() <= 100);
+    assert!(app.reading.lines.len() >= 4);
+}
+
+#[test]
+fn wide_blocks_break_out_without_widening_surrounding_prose() {
+    let vault = TempVault::new("reading-breakout");
+    let code = "x".repeat(120);
+    vault.write(
+        "A.md",
+        &format!("Before\n\n```text\n{code}\n```\n\nAfter\n"),
+    );
+    let mut app = open(&vault, "A.md");
+    app.focus_mode = true;
+    let rows = screen_rows(&mut app);
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.contains("Before"))
+            .unwrap()
+            .find("Before"),
+        Some(50)
+    );
+    assert_eq!(
+        rows.iter().find(|r| r.contains(&code)).unwrap().find(&code),
+        // Centred on the pane (194 columns wide here), wider than the prose.
+        Some(40)
+    );
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.contains("After"))
+            .unwrap()
+            .find("After"),
+        Some(50)
+    );
+}
+
+#[test]
+fn inline_images_break_out_but_the_words_around_them_keep_the_measure() {
+    let vault = TempVault::new("column-image");
+    vault.write_bytes("chart.png", &png(1600, 200));
+    let index = vault.index();
+    let palette = palette();
+    let mut images = images(30);
+    let mut ctx = drawing(&palette, &index, &mut images);
+    ctx.reading_width = 40;
+    let lines = render_document(
+        &markdown::parse("Before ![chart](chart.png) After"),
+        &mut ctx,
+        160,
+    );
+    assert_eq!(ctx.pictures[0].size.width, 160);
+    assert_eq!(ctx.pictures[0].indent, 0);
+    let text = text_of(&lines);
+    assert_eq!(text[0].find("Before"), Some(60));
+    assert_eq!(text.last().unwrap().find("After"), Some(60));
+}
+
+#[test]
+fn quoted_code_that_fits_the_column_keeps_its_bar_in_the_column() {
+    let vault = TempVault::new("quoted-column");
+    let index = vault.index();
+    let palette = palette();
+    let mut ctx = Ctx::text(&palette, &index);
+    ctx.reading_width = 40;
+    let lines = render_document(
+        &markdown::parse("> words\n>\n> ```rust\n> wide_code\n> ```\n"),
+        &mut ctx,
+        120,
+    );
+    let text = text_of(&lines);
+    // Bar and space, then the panel's own space in front of the code.
+    assert_eq!(first_column_of(&text, "words"), 42);
+    assert_eq!(first_column_of(&text, "wide_code"), 43);
+    assert_eq!(first_column_of(&text, "▎"), 40);
+}
+
+#[test]
+fn quoted_code_wider_than_the_column_breaks_out_with_its_bar() {
+    let vault = TempVault::new("quoted-wide-column");
+    let index = vault.index();
+    let palette = palette();
+    let mut ctx = Ctx::text(&palette, &index);
+    ctx.reading_width = 40;
+    let source = format!("> words\n>\n> ```rust\n> {}\n> ```\n", "x".repeat(80));
+    let lines = render_document(&markdown::parse(&source), &mut ctx, 120);
+    let text = text_of(&lines);
+    assert_eq!(first_column_of(&text, "words"), 42);
+    // Bar, space and panel space (83 columns), centred in 120.
+    let bar = text.iter().find(|row| row.contains("xxx")).unwrap();
+    assert_eq!(
+        bar.find('▎').map(|at| UnicodeWidthStr::width(&bar[..at])),
+        Some(18)
+    );
+    assert_eq!(first_column_of(&text, "xxx"), 21);
+}
+
+/// Rows with their common left margin removed, so two renders of the same
+/// block compare equal wherever the block was placed.
+fn dedented(lines: &[Line<'_>]) -> Vec<String> {
+    let rows = text_of(lines);
+    let margin = rows
+        .iter()
+        .filter(|row| !row.trim().is_empty())
+        .map(|row| row.len() - row.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    rows.iter()
+        .map(|row| row.get(margin..).unwrap_or("").trim_end().to_string())
+        .collect()
+}
+
+fn first_column_of(rows: &[String], needle: &str) -> usize {
+    let row = rows
+        .iter()
+        .find(|row| row.contains(needle))
+        .unwrap_or_else(|| panic!("no row shows {needle:?}: {rows:#?}"));
+    UnicodeWidthStr::width(row.split(needle).next().unwrap())
+}
+
+#[test]
+fn a_table_that_fits_the_column_lines_up_with_the_prose() {
+    let vault = TempVault::new("column-table");
+    let index = vault.index();
+    let palette = palette();
+    let mut ctx = Ctx::text(&palette, &index);
+    ctx.reading_width = 100;
+    let lines = render_document(
+        &markdown::parse("Prose\n\n| A | B |\n|---|---|\n| 1 | 2 |\n"),
+        &mut ctx,
+        160,
+    );
+    let rows = text_of(&lines);
+    assert_eq!(first_column_of(&rows, "Prose"), 30);
+    assert_eq!(first_column_of(&rows, "┌"), 30, "{rows:#?}");
+}
+
+#[test]
+fn code_that_fits_the_column_is_a_column_wide_panel() {
+    let vault = TempVault::new("column-code");
+    let index = vault.index();
+    let palette = palette();
+    let mut ctx = Ctx::text(&palette, &index);
+    ctx.reading_width = 100;
+    let lines = render_document(
+        &markdown::parse("Prose\n\n```rust\nlet a = 1;\n```\n"),
+        &mut ctx,
+        160,
+    );
+    let rows = text_of(&lines);
+    assert_eq!(first_column_of(&rows, "let a"), 31, "{rows:#?}");
+    let code = rows.iter().find(|row| row.contains("let a")).unwrap();
+    assert_eq!(UnicodeWidthStr::width(code.as_str()), 130, "{rows:#?}");
+}
+
+#[test]
+fn content_wider_than_the_column_is_centred_on_the_pane() {
+    let vault = TempVault::new("column-wide-code");
+    let index = vault.index();
+    let palette = palette();
+    let mut ctx = Ctx::text(&palette, &index);
+    ctx.reading_width = 100;
+    let source = format!("```text\n{}\n```\n", "x".repeat(120));
+    let lines = render_document(&markdown::parse(&source), &mut ctx, 160);
+    let rows = text_of(&lines);
+    // One space of panel padding in front of 120 characters: 121 columns.
+    assert_eq!(first_column_of(&rows, "xxx"), 20, "{rows:#?}");
+    let code = rows.iter().find(|row| row.contains("xxx")).unwrap();
+    assert_eq!(UnicodeWidthStr::width(code.as_str()), 19 + 121);
+}
+
+#[test]
+fn content_wider_than_the_pane_starts_at_its_edge() {
+    let vault = TempVault::new("column-huge-code");
+    let index = vault.index();
+    let palette = palette();
+    let mut ctx = Ctx::text(&palette, &index);
+    ctx.reading_width = 100;
+    let source = format!("```text\n{}\n```\n", "x".repeat(300));
+    let lines = render_document(&markdown::parse(&source), &mut ctx, 160);
+    assert_eq!(first_column_of(&text_of(&lines), "xxx"), 1);
+}
+
+#[test]
+fn small_pictures_and_diagrams_stay_in_the_column() {
+    let vault = TempVault::new("column-small-embeds");
+    vault.write_bytes("dot.png", &png(400, 200));
+    vault.write("Flow.mmd", FLOW);
+    vault.write("Flow.excalidraw", SCENE);
+    let index = vault.index();
+    let palette = palette();
+    let mut images = images(30);
+    let mut ctx = drawing(&palette, &index, &mut images);
+    ctx.reading_width = 100;
+    let lines = render_document(
+        &markdown::parse("![dot](dot.png)\n\n![[Flow.mmd]]\n\n![[Flow.excalidraw]]\n"),
+        &mut ctx,
+        160,
+    );
+    assert_eq!(ctx.pictures.len(), 2, "picture and drawing");
+    for picture in &ctx.pictures {
+        assert_eq!(picture.indent, 30, "{:?}", picture.size);
+    }
+    let rows = text_of(&lines);
+    assert_eq!(first_column_of(&rows, "Vault"), 30 + 3, "{rows:#?}");
+}
+
+#[test]
+fn column_layout_handles_narrow_and_unrestricted_panes() {
+    let vault = TempVault::new("column-widths");
+    let index = vault.index();
+    let palette = palette();
+    for (pane, measure, offset, wrap) in [
+        (160, 100, 30, 100),
+        (40, 100, 0, 40),
+        (160, 0, 0, 160),
+        (121, 100, 11, 100),
+    ] {
+        let mut ctx = Ctx::text(&palette, &index);
+        ctx.reading_width = measure;
+        let lines = render_document(&markdown::parse(&"word ".repeat(100)), &mut ctx, pane);
+        for row in text_of(&lines) {
+            assert_eq!(row.find("word"), Some(offset));
+            assert!(row.trim().len() <= wrap);
+        }
+    }
+}
+
+#[test]
+fn every_wide_block_uses_the_pane_independently_of_prose_width() {
+    let vault = TempVault::new("all-breakouts");
+    vault.write("Flow.excalidraw", SCENE);
+    vault.write("Flow.mmd", FLOW);
+    let index = vault.index();
+    let palette = palette();
+    for source in [
+        "| Column | Other |\n|---|---|\n| value | value |".to_string(),
+        "$$\\frac{a+b}{c+d}$$".to_string(),
+        format!("```mermaid\n{FLOW}\n```"),
+        "![[Flow.mmd]]".to_string(),
+        "![[Flow.excalidraw]]".to_string(),
+        format!("```rust\n{}\n```", "x".repeat(120)),
+    ] {
+        let blocks = markdown::parse(&source);
+        let mut full = Ctx::text(&palette, &index);
+        let expected = dedented(&render_document(&blocks, &mut full, 160));
+        let mut measured = Ctx::text(&palette, &index);
+        measured.reading_width = 40;
+        assert_eq!(
+            dedented(&render_document(&blocks, &mut measured, 160)),
+            expected,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn reading_width_changes_invalidate_the_cache_without_changing_note_content() {
+    let vault = TempVault::new("column-cache");
+    let source = "word ".repeat(100);
+    vault.write("A.md", &source);
+    let mut app = open(&vault, "A.md");
+    app.focus_mode = true;
+    screen_rows(&mut app);
+    let measured = app.reading.lines.len();
+    app.config.ui.reading_width = 0;
+    let rows = screen_rows(&mut app);
+    assert_eq!(
+        rows.iter()
+            .find(|r| r.contains("word"))
+            .unwrap()
+            .find("word"),
+        Some(2)
+    );
+    assert!(app.reading.lines.len() < measured);
+    assert_eq!(app.index.read(app.active_note().unwrap()).unwrap(), source);
+}
+
 fn palette() -> Palette {
     Palette::from(&presets::default_theme())
 }
@@ -37,6 +323,22 @@ fn the_reading_layout_is_reused_until_the_note_changes() {
     vault.write("A.md", "the second version\n");
     app.index.refresh_note(id).expect("refresh");
     assert!(screen(&mut app).contains("the second version"));
+}
+
+#[test]
+fn the_link_mark_sits_in_the_margin_beside_the_column_without_moving_the_text() {
+    let palette = palette();
+    let mut line = Line::from(vec![Span::raw(" ".repeat(10)), Span::raw("text with link")]);
+    view::mark_selected_link(&mut line, &palette);
+    let shown: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(shown, format!("{}★ text with link", " ".repeat(8)));
+    assert_eq!(line.width(), 10 + "text with link".width());
+
+    // No margin to put it in: it goes in front, as it did before columns.
+    let mut flush = Line::from("text with link");
+    view::mark_selected_link(&mut flush, &palette);
+    let shown: String = flush.spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(shown, "★ text with link");
 }
 
 /// `]`/`[` pick a link; the reading view must mark that one, not the first.
@@ -592,6 +894,8 @@ fn drawing<'a>(palette: &'a Palette, index: &'a VaultIndex, images: &'a mut Imag
         pictures: Vec::new(),
         anchors: Vec::new(),
         embeds: Vec::new(),
+        reading_width: 0,
+        breakout: 0,
     }
 }
 

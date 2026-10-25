@@ -9,6 +9,28 @@ pub(super) fn render_block(
     indent: usize,
     out: &mut Vec<Line<'static>>,
 ) {
+    if ctx.breakout > 0
+        && matches!(
+            block.kind,
+            BlockKind::Code { .. } | BlockKind::Math(_) | BlockKind::Table(_)
+        )
+    {
+        let extra = std::mem::take(&mut ctx.breakout);
+        let start = out.len();
+        render_block(block, ctx, width + extra, indent, out);
+        ctx.breakout = extra;
+        // Display maths centres itself on the pane, which is also the middle
+        // of the column; everything else is placed by what it needs.
+        let mark = if matches!(block.kind, BlockKind::Math(_)) {
+            ratatui::layout::Alignment::Center
+        } else {
+            ratatui::layout::Alignment::Left
+        };
+        for line in &mut out[start..] {
+            line.alignment = Some(mark);
+        }
+        return;
+    }
     let palette = ctx.palette;
     let pad = " ".repeat(indent);
     let inner_width = width.saturating_sub(indent).max(8);
@@ -128,7 +150,10 @@ pub(super) fn render_block(
                     spans.push(Span::raw(continuation.clone()));
                 }
                 spans.extend(line.spans);
-                out.push(Line::from(spans));
+                out.push(Line {
+                    alignment: line.alignment,
+                    ..Line::from(spans)
+                });
             }
         }
 
@@ -153,7 +178,10 @@ pub(super) fn render_block(
                     span.style = span.style.fg(palette.quote_fg);
                     span
                 }));
-                out.push(Line::from(spans));
+                out.push(Line {
+                    alignment: line.alignment,
+                    ..Line::from(spans)
+                });
             }
         }
 
@@ -183,7 +211,10 @@ pub(super) fn render_block(
                     Span::styled(format!("{} ", icons::QUOTE_BAR), Style::default().fg(color)),
                 ];
                 spans.extend(line.spans);
-                out.push(Line::from(spans));
+                out.push(Line {
+                    alignment: line.alignment,
+                    ..Line::from(spans)
+                });
             }
 
             let mark = ctx.pictures.len();
@@ -198,7 +229,10 @@ pub(super) fn render_block(
                     Span::styled(format!("{} ", icons::QUOTE_BAR), Style::default().fg(color)),
                 ];
                 spans.extend(line.spans);
-                out.push(Line::from(spans));
+                out.push(Line {
+                    alignment: line.alignment,
+                    ..Line::from(spans)
+                });
             }
         }
 

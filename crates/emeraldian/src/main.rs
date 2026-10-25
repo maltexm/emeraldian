@@ -763,6 +763,21 @@ fn handle_click(app: &mut App, point: (u16, u16)) -> bool {
         return true;
     }
 
+    if let Some(link) = ui::reading::link_at(app, point) {
+        if let Some(tab) = app.active_mut() {
+            tab.selected_link = Some(link);
+        }
+        app.focus = app::Focus::Note;
+        keys::handle(
+            app,
+            crossterm::event::KeyEvent::new(
+                crossterm::event::KeyCode::Enter,
+                crossterm::event::KeyModifiers::NONE,
+            ),
+        );
+        return true;
+    }
+
     // Clicking text puts the caret there, as it does in any editor.
     if place_caret(app, point, false) {
         app.focus = app::Focus::Note;
@@ -1200,6 +1215,25 @@ mod tests {
             !all.contains("compressed-json") && !all.contains(&packed[..24]),
             "the base64 the drawing is stored as never reaches the screen"
         );
+    }
+
+    #[test]
+    fn reading_link_click_uses_the_centred_offset_not_the_margin() {
+        let (_vault, mut app) = demo();
+        app.focus_mode = true;
+        app.config.ui.reading_width = 40;
+        lay_out(&mut app);
+        let before = app.active_note();
+        let area = app.regions.reading.unwrap();
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| ui::draw(frame, &mut app)).unwrap();
+        let rows = screen(&terminal);
+        let y = rows.iter().position(|row| row.contains("Beta")).unwrap() as u16;
+        let x = rows[y as usize].find("Beta").unwrap() as u16;
+        assert!(click(&mut app, area.x + 1, y));
+        assert_eq!(app.active_note(), before, "left margin is not a link");
+        assert!(click(&mut app, x, y));
+        assert_eq!(app.active_note(), app.index.id_of_rel("Beta.md"));
     }
 
     #[test]

@@ -32,6 +32,7 @@ struct ReadingKey {
     /// What each picture measures.
     images: u64,
     width: usize,
+    reading_width: u16,
     height: u16,
     palette: Palette,
 }
@@ -101,6 +102,7 @@ pub(in crate::ui) fn draw_reading(
         index: app.index.revision(),
         images: app.images.generation(),
         width,
+        reading_width: app.config.ui.reading_width,
         height: area.height,
         palette: palette.clone(),
     };
@@ -134,6 +136,8 @@ pub(in crate::ui) fn draw_reading(
             pictures: Vec::new(),
             anchors: Vec::new(),
             embeds: note_meta.into_iter().collect(),
+            reading_width: app.config.ui.reading_width as usize,
+            breakout: 0,
         };
         let lines = render_document(&document, &mut ctx, width);
         // Content can be wider than the pane — a table laid out at its
@@ -149,6 +153,7 @@ pub(in crate::ui) fn draw_reading(
         };
     }
     regions.anchors.clone_from(&app.reading.anchors);
+    regions.reading = Some(area);
 
     let total = app.reading.lines.len();
     let height = area.height as usize;
@@ -209,6 +214,46 @@ pub(in crate::ui) fn draw_reading(
         hscroll,
     );
     scrollbar(frame, palette, full, scroll, total);
+}
+
+/// Link under a reading-mode mouse point. Cached rows already include the
+/// column offset, so margins cannot accidentally act as links.
+pub fn link_at(app: &App, point: (u16, u16)) -> Option<usize> {
+    let area = app.regions.reading?;
+    if !area.contains(ratatui::layout::Position::new(point.0, point.1)) {
+        return None;
+    }
+    let tab = app.active()?;
+    let row = tab.scroll + usize::from(point.1 - area.y);
+    let col = tab.hscroll + usize::from(point.0 - area.x);
+    let note = app.index.note(tab.note)?;
+    let line = app.reading.lines.get(row)?;
+    let text: String = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect();
+    for idx in 0..note.links.len() {
+        let reveal = crate::app::Reveal::for_link(note, idx)?;
+        let start = anchor_row(&app.reading.anchors, reveal.line);
+        if row_showing(
+            &app.reading.lines,
+            &app.reading.anchors,
+            start,
+            &reveal.text,
+            reveal.nth,
+        ) != Some(row)
+        {
+            continue;
+        }
+        for (byte, _) in text.match_indices(&reveal.text) {
+            let left = UnicodeWidthStr::width(&text[..byte]);
+            if col >= left && col < left + UnicodeWidthStr::width(reveal.text.as_str()) {
+                return Some(idx);
+            }
+        }
+    }
+    None
 }
 
 /// Draws the pictures whose rows are on screen, over the blanks left for them.
@@ -318,15 +363,26 @@ fn selected_link_row(app: &App, id: usize) -> Option<usize> {
 
 /// Paints the picked link's row with the theme accent and a star, so the
 /// selection is visible without reading colors.
-fn mark_selected_link(line: &mut Line<'_>, palette: &Palette) {
+pub(super) fn mark_selected_link(line: &mut Line<'_>, palette: &Palette) {
     let mark = Style::default()
         .fg(palette.text_on_accent)
         .bg(palette.accent);
-    if let Some(first) = line.spans.first_mut() {
+    // In a centred column the row starts with its margin: the star goes in
+    // the last two cells of that, beside the text, and nothing moves.
+    let margin = line
+        .spans
+        .first()
+        .filter(|span| span.content.len() >= 2 && span.content.chars().all(|c| c == ' '))
+        .map(|span| span.content.len());
+    if let Some(margin) = margin {
+        line.spans[0].content = " ".repeat(margin - 2).into();
+        line.spans.insert(1, Span::styled("★ ", mark));
+    } else if let Some(first) = line.spans.first_mut() {
         first.content = format!("★ {}", first.content).into();
         first.style = mark;
     }
-    for span in line.spans.iter_mut().skip(1) {
+    let skip = if margin.is_some() { 2 } else { 1 };
+    for span in line.spans.iter_mut().skip(skip) {
         span.style = span.style.bg(palette.accent).fg(palette.text_on_accent);
     }
 }

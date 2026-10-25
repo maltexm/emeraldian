@@ -3327,8 +3327,12 @@ mod familiar_tests {
         press(&mut app, KeyCode::Enter, NONE);
 
         let screen = screen(&mut app);
-        assert!(screen.contains("needle at the bottom"), "{screen}");
-        assert!(!screen.contains("needle at the top"), "{screen}");
+        // Reading width can split the phrase across screen rows and pane borders.
+        assert!(
+            screen.contains("needle") && screen.contains("bottom"),
+            "{screen}"
+        );
+        assert!(!screen.contains("top"), "{screen}");
     }
 
     #[test]

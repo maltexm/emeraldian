@@ -401,6 +401,8 @@ pub struct Regions {
     /// Which rendered row each block of the reading pane started on, as
     /// `(source line, row)`, so the outline can scroll to a heading.
     pub anchors: Vec<(usize, usize)>,
+    /// Full reading text area; centred padding is included in cached rows.
+    pub reading: Option<Rect>,
     pub main: Option<Rect>,
     pub chat: Option<Rect>,
     /// The graph canvas with its coordinate bounds, for hit-testing nodes.

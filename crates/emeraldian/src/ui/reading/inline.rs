@@ -45,7 +45,7 @@ pub(super) fn render_styled_spans(
             // `$$…$$` written mid-paragraph is lifted out the same way, since
             // Obsidian sets it apart from the text around it.
             SpanKind::Math { display: true } => None,
-            _ => match lift(span, ctx, width, rest_pad) {
+            _ => match lift(span, ctx, width + ctx.breakout, rest_pad) {
                 Some(found) => Some(found),
                 None => {
                     let mut span = span.clone();
@@ -71,11 +71,16 @@ pub(super) fn render_styled_spans(
         let (source, size) = match lifted_out {
             None => {
                 let pad = if out.is_empty() { first_pad } else { rest_pad };
-                display_math(&span.text, ctx.palette, width, pad, out);
+                let start = out.len();
+                display_math(&span.text, ctx.palette, width + ctx.breakout, pad, out);
+                // Centred on the pane, which is also the column's middle.
+                for line in &mut out[start..] {
+                    line.alignment = Some(ratatui::layout::Alignment::Center);
+                }
                 continue;
             }
             Some(Lift::Lines(drawn)) => {
-                out.extend(drawn);
+                out.extend(drawn.into_iter().map(|line| line.left_aligned()));
                 continue;
             }
             Some(Lift::Picture(source, size)) => (source, size),
@@ -89,7 +94,10 @@ pub(super) fn render_styled_spans(
         // The picture is drawn over these rows once it has been encoded. They
         // are blank so that the text below sits where it will finally sit, and
         // so a half-scrolled picture leaves no debris behind.
-        out.extend(std::iter::repeat_n(Line::from(""), size.height as usize));
+        out.extend(std::iter::repeat_n(
+            Line::from("").left_aligned(),
+            size.height as usize,
+        ));
     }
 
     if !run.is_empty() || out.is_empty() {

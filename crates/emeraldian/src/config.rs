@@ -69,6 +69,8 @@ pub struct UiConfig {
     pub line_numbers: bool,
     /// Start notes in reading mode rather than the editor.
     pub reading_mode: bool,
+    /// Maximum reading prose width; zero uses the full pane.
+    pub reading_width: u16,
     /// How the explorer orders notes within a folder. One of `modified`,
     /// `modified-asc`, `created`, `created-asc`, `name` or `name-desc`.
     ///
@@ -105,6 +107,7 @@ impl Default for UiConfig {
             show_hidden: false,
             line_numbers: true,
             reading_mode: true,
+            reading_width: 100,
             sort_order: SortOrder::default().key().to_string(),
             keyboard: "auto".into(),
         }

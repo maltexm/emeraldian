@@ -176,11 +176,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         column += 1;
     }
 
-    let main = if app.focus_mode && app.view == View::Notes {
-        readable(columns[column])
-    } else {
-        columns[column]
-    };
+    let main = columns[column];
     column += 1;
     regions.main = Some(main);
     regions.screen = Some(area);
@@ -217,25 +213,6 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     modal::draw(frame, app, &palette, area);
 
     app.regions = regions;
-}
-
-/// Widest the note is drawn in focus mode, in columns, gutter and margins
-/// included.
-///
-/// Prose much wider than this is hard to read, which is why Obsidian narrows
-/// its own by default. Tables and code wider than it still pan.
-const FOCUS_WIDTH: u16 = 100;
-
-/// The pane, narrowed to [`FOCUS_WIDTH`] and centred if it is wider.
-fn readable(pane: Rect) -> Rect {
-    if pane.width <= FOCUS_WIDTH {
-        return pane;
-    }
-    Rect {
-        x: pane.x + (pane.width - FOCUS_WIDTH) / 2,
-        width: FOCUS_WIDTH,
-        ..pane
-    }
 }
 
 /// The hint bar's keys, with focus mode's among them wherever there isn't an
@@ -1535,9 +1512,9 @@ mod tests {
     }
 
     #[test]
-    fn switching_modes_does_not_reflow_the_prose() {
-        // The prose column has to sit in the same place with the same width in
-        // both modes, or Ctrl+E rewraps the paragraph under the reader's eyes.
+    fn switching_modes_preserves_prose_with_independent_wrap_widths() {
+        // Reading uses its own measure without an editor gutter; editing keeps
+        // its existing width. Both must show every word exactly once.
         let vault = TempVault::new("render-reflow");
         let sentence = "one two three four five six seven eight nine ten eleven twelve";
         vault.write("Prose.md", &format!("{sentence}\n"));
@@ -1565,11 +1542,8 @@ mod tests {
         };
         let reading = broke_as(&reading);
         assert!(reading.len() > 1, "the sentence should wrap at this width");
-        assert_eq!(
-            reading,
-            broke_as(&editing),
-            "the same words broke in different places"
-        );
+        assert_eq!(reading.join(" "), sentence);
+        assert_eq!(broke_as(&editing).join(" "), sentence);
     }
 
     /// Draws a frame and reports where the terminal caret ended up.
@@ -1772,13 +1746,13 @@ mod tests {
     }
 
     #[test]
-    fn focus_mode_centres_the_note_on_a_wide_terminal() {
+    fn focus_mode_keeps_the_full_pane_for_wide_content() {
         let (_vault, mut app) = demo_app();
         crate::actions::dispatch(&mut app, crate::app::Action::ToggleFocusMode);
         render(&mut app, 200, 40);
         let main = app.regions.main.expect("the note was drawn");
-        assert_eq!(main.width, FOCUS_WIDTH);
-        assert_eq!(main.x, (200 - FOCUS_WIDTH) / 2);
+        assert_eq!(main.width, 200);
+        assert_eq!(main.x, 0);
 
         render(&mut app, 80, 40);
         assert_eq!(
