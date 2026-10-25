@@ -730,6 +730,31 @@ impl App {
                 .is_some_and(|(path, session)| session.shows_modified(&path))
     }
 
+    /// How many notes have changes that are not on disk: the tabs', and those
+    /// of buffers nvim holds for a file that has no tab (a file the index does
+    /// not know, opened with `:edit`).
+    #[must_use]
+    pub fn unsaved_count(&self) -> usize {
+        let in_tabs = (0..self.tabs.len())
+            .filter(|&index| self.tab_modified(index))
+            .count();
+        let Some(session) = self.nvim.as_ref() else {
+            return in_tabs;
+        };
+        let shown: Vec<PathBuf> = self
+            .tabs
+            .iter()
+            .filter_map(|tab| self.note_path(tab.note))
+            .map(|path| std::fs::canonicalize(&path).unwrap_or(path))
+            .collect();
+        in_tabs
+            + session
+                .modified_notes()
+                .iter()
+                .filter(|path| !shown.contains(path))
+                .count()
+    }
+
     /// Whether nvim holds unsaved edits to the note. The built-in editor's
     /// edits are not asked about here: its tabs carry them themselves.
     #[must_use]

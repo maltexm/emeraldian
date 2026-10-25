@@ -747,9 +747,7 @@ pub fn dispatch(app: &mut App, action: Action) {
         Action::Quit => {
             // Quitting is one keystroke away from every pane, so it asks first
             // — and says what's at stake when there's unsaved work.
-            let unsaved = (0..app.tabs.len())
-                .filter(|&index| app.tab_modified(index))
-                .count();
+            let unsaved = app.unsaved_count();
             let message = match unsaved {
                 0 => "Quit emeraldian?".to_string(),
                 1 => "Quit emeraldian? 1 note has unsaved changes.".to_string(),

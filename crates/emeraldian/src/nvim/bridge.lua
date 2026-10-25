@@ -329,6 +329,46 @@ function M.close_buffer(buf, force)
   vim.api.nvim_buf_delete(buf, { force = force })
 end
 
+--- The buffer nvim holds for the file `name`, or nil. Asked of nvim every time:
+--- a buffer can be opened (`:edit`), wiped and opened again behind emeraldian's
+--- back, and a handle remembered from earlier then points at nothing or at
+--- another buffer.
+function M.buffer_of(name)
+  local function real(path)
+    local resolved = vim.uv.fs_realpath(path)
+    if resolved then
+      return resolved
+    end
+    -- A file that is gone (a note just moved away): its folder still resolves.
+    local dir = vim.uv.fs_realpath(vim.fs.dirname(path))
+    return dir and (dir .. "/" .. vim.fs.basename(path)) or path
+  end
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_get_name(buf) == name then
+      return buf
+    end
+  end
+  local want = real(name)
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    local have = vim.api.nvim_buf_get_name(buf)
+    if have ~= "" and real(have) == want then
+      return buf
+    end
+  end
+  return nil
+end
+
+--- The names of the notes whose buffers have unsaved edits.
+function M.modified_notes()
+  local names = {}
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(buf) and note_buf(buf) and vim.bo[buf].modified then
+      names[#names + 1] = vim.api.nvim_buf_get_name(buf)
+    end
+  end
+  return names
+end
+
 --- The names of all buffers that have one.
 function M.buffer_names()
   local names = {}

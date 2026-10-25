@@ -407,3 +407,68 @@ fn autosave_never_overwrites_a_file_that_changed_on_disk() {
         "auto-save wrote over a file it had not read"
     );
 }
+
+#[test]
+fn a_buffer_nvim_opened_by_itself_is_one_the_session_can_act_on() {
+    let vault = TempVault::new("nvim-life-native");
+    let a = vault.write("A.md", "alpha\n");
+    let b = vault.write("B.md", "bravo\n");
+    let Some(mut session) = start_with(vault.path(), false) else {
+        return;
+    };
+    open(&mut session, &a);
+
+    session.input(&format!(":edit {}<CR>ix<Esc>", b.display()));
+
+    assert!(wait_until(&mut session, |s| s.is_modified(&b)));
+    assert_eq!(session.buffer_text(&b).as_deref(), Some("xbravo\n"));
+    let err = session.close(&b, false).expect_err("unsaved edits stay");
+    assert_eq!(err.to_string(), "the note has unsaved changes");
+    session.save(&b).expect("save");
+    assert_eq!(on_disk(&b), "xbravo\n");
+    assert!(!session.is_modified(&b));
+}
+
+#[test]
+fn a_buffer_nvim_replaced_is_looked_up_again() {
+    let vault = TempVault::new("nvim-life-replaced");
+    let a = vault.write("A.md", "alpha\n");
+    let b = vault.write("B.md", "bravo\n");
+    let Some(mut session) = start_with(vault.path(), false) else {
+        return;
+    };
+    open(&mut session, &a);
+    open(&mut session, &b);
+
+    // The handle the session got for B is gone; B comes back under a new one.
+    session.input(&format!(
+        ":buffer {}<CR>:bwipeout! {}<CR>:edit {}<CR>ix<Esc>",
+        a.display(),
+        b.display(),
+        b.display()
+    ));
+
+    assert!(wait_until(&mut session, |s| s.is_modified(&b)));
+    assert_eq!(session.buffer_text(&b).as_deref(), Some("xbravo\n"));
+    session.save(&b).expect("save");
+    assert_eq!(on_disk(&b), "xbravo\n");
+}
+
+#[test]
+fn modified_notes_lists_every_buffer_with_unsaved_edits() {
+    let vault = TempVault::new("nvim-life-modified-list");
+    let a = vault.write("A.md", "alpha\n");
+    let b = vault.write("B.md", "bravo\n");
+    let Some(mut session) = start_with(vault.path(), false) else {
+        return;
+    };
+    open(&mut session, &a);
+    assert!(session.modified_notes().is_empty());
+
+    session.input(&format!("ix<Esc>:edit {}<CR>iy<Esc>", b.display()));
+
+    assert!(wait_until(&mut session, |s| s.modified_notes().len() == 2));
+    let listed = session.modified_notes();
+    assert!(listed.contains(&resolved(&a)), "{listed:?}");
+    assert!(listed.contains(&resolved(&b)), "{listed:?}");
+}

@@ -49,8 +49,11 @@ fn tool(app: &mut App, name: &str, arguments: serde_json::Value) -> emeraldian_a
 }
 
 fn path_of(app: &App, rel: &str) -> PathBuf {
-    let id = app.index.id_of_rel(rel).expect("indexed");
-    app.index.note(id).expect("note").meta.path.clone()
+    match app.index.id_of_rel(rel).and_then(|id| app.index.note(id)) {
+        Some(note) => note.meta.path.clone(),
+        // A note that is gone from the index still has a place in the vault.
+        None => app.index.vault.path.join(rel),
+    }
 }
 
 /// Whether nvim has a buffer for the note.
@@ -582,14 +585,14 @@ fn rename_of_a_diagram_file_keeps_the_active_note() {
     let Some((vault, mut app)) = nvim_app_with(&[
         ("Alpha.md", "# Alpha\n"),
         ("Move.mmd", "flowchart TD\n  X[[Old]] --> Y[Keep]\n"),
-        ("Other.mermaid", "flowchart TD\n  P --> Q\n"),
+        ("Other.mermaid", "flowchart LR\n  P --> Q\n"),
     ]) else {
         return;
     };
     app.focus = Focus::Note;
     draw(&mut app, 100, 30);
     show(&mut app, "Move.mmd", "flowchart TD");
-    show(&mut app, "Other.mermaid", "flowchart TD");
+    show(&mut app, "Other.mermaid", "flowchart LR");
     show(&mut app, "Move.mmd", "flowchart TD");
 
     rename_active(&mut app, "Renamed");
@@ -617,7 +620,7 @@ fn rename_of_a_diagram_file_keeps_the_active_note() {
     settle(&mut app, 100, 30, |_| {
         vault.read("Renamed.mmd").contains('x')
     });
-    assert_eq!(vault.read("Other.mermaid"), "flowchart TD\n  P --> Q\n");
+    assert_eq!(vault.read("Other.mermaid"), "flowchart LR\n  P --> Q\n");
 }
 
 #[test]
@@ -749,6 +752,223 @@ fn deleting_a_note_with_unsaved_edits_does_not_write_it_back() {
     }
 
     assert!(!vault.exists("Alpha.md"), "autosave brought the note back");
+}
+
+// ---- notes nvim opened by itself -------------------------------------------
+
+/// Auto-save off, Alpha open the app's way. Every test below then goes to Beta
+/// with a native `:edit`, which the app did not ask for and only hears about.
+fn native_app() -> Option<(emeraldian_core::test_support::TempVault, App)> {
+    nvim_app_configured(
+        &[
+            ("Alpha.md", "# Alpha\n\nbody\n"),
+            ("Beta.md", "# Beta\n\nsecond\n"),
+        ],
+        |config| config.editor.auto_save = false,
+    )
+}
+
+/// `:edit`s Beta in nvim and types a mark into it, unsaved. Returns once the
+/// app has followed nvim to Beta and nvim shows the mark.
+fn native_dirty_beta(app: &mut App) {
+    app.focus = Focus::Note;
+    draw(app, 100, 30);
+    settle(app, 100, 30, |app| row(app, 0).starts_with("# Alpha"));
+    let beta = path_of(app, "Beta.md");
+    type_text(app, &format!(":edit {}", beta.display()));
+    press(app, KeyCode::Enter);
+    settle(app, 100, 30, |app| {
+        active_title(app) == "Beta" && row(app, 0).starts_with("# Beta")
+    });
+    type_text(app, "A!");
+    press(app, KeyCode::Esc);
+    settle(app, 100, 30, |app| row(app, 0).starts_with("# Beta!"));
+}
+
+#[test]
+fn closing_a_note_nvim_opened_asks_about_its_unsaved_edits() {
+    let Some((vault, mut app)) = native_app() else {
+        return;
+    };
+    native_dirty_beta(&mut app);
+    let beta = app.active_tab.expect("a tab");
+    assert!(app.tab_modified(beta), "nvim holds unsaved edits to Beta");
+
+    actions::dispatch(&mut app, Action::CloseTab);
+
+    assert!(
+        matches!(app.modal, Some(Modal::Confirm(_))),
+        "modal was {:?}",
+        app.modal
+    );
+    assert_eq!(app.tabs.len(), 2, "nothing is closed before the answer");
+    assert_eq!(
+        buffer_text(&app, "Beta.md").as_deref(),
+        Some("# Beta!\n\nsecond\n")
+    );
+
+    confirm_modal(&mut app);
+    assert_eq!(app.tabs.len(), 1);
+    assert!(!has_buffer(&app, "Beta.md"), "no dirty buffer is orphaned");
+    assert_eq!(vault.read("Beta.md"), "# Beta\n\nsecond\n");
+}
+
+#[test]
+fn quitting_counts_the_unsaved_edits_of_a_note_nvim_opened() {
+    let Some((_vault, mut app)) = native_app() else {
+        return;
+    };
+    native_dirty_beta(&mut app);
+
+    actions::dispatch(&mut app, Action::Quit);
+
+    assert!(
+        matches!(&app.modal, Some(Modal::Confirm(c)) if c.message.contains("1 note has unsaved")),
+        "modal was {:?}",
+        app.modal
+    );
+}
+
+#[test]
+fn saving_a_note_nvim_opened_writes_its_buffer() {
+    let Some((vault, mut app)) = native_app() else {
+        return;
+    };
+    native_dirty_beta(&mut app);
+    let beta = app.active_tab.expect("a tab");
+
+    assert!(app.try_save_tab(beta), "status was {:?}", app.status.text);
+
+    assert_eq!(vault.read("Beta.md"), "# Beta!\n\nsecond\n");
+    assert!(!app.tab_modified(beta));
+}
+
+#[test]
+fn leaving_the_editor_saves_a_note_nvim_opened_with_autosave() {
+    let Some((vault, mut app)) = nvim_app_with(&[
+        ("Alpha.md", "# Alpha\n\nbody\n"),
+        ("Beta.md", "# Beta\n\nsecond\n"),
+    ]) else {
+        return;
+    };
+    native_dirty_beta(&mut app);
+
+    keys::handle(&mut app, ctrl_e());
+
+    assert_eq!(app.active().map(|tab| tab.mode), Some(Mode::Reading));
+    assert_eq!(vault.read("Beta.md"), "# Beta!\n\nsecond\n");
+}
+
+#[test]
+fn the_assistant_cannot_write_over_a_note_nvim_opened_with_unsaved_edits() {
+    let Some((vault, mut app)) = native_app() else {
+        return;
+    };
+    native_dirty_beta(&mut app);
+
+    for (name, arguments) in [
+        ("append_note", json!({ "name": "Beta", "text": "agent" })),
+        (
+            "replace_note",
+            json!({ "name": "Beta", "content": "agent\n" }),
+        ),
+        (
+            "rename_note",
+            json!({ "name": "Beta", "new_name": "Gamma" }),
+        ),
+        ("delete_note", json!({ "name": "Beta" })),
+    ] {
+        let outcome = tool(&mut app, name, arguments);
+        assert!(outcome.is_error, "{name} went through: {}", outcome.content);
+        assert!(
+            outcome
+                .content
+                .contains("note has unsaved edits in the editor"),
+            "{name}: {}",
+            outcome.content
+        );
+    }
+    assert_eq!(vault.read("Beta.md"), "# Beta\n\nsecond\n");
+    assert_eq!(
+        buffer_text(&app, "Beta.md").as_deref(),
+        Some("# Beta!\n\nsecond\n")
+    );
+}
+
+#[test]
+fn the_assistant_reads_the_unsaved_text_of_a_note_nvim_opened() {
+    let Some((_vault, mut app)) = native_app() else {
+        return;
+    };
+    native_dirty_beta(&mut app);
+
+    let (rel, body) = crate::agent::active_note_text(&app).expect("an active note");
+
+    assert_eq!(rel, "Beta.md");
+    assert!(body.contains("# Beta!"), "body was {body:?}");
+}
+
+#[test]
+fn renaming_a_note_nvim_opened_keeps_its_unsaved_edits() {
+    let Some((vault, mut app)) = native_app() else {
+        return;
+    };
+    native_dirty_beta(&mut app);
+
+    rename_active(&mut app, "Zulu");
+
+    assert!(!vault.exists("Beta.md"));
+    assert_eq!(vault.read("Zulu.md"), "# Beta!\n\nsecond\n");
+    assert_eq!(active_title(&app), "Zulu");
+    assert_eq!(
+        buffer_text(&app, "Zulu.md").as_deref(),
+        Some("# Beta!\n\nsecond\n")
+    );
+    assert!(!has_buffer(&app, "Beta.md"), "nothing can write Beta back");
+}
+
+#[test]
+fn quitting_counts_a_dirty_buffer_that_has_no_tab() {
+    let Some((vault, mut app)) = native_app() else {
+        return;
+    };
+    app.focus = Focus::Note;
+    draw(&mut app, 100, 30);
+    settle(&mut app, 100, 30, |app| row(app, 0).starts_with("# Alpha"));
+    // A file the index does not know: nvim opens it, the app gets no tab.
+    type_text(
+        &mut app,
+        &format!(":edit {}", vault.path().join("Fresh.md").display()),
+    );
+    press(&mut app, KeyCode::Enter);
+    type_text(&mut app, "ifresh text");
+    press(&mut app, KeyCode::Esc);
+    settle(&mut app, 100, 30, |app| {
+        row(app, 0).starts_with("fresh text")
+    });
+    assert_eq!(app.tabs.len(), 1);
+
+    actions::dispatch(&mut app, Action::Quit);
+
+    assert!(
+        matches!(&app.modal, Some(Modal::Confirm(c)) if c.message.contains("1 note has unsaved")),
+        "modal was {:?}",
+        app.modal
+    );
+}
+
+#[test]
+fn deleting_a_note_nvim_opened_does_not_write_it_back() {
+    let Some((vault, mut app)) = native_app() else {
+        return;
+    };
+    native_dirty_beta(&mut app);
+    let beta = app.index.id_of_rel("Beta.md").unwrap();
+
+    app.delete_note(beta).expect("deleted");
+
+    assert!(!vault.exists("Beta.md"));
+    assert!(!has_buffer(&app, "Beta.md"), "the buffer is closed");
 }
 
 // ---- nvim going away -------------------------------------------------------

@@ -13,7 +13,7 @@ use super::rpc::{Incoming, Rpc, Waker};
 use crate::config::EditorConfig;
 use anyhow::{Result, anyhow};
 use rmpv::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -58,13 +58,6 @@ pub struct Session {
     rpc: Rpc,
     grid: Grid,
     waker: Waker,
-    /// Buffers shown so far, by canonical path. Switching back to one is a
-    /// `:buffer`, never a reload: a reload would drop unsaved edits.
-    ///
-    /// The handle is kept as nvim sent it: a client that registered the API
-    /// types gets `Buffer` as a msgpack extension, everything else as an
-    /// integer, and handing back what nvim handed out works for both.
-    buffers: HashMap<PathBuf, Value>,
     /// The path [`Session::open`] was last given, exactly as given. Callers
     /// pass the active tab's note on every loop turn, so the common case — the
     /// note is already showing — must not touch the filesystem.
@@ -145,7 +138,6 @@ impl Session {
             waker: rpc.waker(),
             rpc,
             grid: Grid::new(size.0, size.1),
-            buffers: HashMap::new(),
             shown: None,
             size,
             busy_until: Instant::now(),
@@ -168,23 +160,20 @@ impl Session {
             return Ok(());
         }
         let key = canonical(path);
-        let buffer = match self.buffers.get(&key) {
-            Some(buffer) => buffer.clone(),
-            // `bufadd` only names the file, so it answers at once; it is the
-            // switch below that reads it. A path given as an argument cannot
-            // be mistaken for command syntax (`|`, `%`, spaces).
-            None => {
-                let buffer = self.request(
-                    "nvim_call_function",
-                    vec![
-                        Value::from("bufadd"),
-                        Value::Array(vec![Value::from(key.to_string_lossy().into_owned())]),
-                    ],
-                )?;
-                self.buffers.insert(key, buffer.clone());
-                buffer
-            }
-        };
+        // `bufadd` gives the buffer nvim already has for the file, whoever
+        // opened it, and otherwise only names a new one, so it answers at once;
+        // it is the switch below that reads the file. No handle is kept from
+        // one call to the next: switching back to a buffer is a `:buffer`,
+        // never a reload (that would drop unsaved edits), and nvim itself says
+        // which buffer that is. A path given as an argument cannot be mistaken
+        // for command syntax (`|`, `%`, spaces).
+        let buffer = self.request(
+            "nvim_call_function",
+            vec![
+                Value::from("bufadd"),
+                Value::Array(vec![Value::from(key.to_string_lossy().into_owned())]),
+            ],
+        )?;
         // Not a request: reading the file can end in a prompt (a swap file
         // left by a crash) that only a key can answer, and the loop has to stay
         // free to deliver that key.
@@ -425,12 +414,14 @@ impl Session {
     /// trail a keystroke. When nvim cannot answer, the buffer counts as
     /// modified — unless nvim is gone, which takes its buffers with it.
     pub fn is_modified(&self, path: &Path) -> bool {
-        let Some(buffer) = self.buffer(path) else {
-            return false;
-        };
         if self.exited.is_some() {
             return false;
         }
+        let buffer = match self.buffer(path) {
+            Ok(Some(buffer)) => buffer,
+            Ok(None) => return false,
+            Err(_) => return !self.rpc.is_closed(),
+        };
         match self.rpc.request(
             "nvim_get_option_value",
             vec![
@@ -450,7 +441,7 @@ impl Session {
     /// This is what the assistant reads an open note from, so that it sees what
     /// is on screen rather than what was last written to disk.
     pub fn buffer_text(&self, path: &Path) -> Option<String> {
-        let buffer = self.buffer(path)?;
+        let buffer = self.buffer(path).ok()??;
         let lines = self
             .rpc
             .request(
@@ -502,23 +493,14 @@ impl Session {
     ///
     /// A path nvim has no buffer for is no error: there is nothing to move.
     pub fn rename(&mut self, from: &Path, to: &Path) -> Result<()> {
-        let Some(buffer) = self.buffers.remove(&canonical(from)) else {
+        let Some(buffer) = self.buffer(from)? else {
             return Ok(());
         };
         let name = canonical(to);
-        let moved = self.bridge_call(
+        self.bridge_call(
             "rename_buffer",
-            vec![
-                buffer.clone(),
-                Value::from(name.to_string_lossy().into_owned()),
-            ],
-        );
-        if let Err(err) = moved {
-            // Whatever nvim did, it is still the same buffer.
-            self.buffers.insert(canonical(from), buffer);
-            return Err(err);
-        }
-        self.buffers.insert(name, buffer);
+            vec![buffer, Value::from(name.to_string_lossy().into_owned())],
+        )?;
         self.modified.remove(&canonical(from));
         if self.shown.as_deref() == Some(from) {
             self.shown = Some(to.to_path_buf());
@@ -535,7 +517,7 @@ impl Session {
     /// with unsaved edits gets its links rewritten: through the buffer, not
     /// under it. A path nvim has no buffer for is left alone.
     pub fn set_lines(&mut self, path: &Path, text: &str) -> Result<()> {
-        let Some(buffer) = self.buffer(path) else {
+        let Some(buffer) = self.buffer(path)? else {
             return Ok(());
         };
         let body = text.strip_suffix('\n').unwrap_or(text);
@@ -552,7 +534,7 @@ impl Session {
     /// and when nvim stops to ask something (the file changed on disk since it
     /// was read) the call times out with the question still on nvim's screen.
     pub fn save(&mut self, path: &Path) -> Result<()> {
-        let Some(buffer) = self.buffer(path) else {
+        let Some(buffer) = self.buffer(path)? else {
             return Ok(());
         };
         self.bridge_call("save", vec![buffer])?;
@@ -564,17 +546,32 @@ impl Session {
     /// fail and the buffer stays.
     pub fn close(&mut self, path: &Path, discard: bool) -> Result<()> {
         let key = canonical(path);
-        let Some(buffer) = self.buffers.get(&key).cloned() else {
+        let Some(buffer) = self.buffer(path)? else {
             return Ok(());
         };
         self.bridge_call("close_buffer", vec![buffer, Value::from(discard)])?;
-        self.buffers.remove(&key);
         self.modified.remove(&key);
         if self.shown.as_deref() == Some(path) {
             // nvim moved its window to some other buffer.
             self.shown = None;
         }
         Ok(())
+    }
+
+    /// The notes whose buffers have unsaved edits, whoever opened them.
+    #[must_use]
+    pub fn modified_notes(&self) -> Vec<PathBuf> {
+        self.bridge_call("modified_notes", Vec::new())
+            .ok()
+            .and_then(|names| {
+                names.as_array().map(|names| {
+                    names
+                        .iter()
+                        .filter_map(|name| name.as_str().map(|name| canonical(Path::new(name))))
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
     }
 
     /// The names of nvim's buffers, as nvim spells them.
@@ -605,9 +602,17 @@ impl Session {
         self.rpc.shutdown(SHUTDOWN);
     }
 
-    /// The nvim buffer handle for `path`, once it has been opened.
-    fn buffer(&self, path: &Path) -> Option<Value> {
-        self.buffers.get(&canonical(path)).cloned()
+    /// The nvim buffer handle for `path`, as nvim has it right now: `None` when
+    /// it holds no buffer for the file. Never remembered between calls (see
+    /// `buffer_of` in `bridge.lua`).
+    ///
+    /// The handle is passed on as nvim sent it: a client that registered the
+    /// API types gets `Buffer` as a msgpack extension, everything else as an
+    /// integer, and handing back what nvim handed out works for both.
+    fn buffer(&self, path: &Path) -> Result<Option<Value>> {
+        let name = canonical(path).to_string_lossy().into_owned();
+        let handle = self.bridge_call("buffer_of", vec![Value::from(name)])?;
+        Ok((!handle.is_nil()).then_some(handle))
     }
 
     /// A call that has to be answered, with the session's timeout.
