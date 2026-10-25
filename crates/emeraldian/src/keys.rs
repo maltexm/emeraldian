@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::actions::{self, dispatch};
 use crate::agent;
-use crate::app::{Action, App, Focus, Mode, View};
+use crate::app::{Action, App, Focus, Mode, Reveal, View};
 use crate::modal::{Modal, PickerKind, Prompt, PromptIntent};
 use crate::nvim::bridge::LinkTarget;
 use crate::ui::panes::{SidebarTarget, sidebar_targets};
@@ -710,17 +710,27 @@ fn handle_reading(app: &mut App, key: KeyEvent) {
 /// `]` starts on the first link, `[` on the last.
 fn cycle_selected_link(app: &mut App, delta: isize) {
     let Some(id) = app.active_note() else { return };
-    let count = app.index.note(id).map_or(0, |note| note.links.len());
+    let Some(note) = app.index.note(id) else {
+        return;
+    };
+    let count = note.links.len();
     if count == 0 {
         return;
     }
-    let Some(tab) = app.active_mut() else { return };
-    let next = match tab.selected_link {
+    let current = app.active().and_then(|tab| tab.selected_link);
+    let next = match current {
         None if delta > 0 => 0,
         None => count - 1,
         Some(i) => (i as isize + delta).rem_euclid(count as isize) as usize,
     };
-    tab.selected_link = Some(next);
+    // The reading view brings the picked row on screen once, on the next
+    // frame, from the layout it has just drawn. Doing it in the draw pass
+    // every frame would pull the view back after a plain `j`/`k`.
+    let reveal = Reveal::for_link(note, next);
+    if let Some(tab) = app.active_mut() {
+        tab.selected_link = Some(next);
+    }
+    app.reveal = reveal;
 }
 
 /// Follows the link the reading view has selected; with nothing selected (or a
@@ -1452,6 +1462,22 @@ mod tests {
         assert_eq!(app.active().unwrap().selected_link, Some(2));
         handle(&mut app, key(KeyCode::Char('[')));
         assert_eq!(app.active().unwrap().selected_link, Some(1));
+    }
+
+    #[test]
+    fn selecting_a_link_queues_a_reveal_for_the_reading_view() {
+        let vault = TempVault::new("reveal-link");
+        vault.write("X.md", "# X\n\n[[A]]\n\ntext [[B]] more\n");
+        let mut app = App::new(vault.vault(), Config::default()).expect("app");
+        let x = app.index.id_of_rel("X.md").unwrap();
+        app.open_note(x);
+
+        handle(&mut app, key(KeyCode::Char(']')));
+        handle(&mut app, key(KeyCode::Char(']')));
+
+        let reveal = app.reveal.clone().expect("a reveal is queued");
+        assert_eq!(reveal.text, "B", "the picked link's text");
+        assert_eq!(reveal.line, 4, "the source line it is on");
     }
 
     #[test]

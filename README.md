@@ -142,7 +142,7 @@ full list in the app.
 | `Ctrl+\` / `Ctrl+]` | Toggle the sidebars (hard to type on some layouts — [remap them](#configuration)) |
 | `Tab` / `Shift+Tab` | Move between panes (`Esc` first while typing in a note) |
 | `hjkl`, `g`, `G` | Move within a pane |
-| `]` / `[` | Next / previous link while reading (wraps) |
+| `]` / `[` | Next / previous link (wraps; in nvim Normal mode too, with a count) |
 | `Enter` | Open / follow the selected link |
 | `Alt+←` / `Alt+→` | Back / forward through the notes you've visited |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab, as do `Ctrl+PgDn` / `Ctrl+PgUp` |
@@ -342,8 +342,14 @@ only if it uses `Alt` or an F-key; a plain `Ctrl` remap goes to nvim there. So
 `Space` all mean what nvim says. The built-in vim layer stands down completely
 while nvim owns the pane.
 
-**Links.** In a vault note, `]l` and `[l` (Normal mode, with a count) jump to
-the next and previous link, wrapping; `<CR>`, `gf` and `Ctrl+]` follow the
+**Links.** In a vault note, `]` and `[` (Normal mode, buffer-local, `nowait`,
+with a count) jump to the next and previous link, wrapping. That covers
+wikilinks, Markdown links and bare `http`/`https` URLs, and skips a link inside
+a fenced block. A map you already have on `]` or `[` is kept, and the status
+line says so. Mapping Normal mode only means Visual and operator-pending keep
+the built-in bracket motions; the Normal-mode ones this shadows, and that no
+longer start, are `]]`, `[[`, `]m`, `[m`, `]M`, `[M`, `]s`, `[s`, `]d`, `[d`,
+`]c`, `[c` and the other `]x`/`[x` pairs. `<CR>`, `gf` and `Ctrl+]` follow the
 link under the cursor: `[[Note]]`, `[[Note|alias]]`, `[[Folder/Note#Heading]]`,
 `[[Note#^block]]` and relative `[text](../Note.md)` links, which resolve from the
 folder of the note they are in. A heading or block anchor jumps to its line.

@@ -106,6 +106,24 @@ local function scan(line)
   return found
 end
 
+--- Bare `https://...` / `http://...` spans `scan` ignores. Reading mode lists
+--- those as links, so the jump has to land on them too. 0-based inclusive.
+local function bare_urls(line)
+  local found = {}
+  local init = 1
+  while true do
+    local s, e = line:find("https?://%S+", init)
+    if not s then
+      break
+    end
+    -- A trailing mark is punctuation, not part of the address.
+    local bare = line:sub(s, e):gsub("[%.,;:!?)]+$", "")
+    found[#found + 1] = { s = s - 1, e = s + #bare - 2 }
+    init = e + 1
+  end
+  return found
+end
+
 --- The link under 0-based byte column `col` of `line`, or nil. Both closing
 --- brackets belong to a wikilink; the cell after them does not.
 function M.link_at(line, col)
@@ -121,12 +139,26 @@ function M.link_at(line, col)
 end
 
 --- Every link in `lines`, in reading order, as `{ line, col }` (1-based line,
---- 0-based column of the link's first byte).
+--- 0-based column of the link's first byte). A fenced block is not a link, the
+--- same rule the reading view uses; a bare URL is.
 local function all_links(lines)
   local found = {}
+  local fence
   for lnum, line in ipairs(lines) do
-    for _, link in ipairs(scan(line)) do
-      found[#found + 1] = { lnum, link.s }
+    local marker = line:match("^%s*(```+)") or line:match("^%s*(~~~+)")
+    if marker then
+      if fence == nil then
+        fence = marker:sub(1, 1)
+      elseif fence == marker:sub(1, 1) then
+        fence = nil
+      end
+    elseif not fence then
+      for _, link in ipairs(scan(line)) do
+        found[#found + 1] = { lnum, link.s }
+      end
+      for _, url in ipairs(bare_urls(line)) do
+        found[#found + 1] = { lnum, url.s }
+      end
     end
   end
   -- `scan` lists wikilinks before markdown links, not left to right.
@@ -136,7 +168,7 @@ local function all_links(lines)
   return found
 end
 
---- Where `]l` / `[l` land. `delta` is signed and counts links: positive forward,
+--- Where `]` / `[` land. `delta` is signed and counts links: positive forward,
 --- negative back. A link the cursor is already on does not count as the next
 --- one. Wraps. nil when the buffer has no link.
 function M.next_link(lines, lnum, col, delta)
@@ -654,8 +686,9 @@ local function follow_or_fallback(lhs, previous)
   end
 end
 
---- `]l` / `[l`. A count jumps that many links. No link in the buffer: nothing
---- moves. Insert mode is untouched; this map is normal-mode only.
+--- `]` / `[`. A count jumps that many links. No link in the buffer: nothing
+--- moves. Normal mode only, so Insert, Visual and operator-pending keep the
+--- built-in bracket motions.
 local function jump_link(delta)
   local cursor = vim.api.nvim_win_get_cursor(0)
   local count = vim.v.count > 0 and vim.v.count or 1
@@ -670,12 +703,18 @@ local function jump_link(delta)
   end
 end
 
+--- A vault note buffer: Markdown, or one of the standalone diagram files
+--- emeraldian opens as a note (`.excalidraw`, `.mmd`, `.mermaid`).
+local function note_file(name)
+  local base = name:match("[^/]*$"):lower()
+  return base:match("%.md$")
+    or base:match("%.excalidraw$")
+    or base:match("%.mmd$")
+    or base:match("%.mermaid$")
+end
+
 local function attach(buf)
-  if
-    vim.b[buf].emeraldian_attached
-    or not note_buf(buf)
-    or vim.bo[buf].filetype ~= "markdown"
-  then
+  if vim.b[buf].emeraldian_attached or not note_buf(buf) or not note_file(vim.api.nvim_buf_get_name(buf)) then
     return
   end
   vim.b[buf].emeraldian_attached = true
@@ -690,12 +729,30 @@ local function attach(buf)
       follow_or_fallback(lhs, previous)
     end, { buffer = buf, silent = true, desc = "emeraldian: follow the link under the cursor" })
   end
-  vim.keymap.set("n", "]l", function()
-    jump_link(1)
-  end, { buffer = buf, silent = true, desc = "emeraldian: next link" })
-  vim.keymap.set("n", "[l", function()
-    jump_link(-1)
-  end, { buffer = buf, silent = true, desc = "emeraldian: previous link" })
+  -- A user's own `]` / `[` wins. Mapping these shadows the built-in `]x` / `[x`
+  -- motions, so a map the user already set is kept and reported instead.
+  local kept = {}
+  for _, lhs in ipairs({ "]", "[" }) do
+    local previous = vim.api.nvim_buf_call(buf, function()
+      return vim.fn.maparg(lhs, "n", false, true)
+    end)
+    if previous.rhs or previous.callback then
+      kept[#kept + 1] = lhs
+    else
+      local delta = lhs == "]" and 1 or -1
+      vim.keymap.set("n", lhs, function()
+        jump_link(delta)
+      end, {
+        buffer = buf,
+        silent = true,
+        nowait = true,
+        desc = lhs == "]" and "emeraldian: next link" or "emeraldian: previous link",
+      })
+    end
+  end
+  if #kept > 0 then
+    send("notice", "kept your " .. table.concat(kept, " ") .. " map; that key does not jump between links")
+  end
   vim.keymap.set("n", "ZZ", function()
     if M.last_window() then
       M.leave(true)
@@ -738,7 +795,7 @@ function M.setup(channel, options)
   end)
   on("FileType", function(args)
     attach(args.buf)
-  end, { pattern = "markdown" })
+  end, { pattern = { "markdown", "excalidraw", "mermaid", "mmd" } })
   -- `:q`, `:wq` and `:x` on the last window are typed through the abbreviations
   -- below; this catches the other ways out (`:q!`, `:qa`, `<C-w>q`), which end
   -- nvim: emeraldian is told first so it goes back to reading.

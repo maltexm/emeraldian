@@ -171,14 +171,23 @@ fn bridge_follow_notifies() {
     );
 }
 
-/// `]l` / `[l` move the cursor from link to link, wrapping, and `<CR>` on the
-/// landed link still follows it. Insert mode does not have the map.
+/// Waits until the cursor is on `row` and `col`.
+fn cursor_is(session: &mut Session, row: u16, col: u16) -> bool {
+    collect(session, |session, _| {
+        let cursor = session.grid().cursor;
+        cursor == (col, row)
+    })
+    .is_ok()
+}
+
+/// `]` / `[` move the cursor from link to link, wrapping, and a count jumps
+/// that many. `<CR>` on the landed link still follows it.
 #[test]
-fn bracket_l_jumps_between_links() {
+fn brackets_jump_between_links() {
     let vault = TempVault::new("nvim-bridge-jump");
     let path = vault.write(
         "a.md",
-        "see [[Alpha]] first\n\nthen [there](Beta.md) and [[Gamma]]\n",
+        "see [[Alpha]] first\n\nthen [there](Beta.md)\n\nand [[Gamma]]\n",
     );
     let Some(mut session) = start(vault.path(), false) else {
         return;
@@ -190,27 +199,103 @@ fn bracket_l_jumps_between_links() {
     })
     .expect("note entered");
 
-    session.input("]l");
-    let landed = collect(&mut session, |session, _| {
-        row_text(session.grid(), session.grid().cursor.1).contains("Alpha")
-    });
-    let landed = landed.expect("cursor on Alpha");
-    let row = session.grid().cursor.1;
+    // Links sit on rows 0 (Alpha, col 4), 2 (Beta, col 5) and 4 (Gamma, col 4).
+    // The column is part of the check: a jump that did nothing leaves col 0.
+    session.input("gg0]");
     assert!(
-        row_text(session.grid(), row).contains("Alpha"),
-        "first ]l should land on Alpha, row {row}: {:?}",
-        row_text(session.grid(), row)
+        cursor_is(&mut session, 0, 4),
+        "] lands on Alpha, cursor {:?}",
+        session.grid().cursor
+    );
+    session.input("2]");
+    assert!(
+        cursor_is(&mut session, 4, 4),
+        "2] from Alpha is Gamma, cursor {:?}",
+        session.grid().cursor
+    );
+    session.input("]");
+    assert!(
+        cursor_is(&mut session, 0, 4),
+        "] after the last link wraps, cursor {:?}",
+        session.grid().cursor
+    );
+    session.input("[");
+    assert!(
+        cursor_is(&mut session, 4, 4),
+        "[ before the first link wraps, cursor {:?}",
+        session.grid().cursor
+    );
+    session.input("2[");
+    assert!(
+        cursor_is(&mut session, 0, 4),
+        "2[ from Gamma is Alpha, cursor {:?}",
+        session.grid().cursor
     );
 
-    session.input("]l<CR>");
+    session.input("]<CR>");
     let seen = collect(&mut session, |_, seen| !follows(seen).is_empty())
-        .expect("Follow after the second ]l");
+        .expect("Follow after ] then Enter");
     assert!(
         matches!(
             follows(&seen).first(),
             Some(BridgeEvent::Follow(target)) if target.note.contains("Beta")
         ),
-        "second ]l should land on the markdown link, saw {landed:?}"
+        "] from Alpha lands on the markdown link, saw {seen:?}"
+    );
+}
+
+/// Insert mode keeps `]` and `[` as plain characters.
+#[test]
+fn brackets_stay_plain_text_in_insert_mode() {
+    let vault = TempVault::new("nvim-bridge-bracket-insert");
+    let path = vault.write("a.md", "see [[Alpha]]\n");
+    let Some(mut session) = start(vault.path(), false) else {
+        return;
+    };
+    session.open(&path).expect("open");
+    collect(&mut session, |_, seen| {
+        seen.iter()
+            .any(|event| matches!(event, BridgeEvent::Entered(_)))
+    })
+    .expect("note entered");
+    session.input("A][<Esc>");
+    let typed = collect(&mut session, |session, _| {
+        row_text(session.grid(), 0).contains("[[Alpha]]][")
+    });
+    assert!(typed.is_ok(), "row 0: {:?}", row_text(session.grid(), 0));
+}
+
+/// A `]` / `[` the user already mapped stays theirs. The bridge does not
+/// replace it, and says so.
+#[test]
+fn brackets_keep_a_users_own_map() {
+    let vault = TempVault::new("nvim-bridge-bracket-user");
+    let path = vault.write("a.md", "one\nsee [[Alpha]]\nthree\n");
+    let Some(mut session) = start_configured(vault.path(), &["nnoremap ] G", "nnoremap [ gg"])
+    else {
+        return;
+    };
+    session.open(&path).expect("open");
+    let entered = collect(&mut session, |_, seen| {
+        seen.iter()
+            .any(|event| matches!(event, BridgeEvent::Entered(_)))
+    })
+    .expect("note entered");
+
+    session.input("gg0]");
+    assert!(
+        cursor_is(&mut session, 2, 0),
+        "the user's ] must still mean G, not a link jump; cursor {:?}",
+        session.grid().cursor
+    );
+
+    // The bridge reports the kept maps as a notice.
+    assert!(
+        entered.iter().any(|event| matches!(
+            event,
+            BridgeEvent::Notice(text) if text.contains("kept your ] [")
+        )),
+        "a kept user map must be reported, saw {entered:?}"
     );
 }
 

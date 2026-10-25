@@ -16,6 +16,7 @@
 //! | `emeraldian.entered`   | `path`                                        |
 //! | `emeraldian.action`    | `name` (one of [`ACTIONS`])                   |
 //! | `emeraldian.leave`     | —                                             |
+//! | `emeraldian.notice`    | `text` (a note for the status line)           |
 //!
 //! and makes one request, `emeraldian.notes`, answered with the names a
 //! `[[link]]` can be completed to (see `Session::set_notes`).
@@ -97,6 +98,9 @@ pub enum BridgeEvent {
     /// `:q`, `:wq` or `:x` on the last window: back to the reading view,
     /// nvim stays.
     LeaveEditing,
+    /// Something the user should see but that changes nothing: a kept map, a
+    /// skipped step. Shown on the status line.
+    Notice(String),
 }
 
 /// The arguments the script is called with: nvim's channel for this client
@@ -133,6 +137,7 @@ pub fn parse_notification(method: &str, params: &[Value]) -> Option<BridgeEvent>
         "entered" => Some(BridgeEvent::Entered(PathBuf::from(text(0)?))),
         "action" => Some(BridgeEvent::Action(text(0)?.to_string())),
         "leave" => Some(BridgeEvent::LeaveEditing),
+        "notice" => Some(BridgeEvent::Notice(text(0)?.to_string())),
         _ => None,
     }
 }

@@ -21,7 +21,7 @@ use emeraldian_core::index::VaultIndex;
 use emeraldian_core::markdown::{self, Align, Block, BlockKind, Marker, SpanKind, Table};
 use emeraldian_theme::Palette;
 
-use crate::app::{App, Mode, Regions};
+use crate::app::{App, Mode, Regions, Reveal};
 use crate::editor::{Cursor, Row};
 use crate::images::{self, Images};
 use crate::ui::{drawing, icons, math, mermaid, scrollbar, truncate};
@@ -479,22 +479,16 @@ fn draw_reading(
         .cloned()
         .collect();
     let mut visible = visible;
-    // `]`/`[` pick one link. Mark that row so Enter's target is visible, and
-    // bring it on screen when the pick landed below the fold.
-    if let Some(row) = selected_link_row(app, id) {
-        // `||` cannot join a let chain, so this stays nested.
-        #[allow(clippy::collapsible_if)]
-        if row < scroll || row >= scroll + height {
-            if let Some(tab) = app.active_mut() {
-                tab.scroll = row.saturating_sub(height / 3);
-            }
-        }
-        if row >= scroll
-            && row < scroll + height
-            && let Some(line) = visible.get_mut(row - scroll)
-        {
-            mark_selected_link(line, palette);
-        }
+    // `]`/`[` pick one link. Mark that row so Enter's target is visible. The
+    // scroll that brings it on screen happens in the key handler, not here:
+    // this runs every frame, and moving the scroll here would snap the view
+    // back the moment `j`/`k` left the selection.
+    if let Some(row) = selected_link_row(app, id)
+        && row >= scroll
+        && row < scroll + height
+        && let Some(line) = visible.get_mut(row - scroll)
+    {
+        mark_selected_link(line, palette);
     }
     Paragraph::new(visible)
         .scroll((0, u16::try_from(hscroll).unwrap_or(u16::MAX)))
@@ -620,25 +614,15 @@ pub fn render_document(
 /// the anchors `render_document` records.
 fn selected_link_row(app: &App, id: usize) -> Option<usize> {
     let idx = app.active()?.selected_link?;
-    let note = app.index.note(id)?;
-    let link = note.links.get(idx)?;
-    let file_line = note.body_offset + link.raw.line;
-    let start = anchor_row(&app.reading.anchors, file_line);
-    let display = link.display();
-    // Same text earlier in this block is another link, not this one.
-    let nth = note
-        .links
-        .iter()
-        .take(idx)
-        .filter(|earlier| earlier.raw.line == link.raw.line && earlier.display() == display)
-        .count();
+    let reveal = Reveal::for_link(app.index.note(id)?, idx)?;
+    let start = anchor_row(&app.reading.anchors, reveal.line);
     Some(
         row_showing(
             &app.reading.lines,
             &app.reading.anchors,
             start,
-            display,
-            nth,
+            &reveal.text,
+            reveal.nth,
         )
         .unwrap_or(start),
     )
@@ -2269,6 +2253,34 @@ mod tests {
             .find(|r| r.contains("Gamma"))
             .expect("Gamma on screen");
         assert!(!gamma.contains('★'), "third link unmarked, got: {gamma}");
+    }
+
+    /// Scrolling away from a selected link must stay scrolled away. The mark
+    /// follows the link back into view on the next `]`/`[`, not on a redraw.
+    #[test]
+    fn scrolling_away_from_a_selected_link_stays_away() {
+        let vault = TempVault::new("scroll-away");
+        let body = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        vault.write("X.md", &format!("# X\n\n[[Alpha]]\n\n{body}\n"));
+        let mut app = App::new(vault.vault(), crate::config::Config::default()).expect("app");
+        let id = app.index.id_of_rel("X.md").expect("indexed");
+        app.open_note(id);
+        app.active_mut().unwrap().selected_link = Some(0);
+
+        let _ = screen_rows(&mut app);
+        let brought = app.active().unwrap().scroll;
+        app.active_mut().unwrap().scroll = brought + 12;
+        let away = app.active().unwrap().scroll;
+
+        let _ = screen_rows(&mut app);
+        assert_eq!(
+            app.active().unwrap().scroll,
+            away,
+            "a redraw must not snap the scroll back to the selected link"
+        );
     }
 
     /// What is on screen after drawing the app at a fixed size, one string per
