@@ -38,6 +38,12 @@ const PADDING: u16 = 2;
 /// digit rather than moving the text.
 const GUTTER: u16 = 4;
 
+/// How deeply embeds may nest before they are refused.
+///
+/// A note is depth 0 and starts the count; Obsidian stops long before a chain
+/// of embeds could recurse forever, and shows a placeholder instead.
+const MAX_EMBED_DEPTH: usize = 5;
+
 /// Widest a single table column may be drawn, in characters.
 ///
 /// Tables are laid out at their content's width and panned across, so this is
@@ -69,6 +75,10 @@ pub struct Ctx<'a> {
     /// headings gain a rule, a picture takes a dozen rows — so scrolling to a
     /// heading the outline points at needs the translation written down.
     pub anchors: Vec<(usize, usize)>,
+    /// The files currently being rendered, the note being read first, so an
+    /// embed that names one of them can be refused instead of followed into a
+    /// cycle. Obsidian keeps the same stack for the same reason.
+    pub embeds: Vec<String>,
 }
 
 impl<'a> Ctx<'a> {
@@ -83,6 +93,7 @@ impl<'a> Ctx<'a> {
             images: None,
             pictures: Vec::new(),
             anchors: Vec::new(),
+            embeds: Vec::new(),
         }
     }
 }
@@ -403,10 +414,10 @@ fn draw_reading(
         } else {
             markdown::parse(&content)
         };
-        let note_dir = app
-            .index
-            .note(id)
-            .map(|note| app.index.vault.path.join(&note.meta.rel))
+        let note_meta = app.index.note(id).map(|note| note.meta.rel.clone());
+        let note_dir = note_meta
+            .as_deref()
+            .map(|rel| app.index.vault.path.join(rel))
             .and_then(|path| path.parent().map(Path::to_path_buf));
         let mut ctx = Ctx {
             palette,
@@ -415,6 +426,7 @@ fn draw_reading(
             images: Some(&mut app.images),
             pictures: Vec::new(),
             anchors: Vec::new(),
+            embeds: note_meta.into_iter().collect(),
         };
         let lines = render_document(&document, &mut ctx, width);
         // Content can be wider than the pane — a table laid out at its
@@ -1049,6 +1061,12 @@ fn lift(span: &markdown::Span, ctx: &mut Ctx, width: usize, pad: &str) -> Option
 /// `None` when the target is neither or can't be read: the embed stays a link
 /// then. A Mermaid file that can't be drawn is still laid out, as its source
 /// under the reason, the same as a block of it in the note.
+///
+/// Every embed target passes through here, so the guard against a chain of
+/// embeds that never ends — a file embedding itself, or two files embedding
+/// each other — lives here too, as Obsidian does it: a stack of what is
+/// already being rendered plus a shallow depth limit, and a placeholder where
+/// the recursion would have gone.
 fn embedded_diagram(target: &str, ctx: &mut Ctx, width: usize, pad: &str) -> Option<Lift> {
     let decoded = target.replace("%20", " ");
     let index = ctx.index;
@@ -1058,9 +1076,16 @@ fn embedded_diagram(target: &str, ctx: &mut Ctx, width: usize, pad: &str) -> Opt
         let rel = emeraldian_core::note::relative_path(&index.vault.path, &path)?;
         index.id_of_rel(&rel)
     })?;
-    let rel = &index.note(id)?.meta.rel;
+    let rel = index.note(id)?.meta.rel.clone();
 
-    if excalidraw::is_drawing(rel) {
+    if ctx.embeds.contains(&rel) {
+        return Some(refused(&format!("circular embed: {rel}"), ctx, pad));
+    }
+    if ctx.embeds.len() >= MAX_EMBED_DEPTH {
+        return Some(refused(&format!("embed too deep: {rel}"), ctx, pad));
+    }
+
+    if excalidraw::is_drawing(&rel) {
         let scene = excalidraw::parse(&index.read(id).ok()?)?;
         let (cols, rows) = drawing::fit(&scene, width, EMBEDDED_DRAWING_ROWS)?;
         return Some(Lift::Picture(
@@ -1068,22 +1093,44 @@ fn embedded_diagram(target: &str, ctx: &mut Ctx, width: usize, pad: &str) -> Opt
             Size::new(cols, rows),
         ));
     }
-    if is_mermaid_file(rel) {
+    if is_mermaid_file(&rel) {
         let document = mermaid_document(&index.read(id).ok()?);
         let indent = pad.chars().count();
         let mut lines = Vec::new();
+        ctx.embeds.push(rel);
         for block in &document.blocks {
             render_block(block, ctx, width + indent, indent, &mut lines);
         }
+        ctx.embeds.pop();
         return Some(Lift::Lines(lines));
     }
     None
 }
 
+/// The line an embed becomes when it must not be followed.
+fn refused(words: &str, ctx: &Ctx, pad: &str) -> Lift {
+    Lift::Lines(vec![Line::from(Span::styled(
+        format!("{pad}{words}"),
+        Style::default().fg(ctx.palette.text_faint),
+    ))])
+}
+
 /// A Mermaid file as the one code block it is, which draws the diagram or says
 /// why it can't and shows the source.
+///
+/// The source is data, never parsed as Markdown: interpolating it into a
+/// fence of our own would let a ``` inside it close that fence, and everything
+/// after it — an embed of this very file — would run again.
 fn mermaid_document(source: &str) -> markdown::Document {
-    markdown::parse(&format!("```mermaid\n{source}\n```\n"))
+    markdown::Document {
+        blocks: vec![Block {
+            line: 0,
+            kind: BlockKind::Code {
+                lang: "mermaid".to_string(),
+                lines: source.lines().map(str::to_string).collect(),
+            },
+        }],
+    }
 }
 
 /// Whether a note's file is Mermaid source rather than Markdown.
@@ -2355,6 +2402,94 @@ mod tests {
         );
     }
 
+    /// A diagram file's source is inert data, the way Obsidian and
+    /// render-markdown.nvim treat code blocks: a fence inside it closes
+    /// nothing, and an embed-looking line inside it is never followed.
+    #[test]
+    fn a_mermaid_file_that_closes_a_fence_shows_source_instead_of_reentering() {
+        let vault = TempVault::new("mermaid-fenced");
+        vault.write("Fenced.mmd", "flowchart TD\n```\n![[Fenced.mmd]]\n");
+        let mut app = open(&vault, "Fenced.mmd");
+        let shown = screen_text(&mut app);
+        assert!(shown.contains("flowchart TD"), "the source stays:\n{shown}");
+        assert!(
+            shown.contains("```"),
+            "the closing fence is source, not structure:\n{shown}"
+        );
+        assert!(shown.contains("![[Fenced.mmd]]"), "{shown}");
+        assert!(shown.contains("mermaid:"), "and why:\n{shown}");
+    }
+
+    /// The same file embedded in a note: its source must not become an embed
+    /// of itself halfway through rendering.
+    #[test]
+    fn an_embedded_mermaid_file_with_a_closing_fence_shows_its_source() {
+        let vault = TempVault::new("mermaid-fenced-embed");
+        vault.write("Fenced.mmd", "flowchart TD\n```\n![[Fenced.mmd]]\n");
+        vault.write("A.md", "before\n\n![[Fenced.mmd]]\n\nafter\n");
+        let mut app = open(&vault, "A.md");
+        let shown = screen_text(&mut app);
+        assert!(
+            shown.contains("![[Fenced.mmd]]"),
+            "the inert source:\n{shown}"
+        );
+        assert!(shown.contains("mermaid:"), "and why:\n{shown}");
+        assert!(
+            shown.contains("before") && shown.contains("after"),
+            "the prose survives:\n{shown}"
+        );
+    }
+
+    /// Two diagram files whose sources name each other through closing fences
+    /// render once each instead of following the cycle.
+    #[test]
+    fn two_mermaid_files_naming_each_other_render_once_without_recursing() {
+        let vault = TempVault::new("mermaid-cycle");
+        vault.write("B.mmd", "flowchart TD\n```\n![[C.mmd]]\n");
+        vault.write("C.mmd", "flowchart TD\n```\n![[B.mmd]]\n");
+        vault.write("A.md", "before\n\n![[B.mmd]]\n\nafter\n");
+        let mut app = open(&vault, "A.md");
+        let shown = screen_text(&mut app);
+        assert!(
+            shown.contains("![[C.mmd]]"),
+            "B's source is inert:\n{shown}"
+        );
+        assert!(
+            shown.contains("before") && shown.contains("after"),
+            "{shown}"
+        );
+    }
+
+    /// A note that embeds itself gets Obsidian's placeholder rather than a
+    /// second rendering of itself.
+    #[test]
+    fn a_note_embedded_in_itself_says_so_instead_of_opening_itself() {
+        let vault = TempVault::new("embed-self");
+        vault.write("A.md", "text\n\n![[A.md]]\n\ndone\n");
+        let mut app = open(&vault, "A.md");
+        let shown = screen_text(&mut app);
+        assert!(shown.contains("circular embed"), "placeholder:\n{shown}");
+        assert!(shown.contains("text") && shown.contains("done"), "{shown}");
+    }
+
+    #[test]
+    fn an_embed_beyond_the_depth_limit_is_refused_as_too_deep() {
+        let vault = TempVault::new("embed-depth");
+        vault.write("Flow.excalidraw", SCENE);
+        let index = vault.index();
+        let palette = palette();
+        let mut images = images(20);
+        let mut ctx = drawing(&palette, &index, &mut images);
+        ctx.embeds = (0..MAX_EMBED_DEPTH).map(|n| format!("N{n}.md")).collect();
+
+        let shown = match embedded_diagram("Flow.excalidraw", &mut ctx, 60, "") {
+            Some(Lift::Lines(lines)) => text_of(&lines).join("\n"),
+            Some(Lift::Picture(..)) => panic!("past the depth limit it is not a picture"),
+            None => panic!("past the depth limit it is not left as a bare link"),
+        };
+        assert!(shown.contains("too deep"), "{shown}");
+    }
+
     #[test]
     fn a_self_loop_is_never_a_diagram_that_quietly_lacks_its_loop() {
         let vault = TempVault::new("mermaid-self-loop");
@@ -2513,6 +2648,7 @@ mod tests {
             images: Some(images),
             pictures: Vec::new(),
             anchors: Vec::new(),
+            embeds: Vec::new(),
         }
     }
 
