@@ -334,11 +334,13 @@ fn the_link_mark_sits_in_the_margin_beside_the_column_without_moving_the_text() 
     assert_eq!(shown, format!("{}★ text with link", " ".repeat(8)));
     assert_eq!(line.width(), 10 + "text with link".width());
 
-    // No margin to put it in: it goes in front, as it did before columns.
+    // No margin to put it in: the row keeps its text where it was.
     let mut flush = Line::from("text with link");
     view::mark_selected_link(&mut flush, &palette);
     let shown: String = flush.spans.iter().map(|s| s.content.as_ref()).collect();
-    assert_eq!(shown, "★ text with link");
+    assert_eq!(shown, "text with link");
+    assert_eq!(flush.width(), "text with link".width());
+    assert_eq!(flush.spans[0].style.bg, Some(palette.accent));
 }
 
 /// `]`/`[` pick a link; the reading view must mark that one, not the first.

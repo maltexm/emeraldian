@@ -1236,6 +1236,265 @@ mod tests {
         assert_eq!(app.active_note(), app.index.id_of_rel("Beta.md"));
     }
 
+    // --- occurrence-aware link hit ranges (reading view) ---
+
+    /// A vault with `X.md` holding `body` plus Alpha, Beta and Gamma, X open
+    /// in a reading pane that has the whole window.
+    fn reading_vault(name: &str, body: &str) -> (TempVault, App) {
+        let vault = TempVault::new(name);
+        vault.write("X.md", body);
+        vault.write("Alpha.md", "# Alpha\n");
+        vault.write("Beta.md", "# Beta\n");
+        vault.write("Gamma.md", "# Gamma\n");
+        let mut app = App::new(vault.vault(), Config::default()).expect("app");
+        app.focus_mode = true;
+        let x = app.index.id_of_rel("X.md").expect("indexed");
+        app.open_note(x);
+        (vault, app)
+    }
+
+    fn draw_at(app: &mut App, width: u16) -> Terminal<TestBackend> {
+        let mut terminal = Terminal::new(TestBackend::new(width, 40)).expect("terminal");
+        terminal.draw(|frame| ui::draw(frame, app)).expect("draw");
+        terminal
+    }
+
+    /// Screen columns (not string offsets) of the cells on row `y` whose
+    /// symbol is `symbol`.
+    fn columns_of(terminal: &Terminal<TestBackend>, y: u16, symbol: &str) -> Vec<u16> {
+        let buffer = terminal.backend().buffer();
+        (0..buffer.area.width)
+            .filter(|&x| buffer[(x, y)].symbol() == symbol)
+            .collect()
+    }
+
+    fn row_of(terminal: &Terminal<TestBackend>, needle: &str) -> u16 {
+        screen(terminal)
+            .iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle:?} on screen")) as u16
+    }
+
+    /// Clicks `(x, y)` on a freshly drawn X and returns the note that is open
+    /// afterwards.
+    fn click_opens(app: &mut App, width: u16, x: u16, y: u16) -> Option<usize> {
+        let x_id = app.index.id_of_rel("X.md").expect("indexed");
+        app.open_note(x_id);
+        draw_at(app, width);
+        click(app, x, y);
+        app.active_note()
+    }
+
+    #[test]
+    fn same_label_on_one_row_opens_its_own_target() {
+        let (_vault, mut app) = reading_vault("hit-a", "[[Alpha|same]] then [[Beta|same]]\n");
+        let terminal = draw_at(&mut app, 120);
+        let y = row_of(&terminal, "same");
+        let xs = columns_of(&terminal, y, "s");
+        // "same" twice; "s" also starts nothing else on this row.
+        let (first, second) = (xs[0], *xs.iter().find(|&&x| x > xs[0] + 8).unwrap());
+        let alpha = app.index.id_of_rel("Alpha.md");
+        let beta = app.index.id_of_rel("Beta.md");
+        assert_eq!(click_opens(&mut app, 120, first + 1, y), alpha);
+        assert_eq!(click_opens(&mut app, 120, second + 1, y), beta);
+        assert_eq!(click_opens(&mut app, 120, second + 3, y), beta, "last cell");
+    }
+
+    #[test]
+    fn same_label_on_consecutive_source_lines_of_one_paragraph_opens_its_own_target() {
+        let (_vault, mut app) = reading_vault("hit-b", "[[Alpha|same]]\n[[Beta|same]]\n");
+        let terminal = draw_at(&mut app, 120);
+        let rows = screen(&terminal);
+        let at = |n: usize| {
+            rows.iter()
+                .enumerate()
+                .filter(|(_, r)| r.contains("same"))
+                .nth(n)
+                .map(|(y, r)| (r.find("same").unwrap() as u16, y as u16))
+        };
+        // Soft break: both labels may share a row or sit on two; click each
+        // occurrence wherever it was drawn.
+        let first = at(0).unwrap();
+        let alpha = app.index.id_of_rel("Alpha.md");
+        let beta = app.index.id_of_rel("Beta.md");
+        assert_eq!(click_opens(&mut app, 120, first.0, first.1), alpha);
+        let second_x = rows[usize::from(first.1)].rfind("same").unwrap() as u16;
+        let (x, y) = at(1).unwrap_or((second_x, first.1));
+        assert_eq!(click_opens(&mut app, 120, x, y), beta);
+    }
+
+    #[test]
+    fn distinct_labels_on_one_row_still_open_their_own_targets() {
+        let (_vault, mut app) = reading_vault("distinct", "[[Alpha]] and [[Beta]] and [[Gamma]]\n");
+        let terminal = draw_at(&mut app, 120);
+        let y = row_of(&terminal, "Alpha");
+        let at = |c: &str| columns_of(&terminal, y, c)[0];
+        let (a, b, g) = (at("A"), at("B"), at("G"));
+        for (x, rel) in [(a, "Alpha.md"), (b, "Beta.md"), (g, "Gamma.md")] {
+            let want = app.index.id_of_rel(rel);
+            assert_eq!(click_opens(&mut app, 120, x, y), want, "{rel}");
+        }
+        // Between the links is plain text.
+        let x_id = app.index.id_of_rel("X.md");
+        assert_eq!(click_opens(&mut app, 120, a + 6, y), x_id, "the word 'and'");
+    }
+
+    #[test]
+    fn a_link_alias_wrapped_over_two_rows_opens_from_either_fragment() {
+        let alias = ["alpha"; 25].join(" ");
+        assert_eq!(alias.len(), 149);
+        let body = format!("See [[Beta]] and [[Alpha|{alias}]].\n");
+        let (_vault, mut app) = reading_vault("wrapped-alias", &body);
+        let terminal = draw_at(&mut app, 120);
+        let rows = screen(&terminal);
+        let first = rows.iter().position(|r| r.contains("and alpha")).unwrap();
+        let second = first + 1;
+        assert!(
+            rows[second].contains("alpha"),
+            "alias runs onto a second row"
+        );
+        assert!(
+            !rows[first].contains(&alias),
+            "the whole alias is on no single row"
+        );
+        let alpha = app.index.id_of_rel("Alpha.md");
+        let beta = app.index.id_of_rel("Beta.md");
+        let head = rows[first].find("and alpha").unwrap() as u16 + 4;
+        let tail = rows[second].find("alpha").unwrap() as u16;
+        let tail_end = rows[second].rfind("alpha").unwrap() as u16 + 4;
+        for (x, y) in [(head, first), (tail, second), (tail_end, second)] {
+            assert_eq!(click_opens(&mut app, 120, x, y as u16), alpha, "({x},{y})");
+        }
+        // "See [[Beta]]" is a different link on the first row.
+        let b = columns_of(&terminal, first as u16, "B")[0];
+        assert_eq!(click_opens(&mut app, 120, b, first as u16), beta);
+    }
+
+    #[test]
+    fn wide_characters_are_hit_by_their_cells_not_their_bytes() {
+        let (_vault, mut app) =
+            reading_vault("wide-label", "日本 [[Alpha|語語]] 日本 [[Beta|語語]]\n");
+        let terminal = draw_at(&mut app, 120);
+        let y = row_of(&terminal, "語");
+        let xs = columns_of(&terminal, y, "語");
+        // Two wide chars per link: each takes two cells.
+        assert_eq!(xs.len(), 4);
+        let (a, b) = (xs[0], xs[2]);
+        let alpha = app.index.id_of_rel("Alpha.md");
+        let beta = app.index.id_of_rel("Beta.md");
+        assert_eq!(click_opens(&mut app, 120, a, y), alpha);
+        assert_eq!(
+            click_opens(&mut app, 120, a + 3, y),
+            alpha,
+            "second glyph, right half"
+        );
+        assert_eq!(click_opens(&mut app, 120, b, y), beta);
+        assert_eq!(click_opens(&mut app, 120, b + 3, y), beta);
+    }
+
+    #[test]
+    fn links_are_hit_after_vertical_and_horizontal_scrolling() {
+        let mut body = String::new();
+        for i in 0..60 {
+            body.push_str(&format!("line {i}\n\n"));
+        }
+        body.push_str("[[Alpha|same]] then [[Beta|same]]\n\n");
+        // A code line wider than the pane makes the pane pannable.
+        body.push_str(&format!("```text\n{}\n```\n", "x".repeat(200)));
+        let (_vault, mut app) = reading_vault("scrolled", &body);
+        let alpha = app.index.id_of_rel("Alpha.md");
+        let beta = app.index.id_of_rel("Beta.md");
+        for hscroll in [0usize, 7] {
+            let terminal = draw_scrolled(&mut app, hscroll);
+            let tab = app.active().unwrap();
+            assert_eq!(tab.hscroll, hscroll, "pannable");
+            assert!(tab.scroll > 40, "scrolled down, got {}", tab.scroll);
+            let y = row_of(&terminal, "same");
+            let xs = columns_of(&terminal, y, "s");
+            let second = *xs.iter().find(|&&x| x > xs[0] + 8).unwrap();
+            for (x, want) in [(xs[0], alpha), (second, beta)] {
+                draw_scrolled(&mut app, hscroll);
+                click(&mut app, x, y);
+                assert_eq!(app.active_note(), want, "hscroll {hscroll}, x {x}");
+            }
+        }
+    }
+
+    /// X scrolled to its end (the draw clamps it) and `hscroll` columns in.
+    fn draw_scrolled(app: &mut App, hscroll: usize) -> Terminal<TestBackend> {
+        let x_id = app.index.id_of_rel("X.md").expect("indexed");
+        app.open_note(x_id);
+        let tab = app.active_mut().unwrap();
+        tab.scroll = 10_000;
+        tab.hscroll = hscroll;
+        draw_at(app, 120)
+    }
+
+    #[test]
+    fn selecting_a_link_moves_no_text_and_no_hit_cell() {
+        let body = "[[Alpha|same]] then [[Beta|same]]\n";
+        for width in [0u16, 100] {
+            let (_vault, mut app) = reading_vault("marker", body);
+            app.config.ui.reading_width = width;
+            // Wider than the measure, so there is a margin; and with
+            // `reading_width = 0` there is none.
+            let plain = draw_at(&mut app, 160);
+            let y = row_of(&plain, "same");
+            let before = screen(&plain)[usize::from(y)].clone();
+            let at_before = columns_of(&plain, y, "s");
+
+            app.active_mut().unwrap().selected_link = Some(1);
+            let marked = draw_at(&mut app, 160);
+            let after = screen(&marked)[usize::from(y)].clone();
+            assert_eq!(
+                columns_of(&marked, y, "s"),
+                at_before,
+                "reading_width {width}: text keeps its cells"
+            );
+            assert_eq!(
+                after.replace('★', " "),
+                before,
+                "reading_width {width}: the star only replaces blanks"
+            );
+            if width != 0 {
+                let star = columns_of(&marked, y, "★");
+                assert_eq!(star.len(), 1, "the margin has room for the star");
+                assert_eq!(star[0] + 2, at_before[0], "right beside the text");
+            }
+
+            // Still the same cells open the same targets while selected.
+            let alpha = app.index.id_of_rel("Alpha.md");
+            let beta = app.index.id_of_rel("Beta.md");
+            let second = *at_before.iter().find(|&&x| x > at_before[0] + 8).unwrap();
+            for (x, want) in [(at_before[0], alpha), (second, beta)] {
+                let x_id = app.index.id_of_rel("X.md").unwrap();
+                app.open_note(x_id);
+                app.active_mut().unwrap().selected_link = Some(1);
+                draw_at(&mut app, 160);
+                click(&mut app, x, y);
+                assert_eq!(app.active_note(), want, "reading_width {width}, x {x}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_selection_star_and_the_margin_are_not_links() {
+        let (_vault, mut app) = reading_vault("margin", "[[Alpha]]\n");
+        let x_id = app.index.id_of_rel("X.md");
+        app.active_mut().unwrap().selected_link = Some(0);
+        let terminal = draw_at(&mut app, 160);
+        let y = row_of(&terminal, "Alpha");
+        let star = columns_of(&terminal, y, "★")[0];
+        let a = columns_of(&terminal, y, "A")[0];
+        for x in [star, star + 1, a - 1, 0, 3] {
+            app.open_note(x_id.unwrap());
+            app.active_mut().unwrap().selected_link = Some(0);
+            draw_at(&mut app, 160);
+            click(&mut app, x, y);
+            assert_eq!(app.active_note(), x_id, "x {x} is not part of the link");
+        }
+    }
+
     #[test]
     fn clicking_a_ribbon_icon_runs_its_action() {
         let (_v, mut app) = demo();

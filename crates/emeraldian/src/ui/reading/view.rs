@@ -216,8 +216,13 @@ pub(in crate::ui) fn draw_reading(
     scrollbar(frame, palette, full, scroll, total);
 }
 
-/// Link under a reading-mode mouse point. Cached rows already include the
-/// column offset, so margins cannot accidentally act as links.
+/// Link under a reading-mode mouse point.
+///
+/// The cached rows hold exactly what was drawn, margins included, so a point is
+/// resolved against the cell ranges each link occupies there: the very
+/// occurrence its `]`/`[` position names, on every row it wraps over. Nothing
+/// outside those cells — the centring margin, the selection star, another
+/// link's identical label — can act as the link.
 pub fn link_at(app: &App, point: (u16, u16)) -> Option<usize> {
     let area = app.regions.reading?;
     if !area.contains(ratatui::layout::Position::new(point.0, point.1)) {
@@ -227,33 +232,157 @@ pub fn link_at(app: &App, point: (u16, u16)) -> Option<usize> {
     let row = tab.scroll + usize::from(point.1 - area.y);
     let col = tab.hscroll + usize::from(point.0 - area.x);
     let note = app.index.note(tab.note)?;
-    let line = app.reading.lines.get(row)?;
-    let text: String = line
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect();
+    let lines = &app.reading.lines;
+    let anchors = &app.reading.anchors;
+    if row >= lines.len() {
+        return None;
+    }
+    // Each block is flattened once, however many links it holds.
+    let mut blocks: Vec<(usize, Vec<TextCell>)> = Vec::new();
     for idx in 0..note.links.len() {
-        let reveal = crate::app::Reveal::for_link(note, idx)?;
-        let start = anchor_row(&app.reading.anchors, reveal.line);
-        if row_showing(
-            &app.reading.lines,
-            &app.reading.anchors,
-            start,
-            &reveal.text,
-            reveal.nth,
-        ) != Some(row)
-        {
+        let reveal = Reveal::for_link(note, idx)?;
+        let start = anchor_row(anchors, reveal.line);
+        if row < start || row >= block_end(lines.len(), anchors, start) {
             continue;
         }
-        for (byte, _) in text.match_indices(&reveal.text) {
-            let left = UnicodeWidthStr::width(&text[..byte]);
-            if col >= left && col < left + UnicodeWidthStr::width(reveal.text.as_str()) {
-                return Some(idx);
+        let at = match blocks.iter().position(|(first, _)| *first == start) {
+            Some(at) => at,
+            None => {
+                blocks.push((start, block_cells(lines, anchors, start)));
+                blocks.len() - 1
             }
+        };
+        let nth = nth_in_block(note, idx, anchors);
+        let hit = link_ranges(&blocks[at].1, &reveal.text, nth)
+            .into_iter()
+            .any(|(r, from, to)| r == row && col >= from && col < to);
+        if hit {
+            return Some(idx);
         }
     }
     None
+}
+
+/// How many links before the `idx`-th one show the same label in the same
+/// block. This is the occurrence of the label that the `idx`-th link is: a
+/// paragraph can run over several source lines, and the label is looked for in
+/// the whole of it.
+fn nth_in_block(
+    note: &emeraldian_core::index::IndexedNote,
+    idx: usize,
+    anchors: &[(usize, usize)],
+) -> usize {
+    let block = |idx: usize| anchor_row(anchors, note.body_offset + note.links[idx].raw.line);
+    let label = note.links[idx].display().to_lowercase();
+    (0..idx)
+        .filter(|&earlier| {
+            block(earlier) == block(idx) && note.links[earlier].display().to_lowercase() == label
+        })
+        .count()
+}
+
+/// One character of a block's text, with the cells it occupies on its row.
+struct TextCell {
+    /// Lowercased, so that labels match as `row_showing` matches them. A
+    /// character that lowercases to several is several cells sharing a place.
+    ch: char,
+    /// `None` for the space standing in for a line break.
+    row: Option<usize>,
+    from: usize,
+    to: usize,
+}
+
+/// The row after the last of the block starting at `start`.
+fn block_end(total: usize, anchors: &[(usize, usize)], start: usize) -> usize {
+    anchors
+        .iter()
+        .map(|(_, row)| *row)
+        .find(|row| *row > start)
+        .unwrap_or(total)
+        .min(total)
+}
+
+/// The text of the block starting at `start`, as the cells it was drawn in.
+/// Rows are joined the way the wrap split them: the blanks around a break
+/// make one space.
+fn block_cells(lines: &[Line], anchors: &[(usize, usize)], start: usize) -> Vec<TextCell> {
+    let end = block_end(lines.len(), anchors, start);
+    let mut out = Vec::new();
+    for (row, line) in lines.iter().enumerate().take(end).skip(start) {
+        let mut cells: Vec<(char, usize, usize)> = Vec::new();
+        let mut col = 0;
+        for ch in line.spans.iter().flat_map(|span| span.content.chars()) {
+            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+            cells.push((ch, col, col + width));
+            col += width;
+        }
+        if row > start {
+            let blank = cells
+                .iter()
+                .take_while(|(ch, ..)| ch.is_whitespace())
+                .count();
+            cells.drain(..blank);
+        }
+        if row + 1 < end {
+            while cells.last().is_some_and(|(ch, ..)| ch.is_whitespace()) {
+                cells.pop();
+            }
+        }
+        for (ch, from, to) in cells {
+            for lower in ch.to_lowercase() {
+                out.push(TextCell {
+                    ch: lower,
+                    row: Some(row),
+                    from,
+                    to,
+                });
+            }
+        }
+        if row + 1 < end {
+            out.push(TextCell {
+                ch: ' ',
+                row: None,
+                from: 0,
+                to: 0,
+            });
+        }
+    }
+    out
+}
+
+/// The cells the `nth` occurrence of `text` takes in a block, one `(row, from,
+/// to)` run per row it wraps over. Short of `nth`, the last occurrence.
+fn link_ranges(cells: &[TextCell], text: &str, nth: usize) -> Vec<(usize, usize, usize)> {
+    let needle: Vec<char> = text.to_lowercase().chars().collect();
+    if needle.is_empty() || text.trim().is_empty() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    let mut at = 0;
+    while at + needle.len() <= cells.len() {
+        if cells[at..at + needle.len()]
+            .iter()
+            .map(|c| c.ch)
+            .eq(needle.iter().copied())
+        {
+            found.push(at);
+            at += needle.len();
+        } else {
+            at += 1;
+        }
+    }
+    let Some(&first) = found.get(nth).or(found.last()) else {
+        return Vec::new();
+    };
+    let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
+    for cell in &cells[first..first + needle.len()] {
+        let Some(row) = cell.row else { continue };
+        match ranges.last_mut() {
+            Some((last, _, to)) if *last == row => *to = (*to).max(cell.to),
+            _ => ranges.push((row, cell.from, cell.to)),
+        }
+    }
+    ranges
 }
 
 /// Draws the pictures whose rows are on screen, over the blanks left for them.
@@ -363,25 +492,28 @@ fn selected_link_row(app: &App, id: usize) -> Option<usize> {
 
 /// Paints the picked link's row with the theme accent and a star, so the
 /// selection is visible without reading colors.
+///
+/// The row keeps every cell where it was: mouse hits are resolved against the
+/// cached, unmarked rows, so a mark that moved the text would put the pointer
+/// off the link it points at. The star therefore takes the last two blanks of
+/// the row's leading margin, beside the text. A row with no such margin (full
+/// width reading, a table, a panel) gets the accent alone.
 pub(super) fn mark_selected_link(line: &mut Line<'_>, palette: &Palette) {
     let mark = Style::default()
         .fg(palette.text_on_accent)
         .bg(palette.accent);
-    // In a centred column the row starts with its margin: the star goes in
-    // the last two cells of that, beside the text, and nothing moves.
     let margin = line
         .spans
         .first()
         .filter(|span| span.content.len() >= 2 && span.content.chars().all(|c| c == ' '))
         .map(|span| span.content.len());
+    let mut skip = 0;
     if let Some(margin) = margin {
-        line.spans[0].content = " ".repeat(margin - 2).into();
+        let first = &mut line.spans[0];
+        first.content = " ".repeat(margin - 2).into();
         line.spans.insert(1, Span::styled("★ ", mark));
-    } else if let Some(first) = line.spans.first_mut() {
-        first.content = format!("★ {}", first.content).into();
-        first.style = mark;
+        skip = 2;
     }
-    let skip = if margin.is_some() { 2 } else { 1 };
     for span in line.spans.iter_mut().skip(skip) {
         span.style = span.style.bg(palette.accent).fg(palette.text_on_accent);
     }
