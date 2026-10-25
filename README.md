@@ -373,10 +373,10 @@ four directions) become boxes of box-drawing characters joined by lines with
 arrowheads, with diamonds for decisions, round nodes, dotted and thick edges and
 edge labels. The layout is done in-process, with no browser and no extra
 dependency. A `.mmd` or `.mermaid` file opens as its diagram, and
-`![[flow.mmd]]` embeds one in a note. Subgraphs, other diagram types (sequence,
-class, state, …) and anything that doesn't parse are not drawn: the source is
-shown instead, under a line saying why. A diagram wider than the pane pans like
-a table.
+`![[flow.mmd]]` embeds one in a note. Subgraphs, a node linked to itself, other
+diagram types (sequence, class, state, …) and anything that doesn't parse are
+not drawn: the source is shown instead, under a line saying why, in a block, a
+file or an embed alike. A diagram wider than the pane pans like a table.
 
 Both kinds of file are listed in the explorer and open like notes; rename, move
 and delete keep their extension, and a rename or move rewrites the

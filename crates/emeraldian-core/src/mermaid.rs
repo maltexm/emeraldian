@@ -94,9 +94,14 @@ pub struct Diagram {
     pub edges: Vec<Link>,
 }
 
-/// Most nodes and edges that are drawn; a bigger source stays source.
+/// Most nodes and edges that are drawn; a bigger source stays source. Checked
+/// as each is added, so a hostile line is refused before it has been built.
 const MAX_NODES: usize = 150;
 const MAX_EDGES: usize = 300;
+
+fn too_large() -> String {
+    format!("too large to draw: more than {MAX_NODES} nodes or {MAX_EDGES} edges")
+}
 /// Longest a node's label runs before it wraps onto another line, in columns.
 const WRAP: usize = 32;
 
@@ -186,11 +191,6 @@ pub fn parse(source: &str) -> Result<Flow, String> {
             continue;
         }
         statement_into(statement, &mut flow)?;
-        if flow.nodes.len() > MAX_NODES || flow.edges.len() > MAX_EDGES {
-            return Err(format!(
-                "too large to draw: more than {MAX_NODES} nodes or {MAX_EDGES} edges"
-            ));
-        }
     }
     if flow.nodes.is_empty() {
         return Err("the flowchart has no nodes".into());
@@ -263,6 +263,16 @@ fn statement_into(statement: &str, flow: &mut Flow) -> Result<(), String> {
             return Err("an edge has no node at its end".into());
         }
         let right = group(&chars, &mut at, flow)?;
+        // Before the product is built, not after: `A & A & … --> B & B & …`.
+        if flow.edges.len() + left.len() * right.len() > MAX_EDGES {
+            return Err(too_large());
+        }
+        if let Some(&same) = left.iter().find(|from| right.contains(from)) {
+            return Err(format!(
+                "{} linked to itself is not drawn yet",
+                flow.nodes[same].id
+            ));
+        }
         for &from in &left {
             for &to in &right {
                 flow.edges.push(Edge {
@@ -298,6 +308,9 @@ fn group(chars: &[char], at: &mut usize, flow: &mut Flow) -> Result<Vec<usize>, 
         skip_spaces(chars, &mut look);
         *at = look;
         ids.push(node(chars, at, flow)?);
+        if ids.len() > MAX_EDGES {
+            return Err(too_large());
+        }
     }
 }
 
@@ -332,7 +345,12 @@ fn node(chars: &[char], at: &mut usize, flow: &mut Flow) -> Result<usize, String
     }
     let id: String = chars[start..*at].iter().collect();
 
-    let rest: String = chars[*at..].iter().collect();
+    // Only a node with a shape written after it needs the rest of the line.
+    let rest: String = if matches!(chars.get(*at), Some('(' | '[' | '{' | '>')) {
+        chars[*at..].iter().collect()
+    } else {
+        String::new()
+    };
     let mut spelled = None;
     for (open, closes, shape) in SHAPES {
         let Some(body) = rest.strip_prefix(open) else {
@@ -389,6 +407,9 @@ fn node(chars: &[char], at: &mut usize, flow: &mut Flow) -> Result<usize, String
             });
             flow.nodes.len() - 1
         });
+    if flow.nodes.len() > MAX_NODES {
+        return Err(too_large());
+    }
     if let Some((label, shape)) = spelled {
         flow.nodes[index].label = label;
         flow.nodes[index].shape = shape;
@@ -1478,6 +1499,63 @@ mod tests {
             back.points[0].0,
             "and the same at Stop"
         );
+    }
+
+    #[test]
+    fn a_huge_group_is_refused_before_it_is_expanded() {
+        // 2000 x 2000 would be 4 million edges if built and counted after.
+        let side = |name: &str| vec![name; 2000].join(" & ");
+        let source = format!("flowchart TD\n{} --> {}", side("A"), side("B"));
+        let started = std::time::Instant::now();
+        let reason = parse(&source).expect_err("far too many edges");
+        assert!(reason.contains("too large"), "{reason}");
+        assert!(
+            started.elapsed().as_millis() < 100,
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn a_long_chain_in_one_statement_is_refused_as_fast_as_many_short_ones() {
+        for source in [
+            // Ten thousand distinct nodes, then two nodes taking turns ten thousand times.
+            format!(
+                "flowchart TD\n{}",
+                (0..10_000)
+                    .map(|n| format!("N{n}"))
+                    .collect::<Vec<_>>()
+                    .join(" --> ")
+            ),
+            format!(
+                "flowchart TD\n{}",
+                (0..10_000)
+                    .map(|n| if n % 2 == 0 { "A" } else { "B" })
+                    .collect::<Vec<_>>()
+                    .join(" --> ")
+            ),
+        ] {
+            let started = std::time::Instant::now();
+            let reason = parse(&source).expect_err("far too big");
+            assert!(reason.contains("too large"), "{reason}");
+            assert!(
+                started.elapsed().as_millis() < 500,
+                "{:?} for {} bytes",
+                started.elapsed(),
+                source.len()
+            );
+        }
+    }
+
+    #[test]
+    fn a_node_linked_to_itself_is_refused_with_a_reason_not_drawn_without_its_loop() {
+        let reason = parse("flowchart TD\n  A[Again] -->|retry| A").expect_err("a self loop");
+        assert!(reason.contains("itself"), "{reason}");
+        assert!(
+            parse("flowchart TD\n  A --> B & A").is_err(),
+            "inside a group too"
+        );
+        assert!(parse("flowchart TD\n  A --> B --> B").is_err());
     }
 
     #[test]

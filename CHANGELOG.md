@@ -17,8 +17,9 @@ All notable changes to this project are documented here. The format follows
   `![[flow.mmd]]` embeds a Mermaid file the same way. `.excalidraw`, `.mmd` and
   `.mermaid` files appear in the explorer and open like notes. No pictures and
   no new dependency: everything is text and braille, so it looks the same in
-  every terminal. Diagram types other than flowcharts, subgraphs, and sources
-  that do not parse stay as source with a line saying why.
+  every terminal. Diagram types other than flowcharts, subgraphs, a node linked
+  to itself, sources that do not parse and sources too large to draw stay as
+  source with a line saying why, whether in a block, a file or an embed.
 - Renaming, moving and deleting a diagram file keeps its extension, and renaming
   or moving it rewrites the links that name it (`![[Flow.excalidraw]]`,
   `![[drawings/Flow.excalidraw|400]]`, `[[Flow.mmd#part]]`, the escaped `\|` of a

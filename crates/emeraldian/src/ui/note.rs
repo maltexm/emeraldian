@@ -399,7 +399,7 @@ fn draw_reading(
             .note(id)
             .is_some_and(|note| is_mermaid_file(&note.meta.rel));
         let document = if is_mermaid {
-            markdown::parse(&format!("```mermaid\n{content}\n```\n"))
+            mermaid_document(&content)
         } else {
             markdown::parse(&content)
         };
@@ -1046,9 +1046,10 @@ fn lift(span: &markdown::Span, ctx: &mut Ctx, width: usize, pad: &str) -> Option
 
 /// The drawing or Mermaid diagram an embed names, ready to be laid out.
 ///
-/// `None` when the target is neither, can't be read, or can't be drawn: the
-/// embed stays a link then, rather than an error in the middle of a note.
-fn embedded_diagram(target: &str, ctx: &Ctx, width: usize, pad: &str) -> Option<Lift> {
+/// `None` when the target is neither or can't be read: the embed stays a link
+/// then. A Mermaid file that can't be drawn is still laid out, as its source
+/// under the reason, the same as a block of it in the note.
+fn embedded_diagram(target: &str, ctx: &mut Ctx, width: usize, pad: &str) -> Option<Lift> {
     let decoded = target.replace("%20", " ");
     let index = ctx.index;
     let id = index.resolve(&decoded).or_else(|| {
@@ -1068,10 +1069,21 @@ fn embedded_diagram(target: &str, ctx: &Ctx, width: usize, pad: &str) -> Option<
         ));
     }
     if is_mermaid_file(rel) {
-        let drawn = mermaid::lines(&index.read(id).ok()?, ctx.palette, pad).ok()?;
-        return Some(Lift::Lines(drawn));
+        let document = mermaid_document(&index.read(id).ok()?);
+        let indent = pad.chars().count();
+        let mut lines = Vec::new();
+        for block in &document.blocks {
+            render_block(block, ctx, width + indent, indent, &mut lines);
+        }
+        return Some(Lift::Lines(lines));
     }
     None
+}
+
+/// A Mermaid file as the one code block it is, which draws the diagram or says
+/// why it can't and shows the source.
+fn mermaid_document(source: &str) -> markdown::Document {
+    markdown::parse(&format!("```mermaid\n{source}\n```\n"))
 }
 
 /// Whether a note's file is Mermaid source rather than Markdown.
@@ -2306,11 +2318,7 @@ mod tests {
         let vault = TempVault::new("embed-broken");
         vault.write("Bad.excalidraw", "this is not json");
         vault.write("Empty.excalidraw", r#"{"elements": []}"#);
-        vault.write("Seq.mmd", "sequenceDiagram\n  A->>B: hi\n");
-        vault.write(
-            "A.md",
-            "![[Nope.excalidraw]]\n\n![[Bad.excalidraw]]\n\n![[Empty.excalidraw]]\n\n![[Seq.mmd]]\n",
-        );
+        vault.write("A.md", "![[Nope.excalidraw]]\n\n![[Bad.excalidraw]]\n\n![[Empty.excalidraw]]\n\n![[Nope.mmd]]\n");
         let mut app = open(&vault, "A.md");
         let shown = screen_text(&mut app);
         assert!(app.reading.pictures.is_empty(), "{shown}");
@@ -2318,9 +2326,51 @@ mod tests {
             "Nope.excalidraw",
             "Bad.excalidraw",
             "Empty.excalidraw",
-            "Seq.mmd",
+            "Nope.mmd",
         ] {
             assert!(shown.contains(name), "{name} is still there:\n{shown}");
+        }
+    }
+
+    #[test]
+    fn an_embedded_mermaid_file_that_cannot_be_drawn_shows_its_source_and_why() {
+        let vault = TempVault::new("embed-mermaid-fallback");
+        vault.write("Seq.mermaid", "sequenceDiagram\n  A->>B: hello\n");
+        vault.write("Broken.mmd", "flowchart TD\n  X -->\n");
+        vault.write("A.md", "![[Seq.mermaid]]\n\nbetween\n\n![[Broken.mmd]]\n");
+        let mut app = open(&vault, "A.md");
+        let rows = screen_rows(&mut app);
+        let shown = rows.join("\n");
+        assert!(shown.contains("A->>B: hello"), "{shown}");
+        assert!(
+            shown.contains("sequenceDiagram diagrams are not drawn"),
+            "{shown}"
+        );
+        assert!(shown.contains("X -->"), "{shown}");
+        assert!(shown.contains("an edge has no node at its end"), "{shown}");
+        assert!(
+            row_with(&rows, "A->>B: hello") < row_with(&rows, "between")
+                && row_with(&rows, "between") < row_with(&rows, "X -->"),
+            "each in its place:\n{shown}"
+        );
+    }
+
+    #[test]
+    fn a_self_loop_is_never_a_diagram_that_quietly_lacks_its_loop() {
+        let vault = TempVault::new("mermaid-self-loop");
+        vault.write(
+            "A.md",
+            "```mermaid\nflowchart TD\n  A[Again] -->|retry| A\n```\n",
+        );
+        vault.write("Loop.mmd", "flowchart TD\n  A[Again] -->|retry| A\n");
+        for note in ["A.md", "Loop.mmd"] {
+            let mut app = open(&vault, note);
+            let shown = screen_text(&mut app);
+            assert!(
+                shown.contains("A[Again] -->|retry| A"),
+                "{note}: source:\n{shown}"
+            );
+            assert!(shown.contains("itself"), "{note}: and why:\n{shown}");
         }
     }
 
