@@ -299,6 +299,92 @@ fn brackets_keep_a_users_own_map() {
     );
 }
 
+/// Prose, link interiors and unequal fences use the same rules through the
+/// actual normal-mode maps as through the pure Lua scanner.
+#[test]
+fn brackets_use_cursor_spans_and_matching_fences() {
+    let prose = "[[A]]\nplain text\n[[B]]\nplain text\n[[C]]\ntail\n";
+    let fence = "[[A]]\n````markdown\n```\n[[Hidden]]\n````\n[[B]]\n";
+    for (text, keys, expected) in [
+        (prose, "2G0[", 0),
+        (prose, "G0[", 4),
+        (prose, "G02[", 2),
+        (prose, "2G02[", 4),
+        (prose, "3G02l[", 0),
+        (prose, "3G02l]", 4),
+        (fence, "gg0]", 5),
+        (fence, "G0[", 0),
+        (
+            "[[A]]\n~~~~markdown\n~~~\n[[Hidden]]\n~~~~\n[[B]]\n",
+            "gg0]",
+            5,
+        ),
+        ("[[A]]\n[t](Note C.md)\n[[B]]\n", "gg0]", 1),
+    ] {
+        let vault = TempVault::new("nvim-bracket-edges");
+        let path = vault.write("Edges.md", text);
+        let Some(mut session) = start(vault.path(), false) else {
+            return;
+        };
+        session.open(&path).expect("open");
+        // End the bracket command before the marker's A: nvim otherwise sees
+        // the built-in ]A/[A prefix when all keys arrive in one typeahead batch.
+        let (row, seen) = row_after(&mut session, &format!("{keys}<Ignore>"));
+        assert_eq!(row, expected, "{keys:?} in {text:?}");
+        assert!(follows(&seen).is_empty(), "{seen:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+}
+
+/// Standalone diagram source is data even when its syntax looks like links.
+/// Bracket mappings still attach; follow keys must use the user's fallback.
+#[test]
+fn standalone_diagrams_do_not_navigate_wiki_shaped_data() {
+    for ext in ["mmd", "mermaid", "excalidraw"] {
+        let vault = TempVault::new("nvim-diagram-no-links");
+        let path = vault.write(
+            &format!("flow.{ext}"),
+            "flowchart LR\nA[[Old]] --> B\ntail\n",
+        );
+        let Some(mut session) = start(vault.path(), false) else {
+            return;
+        };
+        session.open(&path).expect("open diagram");
+        collect(&mut session, |_, seen| {
+            seen.iter()
+                .any(|event| matches!(event, BridgeEvent::Entered(_)))
+        })
+        .expect("diagram entered");
+        for keys in ["gg0]<Ignore>", "gg0[<Ignore>"] {
+            let (row, seen) = row_after(&mut session, keys);
+            assert_eq!(row, 0, "{ext}: brackets must not jump into diagram data");
+            assert!(follows(&seen).is_empty(), "{ext}: {seen:?}");
+            session.input("u");
+            collect(&mut session, |session, _| {
+                marker_row(session.grid()).is_none()
+            })
+            .expect("undo marker");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "flowchart LR\nA[[Old]] --> B\ntail\n"
+        );
+
+        for key in ["<CR>", "gf", "<C-]>"] {
+            let config = format!("nnoremap <expr> {key} 'G'");
+            let Some(mut session) = start_configured(vault.path(), &[&config]) else {
+                return;
+            };
+            session
+                .open(&path)
+                .expect("open diagram for follow fallback");
+            let (row, seen) = row_after(&mut session, &format!("2G02l{key}"));
+            assert_eq!(row, 2, "{ext}: {key} must use the user's fallback");
+            assert!(follows(&seen).is_empty(), "{ext}: {key}: {seen:?}");
+        }
+    }
+}
+
 /// A markdown link carries the note it was written in, so that a relative
 /// path can be resolved from that note's folder.
 #[test]

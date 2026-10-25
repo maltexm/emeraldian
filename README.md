@@ -345,8 +345,14 @@ while nvim owns the pane.
 
 **Links.** In a vault note, `]` and `[` (Normal mode, buffer-local, `nowait`,
 with a count) jump to the next and previous link, wrapping. That covers
-wikilinks, Markdown links and bare `http`/`https` URLs, and skips a link inside
-a fenced block. A map you already have on `]` or `[` is kept, and the status
+wikilinks, Markdown links (including paths with spaces) and bare `http`/`https`
+URLs. Fenced blocks stay excluded until a same-character fence at least as long
+as the opener closes them. From ordinary text, `[` selects the nearest preceding
+link; inside a link, either key skips that link, including its closing delimiters.
+Standalone `.mmd`, `.mermaid` and `.excalidraw` sources retain the mappings but
+contain diagram data, not Markdown links; follow keys use their usual fallback.
+A wrapped `.excalidraw.md` file remains Markdown. A map you already have on `]`
+or `[` is kept, and the status
 line says so. Mapping Normal mode only means Visual and operator-pending keep
 the built-in bracket motions; the Normal-mode ones this shadows, and that no
 longer start, are `]]`, `[[`, `]m`, `[m`, `]M`, `[M`, `]s`, `[s`, `]d`, `[d`,

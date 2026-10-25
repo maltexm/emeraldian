@@ -79,7 +79,9 @@ local function scan(line)
     if url:sub(1, 1) == "<" then
       path = url:match("^<([^>]*)>")
     else
-      path = url:match("^(%S*)")
+      -- Vault paths commonly contain spaces. Only a quoted Markdown title
+      -- terminates an unwrapped destination; ordinary spaces belong to it.
+      path = url:match('^(.-)%s+".*"$') or url:match("^(.-)%s+'.*'$") or url
     end
     -- `https:`, `mailto:`, ... are somebody else's business.
     if path and not path:match("^%a[%w+.-]*:") then
@@ -148,16 +150,18 @@ local function all_links(lines)
     local marker = line:match("^%s*(```+)") or line:match("^%s*(~~~+)")
     if marker then
       if fence == nil then
-        fence = marker:sub(1, 1)
-      elseif fence == marker:sub(1, 1) then
+        fence = marker
+      elseif fence:sub(1, 1) == marker:sub(1, 1)
+        and #marker >= #fence
+        and vim.trim(line):sub(#marker + 1):match("^%s*$") then
         fence = nil
       end
     elseif not fence then
       for _, link in ipairs(scan(line)) do
-        found[#found + 1] = { lnum, link.s }
+        found[#found + 1] = { lnum, link.s, link.e }
       end
       for _, url in ipairs(bare_urls(line)) do
-        found[#found + 1] = { lnum, url.s }
+        found[#found + 1] = { lnum, url.s, url.e }
       end
     end
   end
@@ -177,25 +181,20 @@ function M.next_link(lines, lnum, col, delta)
   if n == 0 or delta == 0 then
     return nil
   end
-  local here = 0
+  local before, on = 0, nil
   for i, pos in ipairs(links) do
-    if pos[1] < lnum or (pos[1] == lnum and pos[2] <= col) then
-      here = i
+    if pos[1] < lnum or (pos[1] == lnum and pos[2] < col) then
+      before = i
+    end
+    if pos[1] == lnum and pos[2] <= col and col <= pos[3] then
+      on = i
     end
   end
-  local step = delta > 0 and 1 or -1
-  local left = math.abs(delta) % n
-  if left == 0 then
-    left = n
-  end
-  -- `here` is 0 when the cursor is before every link. Lua's `%` on a negative
-  -- is negative, so the index is computed in 0-based space and shifted back.
-  local i = here == 0 and (step > 0 and 0 or 1) or here
-  while left > 0 do
-    i = (i - 1 + step) % n + 1
-    left = left - 1
-  end
-  return links[i]
+  -- Inside a link (including both delimiters), skip that link. In prose,
+  -- backward starts at the nearest preceding link, not the one before it.
+  local here = on or (delta > 0 and before or before + 1)
+  local pos = links[(here - 1 + delta) % n + 1]
+  return { pos[1], pos[2] }
 end
 
 --- 1-based line number of a heading (`kind = "heading"`, case-insensitive,
@@ -265,10 +264,20 @@ function M.last_window()
   return #wins == 1 and #vim.api.nvim_list_tabpages() == 1
 end
 
+--- Standalone diagram source is data, not Markdown. In particular Mermaid's
+--- `A[[label]]` is a node, not a wikilink. `.excalidraw.md` remains Markdown,
+--- matching the core index's distinction between wrapped and raw drawings.
+local function markdown_buf(buf)
+  return vim.api.nvim_buf_get_name(buf):lower():match("%.md$") ~= nil
+end
+
 --- Follows the link under the cursor. false when there is none, so the caller
 --- can fall back to the key's usual meaning.
 function M.follow()
   local buf = vim.api.nvim_get_current_buf()
+  if not markdown_buf(buf) then
+    return false
+  end
   local cursor = vim.api.nvim_win_get_cursor(0)
   local link = M.link_at(vim.api.nvim_get_current_line(), cursor[2])
   if not link then
@@ -690,6 +699,9 @@ end
 --- moves. Normal mode only, so Insert, Visual and operator-pending keep the
 --- built-in bracket motions.
 local function jump_link(delta)
+  if not markdown_buf(vim.api.nvim_get_current_buf()) then
+    return
+  end
   local cursor = vim.api.nvim_win_get_cursor(0)
   local count = vim.v.count > 0 and vim.v.count or 1
   local pos = M.next_link(
