@@ -101,6 +101,18 @@ impl IndexedNote {
     }
 }
 
+/// What the index parses of a note: its text, or nothing for a diagram file.
+///
+/// A drawing's JSON is full of `#1e1e1e` colours that would index as tags, and
+/// a Mermaid source is not Markdown either; they are listed and opened, not
+/// searched for links.
+fn read_for_index(meta: &NoteMeta) -> String {
+    if note::own_extension(&meta.rel).is_some() {
+        return String::new();
+    }
+    fs::read_to_string(&meta.path).unwrap_or_default()
+}
+
 /// The index over one vault.
 #[derive(Debug, Clone)]
 pub struct VaultIndex {
@@ -147,7 +159,7 @@ impl VaultIndex {
         let mut raw_links: Vec<Vec<(LinkRef, Arc<str>)>> = Vec::with_capacity(metas.len());
 
         for mut meta in metas {
-            let content = fs::read_to_string(&meta.path).unwrap_or_default();
+            let content = read_for_index(&meta);
             let (fm_text, body, body_offset) = note::split_frontmatter(&content);
             let frontmatter = fm_text.map(note::parse_frontmatter).unwrap_or_default();
 
@@ -224,6 +236,14 @@ impl VaultIndex {
             }
         }
         for (id, note) in self.notes.iter().enumerate() {
+            if note::own_extension(&note.meta.rel).is_some() {
+                // A diagram file is linked by its whole name, as Obsidian
+                // links any non-Markdown file: `![[Flow.excalidraw]]`. Its
+                // bare stem stays free for a Markdown note of the same name.
+                let name = note.meta.rel.rsplit('/').next().unwrap_or(&note.meta.rel);
+                self.lookup.entry(name.to_lowercase()).or_insert(id);
+                continue;
+            }
             // First note wins a contested filename, matching the sorted scan
             // order so the result is deterministic rather than filesystem-dependent.
             self.lookup
@@ -487,7 +507,11 @@ impl VaultIndex {
                 )
             })?;
 
-        let content = fs::read_to_string(&path)?;
+        let content = if note::own_extension(&self.notes[id].meta.rel).is_some() {
+            String::new()
+        } else {
+            fs::read_to_string(&path)?
+        };
         let (fm_text, body, body_offset) = note::split_frontmatter(&content);
         let frontmatter = fm_text.map(note::parse_frontmatter).unwrap_or_default();
 
@@ -501,7 +525,7 @@ impl VaultIndex {
         let note = &mut self.notes[id];
         note.meta.title = frontmatter
             .title()
-            .unwrap_or_else(|| note.meta.stem.clone());
+            .unwrap_or_else(|| note::default_title(&note.meta.rel, &note.meta.stem));
         note.meta.size = body.len() as u64;
         note.aliases = frontmatter.aliases();
         note.headings = links::extract_headings(body);
@@ -890,6 +914,64 @@ mod tests {
             None
         );
         assert_eq!(index.attachment_path("nothing.png", None), None);
+    }
+
+    #[test]
+    fn a_diagram_file_is_titled_with_its_whole_name_so_it_is_not_taken_for_a_note() {
+        let vault = TempVault::new("diagram-title");
+        vault.write("Flow.excalidraw", "{}");
+        vault.write("Flow.md", "The note.\n");
+        vault.write("sub/Seq.mmd", "graph TD\n  A --> B");
+        vault.write("Wrapped.excalidraw.md", "---\ntitle: Pretty\n---\n");
+
+        let mut index = vault.index();
+        let title = |index: &VaultIndex, rel: &str| {
+            index
+                .note(index.id_of_rel(rel).unwrap())
+                .unwrap()
+                .meta
+                .title
+                .clone()
+        };
+        assert_eq!(title(&index, "Flow.excalidraw"), "Flow.excalidraw");
+        assert_eq!(title(&index, "Flow.md"), "Flow");
+        assert_eq!(title(&index, "sub/Seq.mmd"), "Seq.mmd");
+        assert_eq!(title(&index, "Wrapped.excalidraw.md"), "Pretty");
+
+        for rel in ["Flow.excalidraw", "sub/Seq.mmd"] {
+            let id = index.id_of_rel(rel).unwrap();
+            index.refresh_note(id).expect("refresh");
+        }
+        assert_eq!(title(&index, "Flow.excalidraw"), "Flow.excalidraw");
+        assert_eq!(title(&index, "sub/Seq.mmd"), "Seq.mmd");
+    }
+
+    #[test]
+    fn colours_in_a_drawing_do_not_index_as_tags() {
+        let vault = TempVault::new("diagram-tags");
+        vault.write(
+            "Flow.excalidraw",
+            r##"{"elements": [{"type": "rectangle", "strokeColor": "#1e1e1e", "x": 0, "y": 0}]}"##,
+        );
+        vault.write("Seq.mmd", "graph TD\n  A[#hash] --> B");
+        vault.write("Real.md", "A real #tag\n");
+
+        let mut index = vault.index();
+        let tags: Vec<_> = index.tags().keys().cloned().collect();
+        assert_eq!(tags, vec!["tag".to_string()]);
+
+        let flow = index.id_of_rel("Flow.excalidraw").unwrap();
+        index.refresh_note(flow).expect("refresh");
+        assert_eq!(
+            index.tags().len(),
+            1,
+            "a refresh doesn't start reading them"
+        );
+        assert!(
+            index.resolve("Flow.excalidraw").is_some(),
+            "but they resolve"
+        );
+        assert!(index.resolve("Seq.mmd").is_some());
     }
 
     #[test]

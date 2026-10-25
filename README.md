@@ -358,11 +358,30 @@ works. Decoding happens off the draw loop, and the space a picture needs is
 worked out before it is decoded, so nothing jumps as it appears. A picture that
 can't be drawn leaves its alt text where it was.
 
-**Excalidraw.** A `.excalidraw.md` note opens as the drawing, not as the wall of
-compressed base64 it is stored as. Shapes, arrows, freehand strokes and labels are
-drawn as vectors on a braille canvas, so a diagram reads the same in every
-terminal whether or not it can show pictures. Scaled to the pane's width and
-scrolled vertically, like the prose it replaces.
+**Excalidraw.** A `.excalidraw.md` note, or a plain `.excalidraw` file, opens as
+the drawing, not as the wall of compressed base64 or JSON it is stored as.
+Shapes, arrows, freehand strokes and labels are drawn as vectors on a braille
+canvas, so a diagram reads the same in every terminal whether or not it can show
+pictures. Scaled to the pane's width and scrolled vertically, like the prose it
+replaces. `![[Flow.excalidraw]]` (or `![[Flow.excalidraw.md]]`, or
+`![](drawings/flow.excalidraw)`) draws the same braille picture inside a note,
+among the prose, sized to the pane and no taller than a screen.
+
+**Mermaid.** A ```` ```mermaid ```` block in a note is drawn on the character
+grid, in the same pictureless style: flowcharts (`flowchart` and `graph`, in all
+four directions) become boxes of box-drawing characters joined by lines with
+arrowheads, with diamonds for decisions, round nodes, dotted and thick edges and
+edge labels. The layout is done in-process, with no browser and no extra
+dependency. A `.mmd` or `.mermaid` file opens as its diagram, and
+`![[flow.mmd]]` embeds one in a note. Subgraphs, a node linked to itself, other
+diagram types (sequence, class, state, …) and anything that doesn't parse are
+not drawn: the source is shown instead, under a line saying why, in a block, a
+file or an embed alike. A diagram wider than the pane pans like a table.
+
+Both kinds of file are listed in the explorer and open like notes; rename, move
+and delete keep their extension, and a rename or move rewrites the
+`![[Flow.excalidraw]]`-style links that name them. Their contents are never
+searched for links or tags.
 
 **Explorer.** The file tree opens with your most recently edited notes at the
 top, which is usually where you left off. `s` steps through the other orders:

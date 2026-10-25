@@ -197,9 +197,9 @@ fn locate(path: &Path) -> Result<(PathBuf, Option<String>), String> {
     if !path.exists() {
         return Err(format!("{} does not exist", path.display()));
     }
-    if !emeraldian_core::vault::is_markdown(path) {
+    if !emeraldian_core::vault::is_note_file(path) {
         return Err(format!(
-            "{} is not a folder or a Markdown note",
+            "{} is not a folder, a Markdown note or a diagram",
             path.display()
         ));
     }
@@ -1532,8 +1532,13 @@ mod tests {
         let picture = vault.write("chart.png", "not really a png");
         let not_a_note = locate(&picture).expect_err("not a note");
         assert!(
-            not_a_note.contains("not a folder or a Markdown note"),
+            not_a_note.contains("not a folder, a Markdown note or a diagram"),
             "{not_a_note}"
         );
+        assert!(
+            locate(&vault.write("Flow.excalidraw", "{}")).is_ok(),
+            "a drawing opens like a note"
+        );
+        assert!(locate(&vault.write("Seq.mmd", "graph TD")).is_ok());
     }
 }

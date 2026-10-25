@@ -6,6 +6,7 @@ pub mod graph;
 pub mod index;
 pub mod links;
 pub mod markdown;
+pub mod mermaid;
 pub mod note;
 pub mod ops;
 pub mod search;

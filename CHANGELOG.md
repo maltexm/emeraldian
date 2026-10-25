@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and versions follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Excalidraw drawings and Mermaid flowcharts inline, and as files of their
+  own.** `![[Flow.excalidraw]]`, `![[Flow.excalidraw.md]]` and
+  `![](drawings/flow.excalidraw)` trace the drawing on the braille canvas right
+  in the note, among the prose. A ```` ```mermaid ```` block is drawn as a
+  flowchart on the character grid (boxes, lines, arrowheads, decision diamonds,
+  edge labels, all four directions) instead of showing its source, and
+  `![[flow.mmd]]` embeds a Mermaid file the same way. `.excalidraw`, `.mmd` and
+  `.mermaid` files appear in the explorer and open like notes. No pictures and
+  no new dependency: everything is text and braille, so it looks the same in
+  every terminal. Diagram types other than flowcharts, subgraphs, a node linked
+  to itself, sources that do not parse and sources too large to draw stay as
+  source with a line saying why, whether in a block, a file or an embed.
+- Renaming, moving and deleting a diagram file keeps its extension, and renaming
+  or moving it rewrites the links that name it (`![[Flow.excalidraw]]`,
+  `![[drawings/Flow.excalidraw|400]]`, `[[Flow.mmd#part]]`, the escaped `\|` of a
+  table). Links that spell out `.md` follow a Markdown note's rename too.
+
+### Fixed
+
+- Renaming a note no longer rewrites `[[Name]]` inside Mermaid and Excalidraw
+  files, where `A[[Name]]` is a subroutine node and not a link.
+- A bare `[[Flow]]` means the Markdown note `Flow.md`, never a `Flow.excalidraw`
+  or `Flow.mmd` next to it; diagram files are linked by their whole name, as
+  Obsidian links any file that is not Markdown.
+
 ## [0.8.0] — 2026-10-22
 
 Shortcuts that follow your system, on Windows, Linux and the Mac alike, find
