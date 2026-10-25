@@ -13,6 +13,7 @@ pub mod mermaid;
 pub mod modal;
 pub mod note;
 pub mod panes;
+pub mod reading;
 
 use emeraldian_theme::Palette;
 use ratatui::Frame;
