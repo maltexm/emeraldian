@@ -84,6 +84,42 @@ pub fn draw(
     drawing: &Drawing,
     scroll: usize,
 ) -> usize {
+    let rows = paint(frame, palette, area, drawing, scroll);
+    if rows > 0 {
+        scrollbar(frame, palette, area, scroll, rows);
+    }
+    rows
+}
+
+/// A scene's rows and columns when it sits in a note among the prose: as wide
+/// as `max_cols` allows but no bigger than life (a cell is about 8 by 16 scene
+/// units), narrowed until it is no taller than `max_rows` if it can be.
+///
+/// `None` for an empty drawing.
+#[must_use]
+pub fn fit(drawing: &Drawing, max_cols: usize, max_rows: usize) -> Option<(u16, u16)> {
+    let (_, _, width, height) = drawing.bounds()?;
+    let (width, height) = (width.max(1.0), height.max(1.0));
+    let natural = (width / 8.0).ceil();
+    // rows = ceil(height * cols / (2 * width)), so this many columns fill the cap.
+    let by_height = (2.0 * max_rows as f64 * width / height).floor();
+    let cols = (max_cols as f64).min(natural).min(by_height).max(6.0);
+    let cols = cols.min(max_cols.max(1) as f64);
+    let rows = (height * cols / (2.0 * width)).ceil().max(1.0);
+    Some((cols as u16, rows as u16))
+}
+
+/// Draws a scene into `area` and nothing else: no scrollbar, no frame round it.
+/// The scene is scaled to the area's width and starts `scroll` rows down.
+///
+/// Returns the number of rows the whole scene needs at that width.
+pub fn paint(
+    frame: &mut Frame,
+    palette: &Palette,
+    area: Rect,
+    drawing: &Drawing,
+    scroll: usize,
+) -> usize {
     let Some((left, top, width, height)) = drawing.bounds() else {
         Paragraph::new(Line::from(Span::styled(
             "this drawing is empty",
@@ -143,7 +179,6 @@ pub fn draw(
         });
 
     frame.render_widget(canvas, area);
-    scrollbar(frame, palette, area, scroll, rows);
     rows
 }
 
@@ -326,20 +361,92 @@ mod tests {
             angle: 0.0,
             stroke: None,
             fill: None,
-            hatched: false,
             dashed: false,
-            dotted: false,
             points: Vec::new(),
             text: String::new(),
-            stroke_width: 1.0,
-            opacity: 1.0,
-            rounded: false,
-            font_size: 20.0,
-            monospace: false,
-            align: emeraldian_core::excalidraw::TextAlign::Left,
-            start_head: None,
-            end_head: None,
         }
+    }
+
+    #[test]
+    fn an_inline_drawing_is_fitted_to_the_width_and_never_blown_up() {
+        let scene = |w: u32, h: u32| {
+            emeraldian_core::excalidraw::parse(&format!(
+                r##"{{"elements": [{{"type": "rectangle", "x": 0, "y": 0, "width": {w}, "height": {h}}}]}}"##
+            ))
+            .expect("a scene")
+        };
+        // Wide: as wide as the room, as tall as its shape says.
+        let (cols, rows) = fit(&scene(800, 400), 60, 24).expect("fits");
+        assert_eq!(cols, 60);
+        assert_eq!(
+            rows, 15,
+            "400 tall at 60 cells across: 400 * 60 / (2 * 800)"
+        );
+        // Small: drawn at about its own size, not stretched over the pane.
+        let (cols, _) = fit(&scene(80, 40), 60, 24).expect("fits");
+        assert!(cols < 20, "{cols} cells for a drawing 80 units wide");
+        // Tall: narrowed until it stops being taller than the cap.
+        let (cols, rows) = fit(&scene(400, 800), 60, 24).expect("fits");
+        assert!(rows <= 24 && cols < 60, "{cols}x{rows}");
+        assert_eq!(
+            fit(&emeraldian_core::excalidraw::Drawing::default(), 60, 24),
+            None,
+            "an empty drawing has no size"
+        );
+    }
+
+    #[test]
+    fn a_drawing_painted_into_a_rect_stays_inside_it_and_scrolls_within_it() {
+        let drawing = emeraldian_core::excalidraw::parse(
+            r##"{"elements": [
+                {"type": "rectangle", "x": 0, "y": 0, "width": 200, "height": 400},
+                {"type": "line", "x": 0, "y": 400, "width": 200, "height": 0,
+                 "points": [[0, 0], [200, 0]]}]}"##,
+        )
+        .expect("a scene");
+        let palette = Palette::from(&presets::default_theme());
+        let area = Rect::new(5, 3, 20, 6);
+        let paint_at = |scroll: usize| {
+            let backend = ratatui::backend::TestBackend::new(40, 20);
+            let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+            let mut rows = 0;
+            terminal
+                .draw(|frame| rows = paint(frame, &palette, area, &drawing, scroll))
+                .expect("draw");
+            let buffer = terminal.backend().buffer().clone();
+            (rows, buffer)
+        };
+        let braille = |cell: &ratatui::buffer::Cell| {
+            cell.symbol()
+                .chars()
+                .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c))
+        };
+
+        let (rows, top) = paint_at(0);
+        assert!(
+            rows > 6,
+            "the whole drawing needs more rows than it was given"
+        );
+        for y in 0..20 {
+            for x in 0..40 {
+                if !area.contains((x, y).into()) {
+                    assert!(!braille(&top[(x, y)]), "ink escaped the rect at {x},{y}");
+                }
+            }
+        }
+        assert!((3..9).any(|y| (5..25).any(|x| braille(&top[(x, y)]))));
+        let (_, scrolled) = paint_at(rows - 6);
+        assert_ne!(
+            (3..9)
+                .map(|y| (5..25)
+                    .map(|x| scrolled[(x, y)].symbol())
+                    .collect::<String>())
+                .collect::<Vec<_>>(),
+            (3..9)
+                .map(|y| (5..25).map(|x| top[(x, y)].symbol()).collect::<String>())
+                .collect::<Vec<_>>(),
+            "scrolling shows another part of the drawing"
+        );
     }
 
     #[test]

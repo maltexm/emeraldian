@@ -302,11 +302,21 @@ impl VaultIndex {
 
     /// Rewrites `[[old]]`-style links across the vault after a rename or move.
     ///
-    /// Covers the four wikilink shapes Obsidian writes — bare, aliased,
-    /// heading-anchored, and full-path — for both the old filename and the old
-    /// vault-relative path. Markdown links are left alone: they carry a real
-    /// relative path whose correctness depends on the linking note's own
-    /// location, which this operation doesn't change.
+    /// Covers the wikilink shapes Obsidian writes — bare, aliased (also the
+    /// `\|` a table needs), heading-anchored, and full-path — for the old
+    /// filename and the old vault-relative path.
+    ///
+    /// A Markdown note is linked without its extension (`[[Note]]`,
+    /// `[[folder/Note]]`) or with it. A diagram file is a plain attachment to
+    /// Obsidian and is linked only by its whole name or path
+    /// (`![[Flow.excalidraw]]`, `![[drawings/Flow.excalidraw]]`); its bare stem
+    /// belongs to whatever Markdown note shares it and is never rewritten.
+    ///
+    /// Only Markdown is rewritten. The text of a diagram file is Mermaid or
+    /// Excalidraw source, where `A[[Old]]` is a subroutine node, not a link.
+    /// Markdown links are left alone: they carry a real relative path whose
+    /// correctness depends on the linking note's own location, which this
+    /// operation doesn't change.
     fn update_wikilinks(
         &self,
         old_stem: &str,
@@ -314,21 +324,29 @@ impl VaultIndex {
         old_rel: &str,
         new_rel: &str,
     ) -> Result<()> {
-        let old_path_form = old_rel.strip_suffix(".md").unwrap_or(old_rel);
-        let new_path_form = new_rel.strip_suffix(".md").unwrap_or(new_rel);
+        let file_name = |rel: &str| rel.rsplit('/').next().unwrap_or(rel).to_string();
 
-        let mut replacements: Vec<(String, String)> = Vec::new();
-        for (old, new) in [
-            (old_path_form, new_path_form),
+        let mut forms: Vec<(String, String)> = Vec::new();
+        if note::own_extension(old_rel).is_some() {
+            forms.push((old_rel.to_string(), new_rel.to_string()));
+            forms.push((file_name(old_rel), file_name(new_rel)));
+        } else {
+            let strip = |rel: &str| rel.strip_suffix(".md").unwrap_or(rel).to_string();
+            forms.push((strip(old_rel), strip(new_rel)));
             // The filename form is checked second so a link written as a full
             // path is rewritten as a full path.
-            (old_stem, new_stem),
-        ] {
+            forms.push((old_stem.to_string(), new_stem.to_string()));
+            forms.push((old_rel.to_string(), new_rel.to_string()));
+            forms.push((file_name(old_rel), file_name(new_rel)));
+        }
+
+        let mut replacements: Vec<(String, String)> = Vec::new();
+        for (old, new) in forms {
             if old == new {
                 continue;
             }
-            for (open, close) in [("[[", "]]"), ("[[", "|"), ("[[", "#")] {
-                replacements.push((format!("{open}{old}{close}"), format!("{open}{new}{close}")));
+            for close in ["]]", "|", "#", "\\|"] {
+                replacements.push((format!("[[{old}{close}"), format!("[[{new}{close}")));
             }
         }
         if replacements.is_empty() {
@@ -336,6 +354,9 @@ impl VaultIndex {
         }
 
         for note in self.notes() {
+            if note::own_extension(&note.meta.rel).is_some() {
+                continue;
+            }
             let Ok(content) = fs::read_to_string(&note.meta.path) else {
                 continue;
             };
@@ -500,6 +521,189 @@ mod tests {
         // The link must actually resolve again, not just look right.
         let a = index.id_of_rel("A.md").unwrap();
         assert_eq!(index.note(a).unwrap().outgoing(), vec![new_id]);
+    }
+
+    #[test]
+    fn renaming_a_note_leaves_the_source_of_diagram_files_alone() {
+        let vault = TempVault::new("diagram-source-untouched");
+        vault.write("Old.md", "# Old\n");
+        vault.write("Link.md", "See [[Old]] and [[Old|the old one]].\n");
+        let mermaid = "graph TD\n  A[[Old]] --> B[[Old|x]]\n";
+        let scene = r##"{"elements": [{"type": "text", "text": "see [[Old]]", "x": 0, "y": 0}]}"##;
+        vault.write("Seq.mmd", mermaid);
+        vault.write("deep/Flow.mermaid", mermaid);
+        vault.write("Sketch.excalidraw", scene);
+        vault.write("deep/Sketch2.excalidraw", scene);
+
+        let mut index = vault.index();
+        let old = index.id_of_rel("Old.md").unwrap();
+        index.rename_note(old, "New").expect("rename");
+
+        assert_eq!(
+            vault.read("Link.md"),
+            "See [[New]] and [[New|the old one]].\n",
+            "the rewrite did run on the Markdown note"
+        );
+        assert_eq!(vault.read("Seq.mmd"), mermaid, "Mermaid subroutine nodes");
+        assert_eq!(vault.read("deep/Flow.mermaid"), mermaid);
+        assert_eq!(vault.read("Sketch.excalidraw"), scene);
+        assert_eq!(vault.read("deep/Sketch2.excalidraw"), scene);
+    }
+
+    #[test]
+    fn renaming_a_diagram_file_rewrites_every_link_that_names_it_with_its_extension() {
+        for (rel, kind) in [
+            ("drawings/Flow.excalidraw", "excalidraw"),
+            ("diagrams/Flow.mmd", "mmd"),
+            ("diagrams/deep/Flow.mermaid", "mermaid"),
+        ] {
+            let vault = TempVault::new("diagram-rename-links");
+            let folder = rel.rsplit_once('/').unwrap().0;
+            vault.write(rel, "{}");
+            vault.write("Flow.md", "The note called Flow.\n");
+            vault.write(
+                "A.md",
+                &format!(
+                    "![[Flow.{kind}]]\n\
+                     ![[Flow.{kind}|400]]\n\
+                     [[Flow.{kind}#part|alias]]\n\
+                     [[Flow.{kind}]]\n\
+                     ![[{folder}/Flow.{kind}]]\n\
+                     ![[{folder}/Flow.{kind}|400]]\n\
+                     and [[Flow]] means the note.\n"
+                ),
+            );
+
+            let mut index = vault.index();
+            let id = index.id_of_rel(rel).unwrap();
+            index.rename_note(id, "Pipeline").expect("rename");
+
+            let expected = format!(
+                "![[Pipeline.{kind}]]\n\
+                 ![[Pipeline.{kind}|400]]\n\
+                 [[Pipeline.{kind}#part|alias]]\n\
+                 [[Pipeline.{kind}]]\n\
+                 ![[{folder}/Pipeline.{kind}]]\n\
+                 ![[{folder}/Pipeline.{kind}|400]]\n\
+                 and [[Flow]] means the note.\n"
+            );
+            assert_eq!(vault.read("A.md"), expected, "{rel}");
+
+            // And they resolve: nothing was left dangling.
+            let fresh = vault.index();
+            assert!(
+                fresh.unresolved().is_empty(),
+                "{rel}: {:?}",
+                fresh.unresolved()
+            );
+            assert_eq!(
+                fresh.resolve(&format!("Pipeline.{kind}")),
+                fresh.id_of_rel(&format!("{folder}/Pipeline.{kind}"))
+            );
+        }
+    }
+
+    #[test]
+    fn moving_a_diagram_file_rewrites_path_links_and_keeps_name_links() {
+        for (rel, kind) in [
+            ("drawings/Flow.excalidraw", "excalidraw"),
+            ("diagrams/Flow.mmd", "mmd"),
+            ("diagrams/deep/Flow.mermaid", "mermaid"),
+        ] {
+            let vault = TempVault::new("diagram-move-links");
+            let folder = rel.rsplit_once('/').unwrap().0;
+            vault.write(rel, "{}");
+            vault.write(
+                "A.md",
+                &format!(
+                    "![[{folder}/Flow.{kind}]]\n\
+                     ![[{folder}/Flow.{kind}|400]]\n\
+                     [[{folder}/Flow.{kind}#part]]\n\
+                     ![[Flow.{kind}]]\n"
+                ),
+            );
+
+            let mut index = vault.index();
+            let id = index.id_of_rel(rel).unwrap();
+            index.move_note(id, "archive").expect("move");
+
+            assert_eq!(
+                vault.read("A.md"),
+                format!(
+                    "![[archive/Flow.{kind}]]\n\
+                     ![[archive/Flow.{kind}|400]]\n\
+                     [[archive/Flow.{kind}#part]]\n\
+                     ![[Flow.{kind}]]\n"
+                ),
+                "{rel}"
+            );
+            let fresh = vault.index();
+            assert!(
+                fresh.unresolved().is_empty(),
+                "{rel}: {:?}",
+                fresh.unresolved()
+            );
+        }
+    }
+
+    #[test]
+    fn a_wikilink_without_an_extension_never_turns_into_a_diagram() {
+        let vault = TempVault::new("diagram-stem-shadow");
+        vault.write("Flow.excalidraw", "{}");
+        vault.write("Flow.md", "The note.\n");
+        vault.write("Seq.mmd", "graph TD\n  A --> B");
+        vault.write("Seq.md", "Another note.\n");
+        let index = vault.index();
+        assert_eq!(index.resolve("Flow"), index.id_of_rel("Flow.md"));
+        assert_eq!(index.resolve("Seq"), index.id_of_rel("Seq.md"));
+        assert_eq!(
+            index.resolve("Flow.excalidraw"),
+            index.id_of_rel("Flow.excalidraw")
+        );
+
+        // And alone, a drawing is not reachable by a bare name either: that is
+        // what Obsidian does with any file that isn't Markdown.
+        let alone = TempVault::new("diagram-bare-name");
+        alone.write("Solo.excalidraw", "{}");
+        assert_eq!(alone.index().resolve("Solo"), None);
+        assert!(alone.index().resolve("Solo.excalidraw").is_some());
+    }
+
+    #[test]
+    fn a_link_inside_a_table_keeps_its_escaped_pipe_through_a_rename() {
+        let vault = TempVault::new("rename-table-link");
+        vault.write("Old.md", "x\n");
+        vault.write("Flow.excalidraw", "{}");
+        vault.write(
+            "T.md",
+            "| a | b |\n|---|---|\n| [[Old\\|alias]] | ![[Flow.excalidraw\\|400]] |\n",
+        );
+        let mut index = vault.index();
+        let old = index.id_of_rel("Old.md").unwrap();
+        index.rename_note(old, "New").expect("rename");
+        let flow = index.id_of_rel("Flow.excalidraw").unwrap();
+        index.rename_note(flow, "Pipeline").expect("rename");
+        assert_eq!(
+            vault.read("T.md"),
+            "| a | b |\n|---|---|\n| [[New\\|alias]] | ![[Pipeline.excalidraw\\|400]] |\n"
+        );
+    }
+
+    #[test]
+    fn links_that_spell_out_md_follow_a_markdown_rename_too() {
+        let vault = TempVault::new("rename-md-extension");
+        vault.write("sub/Old.md", "x\n");
+        vault.write(
+            "A.md",
+            "[[Old.md]] [[sub/Old.md|alias]] [[sub/Old]] [[Old#head]]\n",
+        );
+        let mut index = vault.index();
+        let old = index.id_of_rel("sub/Old.md").unwrap();
+        index.rename_note(old, "New").expect("rename");
+        assert_eq!(
+            vault.read("A.md"),
+            "[[New.md]] [[sub/New.md|alias]] [[sub/New]] [[New#head]]\n"
+        );
     }
 
     #[test]

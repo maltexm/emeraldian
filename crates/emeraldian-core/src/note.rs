@@ -235,6 +235,18 @@ pub fn file_extension(rel: &str) -> &'static str {
     own_extension(rel).unwrap_or(".md")
 }
 
+/// What a note is called when its frontmatter doesn't say: its file stem, or
+/// for a diagram file its whole name, so `Flow.excalidraw` is not mistaken for
+/// a Markdown note `Flow` beside it in a list.
+#[must_use]
+pub fn default_title(rel: &str, stem: &str) -> String {
+    if own_extension(rel).is_some() {
+        rel.rsplit('/').next().unwrap_or(rel).to_string()
+    } else {
+        stem.to_string()
+    }
+}
+
 /// A note's identity and filesystem facts, without its content.
 ///
 /// The index keeps one of these per note and loads bodies on demand, so opening

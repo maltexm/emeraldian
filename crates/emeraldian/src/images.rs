@@ -18,15 +18,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 
 use ratatui::layout::Size;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::sliced::SlicedProtocol;
 use ratatui_image::{FilterType, FontSize, Resize};
-
-use crate::diagram::{self, Kind, Look, Svg};
 
 /// Extensions worth opening. Anything else — a PDF, an embedded note — is left
 /// to the text fallback rather than handed to a decoder that will refuse it.
@@ -80,46 +77,6 @@ pub fn is_image(path: &Path) -> bool {
         .is_some_and(|ext| EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
 }
 
-/// Where a picture comes from.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum Source {
-    /// An image file on disk.
-    File(PathBuf),
-    /// A diagram drawn from text, named by a digest of what it was drawn from
-    /// and the colours it was drawn in (see [`Images::diagram`]).
-    Diagram(u64),
-}
-
-/// How much room a picture may take.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Sizing {
-    /// One picture among prose: capped at a share of the pane, never enlarged.
-    Inline,
-    /// The picture is the page: as wide as the pane allows however tall that
-    /// makes it, enlarged if it is vector art. The reading view scrolls it.
-    Page,
-}
-
-/// How far a diagram has got.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Status<'a> {
-    /// Being laid out on the worker thread.
-    Pending,
-    Ready,
-    /// The renderer's complaint, short enough for one line.
-    Failed(&'a str),
-}
-
-enum Diagram {
-    Pending,
-    Ready { svg: Arc<Svg>, look: Look },
-    Failed(String),
-}
-
-/// Diagrams kept at once; past that the finished ones are dropped. They are
-/// named by their content, so dropping one only costs drawing it again.
-const MAX_DIAGRAMS: usize = 64;
-
 /// The terminal's picture-drawing ability, plus everything already drawn.
 pub struct Images {
     /// `None` when images are switched off, or the terminal was never asked.
@@ -134,7 +91,6 @@ pub struct Images {
     /// Pixel dimensions by path. `None` records a file that could not be read,
     /// so a missing image is not re-opened on every frame.
     dims: HashMap<PathBuf, Option<(u32, u32)>>,
-    diagrams: HashMap<u64, Diagram>,
     cache: HashMap<Key, Entry>,
     clock: u64,
     worker: Option<Worker>,
@@ -150,7 +106,7 @@ fn next_generation() -> u64 {
     GENERATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
-type Key = (Source, u16, u16);
+type Key = (PathBuf, u16, u16);
 
 struct Entry {
     state: State,
@@ -165,28 +121,12 @@ enum State {
 
 struct Worker {
     jobs: Sender<Job>,
-    done: Receiver<Done>,
+    done: Receiver<(Key, Option<Box<SlicedProtocol>>)>,
 }
 
-enum Job {
-    /// Encode a picture for the terminal. A diagram brings its drawing along.
-    Encode {
-        key: Key,
-        picker: Picker,
-        diagram: Option<(Arc<Svg>, Look)>,
-    },
-    /// Lay a diagram out, which is the slow half of drawing one.
-    Prepare {
-        id: u64,
-        kind: Kind,
-        text: String,
-        look: Look,
-    },
-}
-
-enum Done {
-    Encoded(Key, Option<Box<SlicedProtocol>>),
-    Prepared(u64, Look, Result<Arc<Svg>, String>),
+struct Job {
+    key: Key,
+    picker: Picker,
 }
 
 impl Images {
@@ -245,23 +185,12 @@ impl Images {
         Self::with_picker(Some(Picker::halfblocks()), max_height_percent)
     }
 
-    /// An `Images` that claims the kitty protocol with no terminal behind it,
-    /// so diagrams draw and encode. Same 10x20 cells as [`Self::halfblocks`].
-    #[cfg(test)]
-    #[must_use]
-    pub fn kitty(max_height_percent: u16) -> Self {
-        let mut picker = Picker::halfblocks();
-        picker.set_protocol_type(ProtocolType::Kitty);
-        Self::with_picker(Some(picker), max_height_percent)
-    }
-
     fn with_picker(picker: Option<Picker>, max_height_percent: u16) -> Self {
         Self {
             picker,
             max_height_percent,
             pane_rows: 0,
             dims: HashMap::new(),
-            diagrams: HashMap::new(),
             cache: HashMap::new(),
             clock: 0,
             worker: None,
@@ -303,20 +232,6 @@ impl Images {
             .is_some_and(|picker| picker.protocol_type() == ProtocolType::Halfblocks)
     }
 
-    /// Whether a diagram can be drawn legibly: the terminal has a graphics
-    /// protocol, not just half-blocks.
-    ///
-    /// Diagrams are small text on thin lines, and half-blocks turn that into
-    /// grey mush, so a terminal without pixels keeps the source (Mermaid) or
-    /// the braille drawing (Excalidraw) it had before.
-    #[must_use]
-    pub fn draws_diagrams(&self) -> bool {
-        self.picker
-            .as_ref()
-            .is_some_and(|picker| picker.protocol_type() != ProtocolType::Halfblocks)
-            && self.max_height_percent > 0
-    }
-
     /// Records the pane pictures are drawn into, which sets their height cap.
     pub fn set_pane_height(&mut self, rows: u16) {
         self.pane_rows = rows;
@@ -336,89 +251,21 @@ impl Images {
     /// is available on the first frame and the layout never has to move once
     /// the picture arrives. `None` means there is nothing to draw and the
     /// caller should fall back to text.
-    pub fn measure(&mut self, source: &Source, available: Size, sizing: Sizing) -> Option<Size> {
-        let max_rows = match sizing {
-            Sizing::Inline => self.max_rows(),
-            Sizing::Page => u16::MAX,
-        };
+    pub fn measure(&mut self, path: &Path, available: Size) -> Option<Size> {
+        let max_rows = self.max_rows();
         let picker = self.picker.as_ref()?;
-        if available.width == 0 {
+        if available.width == 0 || !is_image(path) {
             return None;
         }
 
-        let (pixels, vector) = match source {
-            Source::File(path) => {
-                if !is_image(path) {
-                    return None;
-                }
-                let pixels = *self
-                    .dims
-                    .entry(path.clone())
-                    .or_insert_with(|| read_dimensions(path));
-                (pixels?, false)
-            }
-            Source::Diagram(id) => match self.diagrams.get(id)? {
-                Diagram::Ready { svg, .. } => {
-                    ((svg.width.ceil() as u32, svg.height.ceil() as u32), true)
-                }
-                Diagram::Pending | Diagram::Failed(_) => return None,
-            },
-        };
+        let pixels = *self
+            .dims
+            .entry(path.to_path_buf())
+            .or_insert_with(|| read_dimensions(path));
+        let pixels = pixels?;
 
         let room = Size::new(available.width, available.height.min(max_rows));
-        // Pictures are never enlarged, except vector art the reader asked to
-        // have as the page: it has no resolution to run out of.
-        let enlarge = vector && sizing == Sizing::Page;
-        Some(fit(pixels, picker.font_size(), room, enlarge))
-    }
-
-    /// Asks for a diagram to be drawn, and says which picture it will be.
-    ///
-    /// The drawing happens on the worker thread; until it lands, [`status`]
-    /// says `Pending` and [`measure`] finds nothing. The id covers the colours
-    /// as well as the source, so a theme switch asks for a new drawing and an
-    /// edit to the source can never show a stale one.
-    ///
-    /// [`status`]: Self::status
-    /// [`measure`]: Self::measure
-    pub fn diagram(&mut self, kind: Kind, text: &str, look: &Look) -> Source {
-        let id = {
-            use std::hash::{Hash, Hasher};
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            (kind, text, look).hash(&mut hasher);
-            hasher.finish()
-        };
-        if !self.diagrams.contains_key(&id) {
-            if self.diagrams.len() >= MAX_DIAGRAMS {
-                self.diagrams
-                    .retain(|_, diagram| matches!(diagram, Diagram::Pending));
-                self.cache
-                    .retain(|(source, ..), _| !matches!(source, Source::Diagram(_)));
-            }
-            self.diagrams.insert(id, Diagram::Pending);
-            let worker = self.worker.get_or_insert_with(spawn_worker);
-            let _ = worker.jobs.send(Job::Prepare {
-                id,
-                kind,
-                text: text.to_string(),
-                look: *look,
-            });
-        }
-        Source::Diagram(id)
-    }
-
-    /// How far a picture has got. A file is always ready to be tried.
-    #[must_use]
-    pub fn status(&self, source: &Source) -> Status<'_> {
-        let Source::Diagram(id) = source else {
-            return Status::Ready;
-        };
-        match self.diagrams.get(id) {
-            Some(Diagram::Ready { .. }) => Status::Ready,
-            Some(Diagram::Failed(why)) => Status::Failed(why),
-            // Asked for and not heard back from, or dropped to make room.
-            Some(Diagram::Pending) | None => Status::Pending,
-        }
+        Some(fit(pixels, picker.font_size(), room))
     }
 
     /// How many cells wide a pixel width is, for Obsidian's `![[x.png|400]]`.
@@ -436,16 +283,9 @@ impl Images {
     /// reserved.
     ///
     /// [`measure`]: Self::measure
-    pub fn get(&mut self, source: &Source, size: Size) -> Option<&SlicedProtocol> {
+    pub fn get(&mut self, path: &Path, size: Size) -> Option<&SlicedProtocol> {
         let picker = self.picker.as_ref()?.clone();
-        let diagram = match source {
-            Source::File(_) => None,
-            Source::Diagram(id) => match self.diagrams.get(id)? {
-                Diagram::Ready { svg, look } => Some((svg.clone(), *look)),
-                Diagram::Pending | Diagram::Failed(_) => return None,
-            },
-        };
-        let key = (source.clone(), size.width, size.height);
+        let key = (path.to_path_buf(), size.width, size.height);
         self.clock += 1;
 
         if !self.cache.contains_key(&key) {
@@ -460,10 +300,9 @@ impl Images {
             let worker = self.worker.get_or_insert_with(spawn_worker);
             // A dead worker leaves the entry pending forever, which draws the
             // placeholder rather than crashing the reader.
-            let _ = worker.jobs.send(Job::Encode {
+            let _ = worker.jobs.send(Job {
                 key: key.clone(),
                 picker,
-                diagram,
             });
         }
 
@@ -481,10 +320,9 @@ impl Images {
             return false;
         };
         let mut arrived = false;
-        let mut measured = false;
         loop {
             match worker.done.try_recv() {
-                Ok(Done::Encoded(key, protocol)) => {
+                Ok((key, protocol)) => {
                     if let Some(entry) = self.cache.get_mut(&key) {
                         entry.state = match protocol {
                             Some(protocol) => State::Ready(protocol),
@@ -493,28 +331,12 @@ impl Images {
                         arrived = true;
                     }
                 }
-                Ok(Done::Prepared(id, look, result)) => {
-                    // Dropped to make room while it was away: nobody is waiting.
-                    if let Some(slot) = self.diagrams.get_mut(&id) {
-                        *slot = match result {
-                            Ok(svg) => Diagram::Ready { svg, look },
-                            Err(why) => Diagram::Failed(why),
-                        };
-                        arrived = true;
-                        measured = true;
-                    }
-                }
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     self.worker = None;
                     break;
                 }
             }
-        }
-        // A diagram that has just been laid out has a size, which the reading
-        // layout was waiting on.
-        if measured {
-            self.generation = next_generation();
         }
         arrived
     }
@@ -549,9 +371,9 @@ impl Images {
 
 /// Scales `pixels` to fit `available`, in cells.
 ///
-/// Pictures are not scaled up unless `enlarge` is set: a 16-pixel icon stays an
-/// icon rather than being blown across the pane.
-fn fit(pixels: (u32, u32), font: FontSize, available: Size, enlarge: bool) -> Size {
+/// Pictures are never scaled up: a 16-pixel icon stays an icon rather than
+/// being blown across the pane.
+fn fit(pixels: (u32, u32), font: FontSize, available: Size) -> Size {
     let (width, height) = pixels;
     if width == 0 || height == 0 {
         return Size::new(0, 0);
@@ -560,7 +382,7 @@ fn fit(pixels: (u32, u32), font: FontSize, available: Size, enlarge: bool) -> Si
     let room = |cells: u16, per_cell: u16| f64::from(cells) * f64::from(per_cell.max(1));
     let scale = (room(available.width, font.width) / f64::from(width))
         .min(room(available.height, font.height) / f64::from(height))
-        .min(if enlarge { f64::MAX } else { 1.0 });
+        .min(1.0);
 
     let cells = |pixels: u32, per_cell: u16, limit: u16| {
         let cells = (f64::from(pixels) * scale / f64::from(per_cell.max(1))).ceil();
@@ -601,18 +423,6 @@ fn read_dimensions(path: &Path) -> Option<(u32, u32)> {
         .ok()
 }
 
-/// Draws a diagram's text to SVG.
-fn prepare(kind: Kind, text: &str, look: &Look) -> Result<Svg, String> {
-    match kind {
-        Kind::Mermaid => diagram::mermaid_svg(text, look),
-        Kind::Excalidraw => {
-            let drawing = emeraldian_core::excalidraw::parse(text)
-                .ok_or("this is not a readable Excalidraw drawing")?;
-            diagram::excalidraw_svg(&drawing, look).ok_or_else(|| "this drawing is empty".into())
-        }
-    }
-}
-
 /// Runs decoding and encoding away from the draw loop.
 ///
 /// One thread, so a note full of pictures fills in top to bottom rather than
@@ -627,50 +437,24 @@ fn spawn_worker() -> Worker {
         .name("emerald-images".into())
         .spawn(move || {
             for job in rx {
-                let done = match job {
-                    Job::Encode {
-                        key,
-                        picker,
-                        diagram,
-                    } => {
-                        let size = Size::new(key.1, key.2);
-                        let font = picker.font_size();
-                        let image = match (&key.0, &diagram) {
-                            (Source::Diagram(_), Some((svg, look))) => {
-                                // Drawn at exactly the pixels the cells hold, so
-                                // text in a diagram is never resampled.
-                                let width = u32::from(size.width) * u32::from(font.width.max(1));
-                                let height = u32::from(size.height) * u32::from(font.height.max(1));
-                                diagram::rasterize(&svg.text, look, width, height)
-                            }
-                            (Source::File(path), _) => image::ImageReader::open(path)
-                                .ok()
-                                .and_then(|reader| reader.with_guessed_format().ok())
-                                .and_then(|reader| reader.decode().ok()),
-                            _ => None,
-                        };
-                        let protocol =
-                            image
-                                .map(|image| downscale(image, size, font))
-                                .and_then(|image| {
-                                    SlicedProtocol::new_with_resize(
-                                        &picker,
-                                        image,
-                                        size,
-                                        Resize::Fit(FILTER),
-                                    )
-                                    .ok()
-                                });
-                        Done::Encoded(key, protocol.map(Box::new))
-                    }
-                    Job::Prepare {
-                        id,
-                        kind,
-                        text,
-                        look,
-                    } => Done::Prepared(id, look, prepare(kind, &text, &look).map(Arc::new)),
-                };
-                if tx.send(done).is_err() {
+                let (path, width, height) = &job.key;
+                let size = Size::new(*width, *height);
+                let font = job.picker.font_size();
+                let protocol = image::ImageReader::open(path)
+                    .ok()
+                    .and_then(|reader| reader.with_guessed_format().ok())
+                    .and_then(|reader| reader.decode().ok())
+                    .map(|image| downscale(image, size, font))
+                    .and_then(|image| {
+                        SlicedProtocol::new_with_resize(
+                            &job.picker,
+                            image,
+                            size,
+                            Resize::Fit(FILTER),
+                        )
+                        .ok()
+                    });
+                if tx.send((job.key, protocol.map(Box::new))).is_err() {
                     return;
                 }
             }
@@ -694,21 +478,21 @@ mod tests {
     #[test]
     fn a_wide_picture_is_bounded_by_the_pane_width() {
         // 1000x200 pixels is 100x10 cells at this font, wider than the pane.
-        let size = fit((1000, 200), FONT, Size::new(40, 30), false);
+        let size = fit((1000, 200), FONT, Size::new(40, 30));
         assert_eq!(size.width, 40, "fills the width it is given");
         assert_eq!(size.height, 4, "and keeps its shape: 200 * 0.4 / 20");
     }
 
     #[test]
     fn a_tall_picture_is_bounded_by_the_row_cap() {
-        let size = fit((200, 1000), FONT, Size::new(40, 10), false);
+        let size = fit((200, 1000), FONT, Size::new(40, 10));
         assert_eq!(size.height, 10, "clipped to the rows allowed");
         assert_eq!(size.width, 4, "200 * 0.2 / 10");
     }
 
     #[test]
     fn a_small_picture_is_left_alone() {
-        let size = fit((100, 40), FONT, Size::new(80, 20), false);
+        let size = fit((100, 40), FONT, Size::new(80, 20));
         assert_eq!(
             (size.width, size.height),
             (10, 2),
@@ -718,7 +502,7 @@ mod tests {
 
     #[test]
     fn a_picture_always_gets_at_least_one_cell() {
-        let size = fit((3, 3), FONT, Size::new(80, 20), false);
+        let size = fit((3, 3), FONT, Size::new(80, 20));
         assert_eq!(
             (size.width, size.height),
             (1, 1),
@@ -838,139 +622,11 @@ mod tests {
     }
 
     #[test]
-    fn a_diagram_is_laid_out_off_thread_then_measured_and_encoded() {
-        let mut images = Images::kitty(100);
-        images.set_pane_height(40);
-        let look = Look {
-            dark: true,
-            background: [0x1e, 0x1e, 0x2e],
-        };
-        let source = images.diagram(Kind::Mermaid, "flowchart LR\n  A --> B", &look);
-        assert_eq!(images.status(&source), Status::Pending);
-        assert_eq!(
-            images.measure(&source, Size::new(80, 30), Sizing::Inline),
-            None,
-            "a size is not known until the worker has laid the diagram out"
-        );
-
-        let before = images.generation();
-        wait(&mut images, |images| {
-            images.status(&source) != Status::Pending
-        });
-        assert_eq!(images.status(&source), Status::Ready);
-        assert_ne!(
-            images.generation(),
-            before,
-            "layouts that were waiting on the size are told to run again"
-        );
-
-        let inline = images
-            .measure(&source, Size::new(200, 40), Sizing::Inline)
-            .expect("measured");
-        let page = images
-            .measure(&source, Size::new(200, 40), Sizing::Page)
-            .expect("measured");
-        assert!(
-            page.width > inline.width,
-            "as the page it is enlarged ({page:?} vs {inline:?}); vector art has no resolution to lose"
-        );
-        assert!(page.height <= 40 && page.width <= 200);
-
-        // Encoding is the second job on the same thread.
-        let mut encoded = false;
-        for _ in 0..500 {
-            if images.get(&source, page).is_some() {
-                encoded = true;
-                break;
-            }
-            images.poll();
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(encoded, "the picture reaches the terminal protocol");
-    }
-
-    fn wait(images: &mut Images, done: impl Fn(&Images) -> bool) {
-        for _ in 0..500 {
-            images.poll();
-            if done(images) {
-                return;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        panic!("the worker never answered");
-    }
-
-    #[test]
-    fn a_diagram_that_cannot_be_drawn_says_why() {
-        let mut images = Images::kitty(100);
-        let look = Look {
-            dark: false,
-            background: [255; 3],
-        };
-        let source = images.diagram(Kind::Excalidraw, "{ not a drawing", &look);
-        wait(&mut images, |images| {
-            images.status(&source) != Status::Pending
-        });
-        assert!(
-            matches!(images.status(&source), Status::Failed(why) if why.contains("Excalidraw")),
-            "{:?}",
-            images.status(&source)
-        );
-        assert_eq!(
-            images.measure(&source, Size::new(80, 20), Sizing::Page),
-            None
-        );
-    }
-
-    #[test]
-    fn a_diagram_is_named_by_its_source_and_its_colours() {
-        let mut images = Images::kitty(100);
-        let dark = Look {
-            dark: true,
-            background: [0, 0, 0],
-        };
-        let light = Look {
-            dark: false,
-            background: [255; 3],
-        };
-        let a = images.diagram(Kind::Mermaid, "flowchart LR\n  A --> B", &dark);
-        assert_eq!(
-            a,
-            images.diagram(Kind::Mermaid, "flowchart LR\n  A --> B", &dark)
-        );
-        assert_ne!(
-            a,
-            images.diagram(Kind::Mermaid, "flowchart LR\n  A --> B", &light),
-            "a theme switch draws it again"
-        );
-        assert_ne!(
-            a,
-            images.diagram(Kind::Mermaid, "flowchart LR\n  A --> C", &dark),
-            "and so does an edit"
-        );
-    }
-
-    #[test]
-    fn only_a_terminal_with_pixels_draws_diagrams() {
-        assert!(Images::kitty(66).draws_diagrams());
-        assert!(
-            !Images::halfblocks(66).draws_diagrams(),
-            "half-blocks turn thin lines and small text into mush"
-        );
-        assert!(!Images::disabled().draws_diagrams());
-        assert!(!Images::kitty(0).draws_diagrams(), "no room, no pictures");
-    }
-
-    #[test]
     fn a_disabled_terminal_measures_nothing() {
         let mut images = Images::disabled();
         assert!(images.describe().is_none(), "nothing to report or to draw");
         assert_eq!(
-            images.measure(
-                &Source::File("chart.png".into()),
-                Size::new(80, 20),
-                Sizing::Inline
-            ),
+            images.measure(Path::new("chart.png"), Size::new(80, 20)),
             None
         );
         assert!(!images.poll(), "and never has work to collect");

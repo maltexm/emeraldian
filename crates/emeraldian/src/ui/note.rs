@@ -6,6 +6,7 @@
 //! background. Editing mode shows the source with a line-number gutter.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect, Size};
@@ -15,15 +16,15 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui_image::sliced::{SignedPosition, SlicedImage};
 use unicode_width::UnicodeWidthStr;
 
+use emeraldian_core::excalidraw;
 use emeraldian_core::index::VaultIndex;
 use emeraldian_core::markdown::{self, Align, Block, BlockKind, Marker, SpanKind, Table};
 use emeraldian_theme::Palette;
 
 use crate::app::{App, Mode, Regions};
-use crate::diagram::{self, Kind, Look};
 use crate::editor::{Cursor, Row};
-use crate::images::{Images, Sizing, Source, Status};
-use crate::ui::{drawing, icons, math, scrollbar, truncate};
+use crate::images::{self, Images};
+use crate::ui::{drawing, icons, math, mermaid, scrollbar, truncate};
 
 /// Left padding inside the note pane, matching Obsidian's generous margins.
 const PADDING: u16 = 2;
@@ -94,7 +95,16 @@ pub struct Picture {
     /// Columns from the left edge of the pane.
     pub indent: u16,
     pub size: Size,
-    pub source: Source,
+    pub source: PictureSource,
+}
+
+/// What a picture's rows are drawn from.
+#[derive(Debug, Clone)]
+pub enum PictureSource {
+    /// An image file, drawn by the terminal's picture protocol.
+    File(PathBuf),
+    /// An Excalidraw scene, traced on a braille canvas over its rows.
+    Drawing(Arc<excalidraw::Drawing>),
 }
 
 /// The note last laid out for reading, kept until something it was laid out
@@ -341,15 +351,11 @@ fn draw_reading(
     // banner and a wall of compressed base64, and the drawing is the content.
     // Judged by the file name, so an ordinary note that happens to have a
     // `## Drawing` heading is still read as prose.
-    //
-    // With pixels to draw on (kitty, WezTerm, iTerm2, sixel) the drawing and
-    // Mermaid files become a real picture further down. Without, a drawing is
-    // traced on a braille canvas here, and Mermaid stays source text.
-    let kind = app
+    let is_drawing = app
         .index
         .note(id)
-        .and_then(|note| diagram::kind_of(&note.meta.rel));
-    if kind == Some(Kind::Excalidraw) && !app.images.draws_diagrams() {
+        .is_some_and(|note| excalidraw::is_drawing(&note.meta.rel));
+    if is_drawing {
         let Ok(content) = app.index.read(id) else {
             return unreadable(frame);
         };
@@ -386,6 +392,17 @@ fn draw_reading(
             app.reading.clear();
             return unreadable(frame);
         };
+        // A Mermaid file is one diagram: read as the code block it is, which
+        // draws it, or says why it can't and shows the source.
+        let is_mermaid = app
+            .index
+            .note(id)
+            .is_some_and(|note| is_mermaid_file(&note.meta.rel));
+        let document = if is_mermaid {
+            markdown::parse(&format!("```mermaid\n{content}\n```\n"))
+        } else {
+            markdown::parse(&content)
+        };
         let note_dir = app
             .index
             .note(id)
@@ -399,21 +416,7 @@ fn draw_reading(
             pictures: Vec::new(),
             anchors: Vec::new(),
         };
-        // A diagram file is its picture, the whole page. Failing that (no
-        // pixels, a drawing that won't parse) it is read as text: a Mermaid
-        // file as the code block it is, anything else as Markdown.
-        let page = kind.and_then(|kind| render_page(&mut ctx, kind, &content, width, area.height));
-        let lines = match page {
-            Some(lines) => lines,
-            None => {
-                let text = if kind == Some(Kind::Mermaid) {
-                    format!("```mermaid\n{content}\n```\n")
-                } else {
-                    content
-                };
-                render_document(&markdown::parse(&text), &mut ctx, width)
-            }
-        };
+        let lines = render_document(&document, &mut ctx, width);
         // Content can be wider than the pane — a table laid out at its
         // natural width, a long code line — and panning is the only way to
         // reach the rest.
@@ -513,7 +516,29 @@ fn draw_pictures(
             continue;
         };
 
-        match images.get(&picture.source, picture.size) {
+        let source = match &picture.source {
+            PictureSource::File(path) => path,
+            PictureSource::Drawing(scene) => {
+                // The rows are blank; the braille is traced over them, clipped to
+                // the part of the drawing that is on screen. Scaled to its own
+                // width, so it has to fit the pane whole or stay out of it.
+                let hidden = u16::try_from((-i32::from(top)).max(0)).unwrap_or(0);
+                let left = u16::try_from(left).unwrap_or(0);
+                let first = u16::try_from(i32::from(top).max(0)).unwrap_or(0);
+                if left + picture.size.width > area.width {
+                    continue;
+                }
+                let rect = Rect {
+                    x: area.x + left,
+                    y: area.y + first,
+                    width: picture.size.width,
+                    height: (picture.size.height - hidden).min(area.height - first),
+                };
+                drawing::paint(frame, palette, rect, scene, usize::from(hidden));
+                continue;
+            }
+        };
+        match images.get(source, picture.size) {
             Some(protocol) => {
                 let position = SignedPosition::from((left, top));
                 frame.render_widget(SlicedImage::new(protocol, position), area);
@@ -823,14 +848,18 @@ fn render_block(
         }
 
         BlockKind::Code { lang, lines: code } => {
-            // A Mermaid block is a diagram first and source second: drawn when
-            // the terminal has pixels for it, shown as code when it doesn't or
-            // when the diagram can't be drawn.
-            let mut note = None;
-            if lang.eq_ignore_ascii_case("mermaid")
-                && mermaid_picture(&code.join("\n"), ctx, inner_width, indent, out, &mut note)
-            {
-                return;
+            // A Mermaid block is a diagram first and source second: drawn on
+            // the character grid when it is a flowchart that parses, and shown
+            // as code under a line saying why when it is not.
+            let mut why = None;
+            if lang.eq_ignore_ascii_case("mermaid") {
+                match mermaid::lines(&code.join("\n"), palette, &format!("{pad} ")) {
+                    Ok(drawn) => {
+                        out.extend(drawn);
+                        return;
+                    }
+                    Err(reason) => why = Some(reason),
+                }
             }
             let background = Style::default().bg(palette.code_bg);
             if !lang.is_empty() {
@@ -839,16 +868,16 @@ fn render_block(
                     background.fg(palette.text_faint),
                 )));
             }
-            if let Some((message, is_error)) = note {
-                let color = if is_error {
-                    palette.text_error
-                } else {
-                    palette.text_faint
-                };
-                out.push(Line::from(Span::styled(
-                    format!("{pad} {message}"),
-                    Style::default().fg(color),
-                )));
+            if let Some(reason) = why {
+                out.extend(wrap_spans(
+                    &[(
+                        format!("mermaid: {reason}"),
+                        Style::default().fg(palette.text_faint),
+                    )],
+                    width,
+                    &format!("{pad} "),
+                    &format!("{pad}   "),
+                ));
             }
             for line in code {
                 let mut spans = vec![Span::styled(format!("{pad} "), background)];
@@ -912,12 +941,12 @@ fn render_styled_spans(
     // shouldn't start it with the space that separated them.
     let mut lifted = false;
     for span in spans {
-        let picture = match span.kind {
+        let lifted_out = match span.kind {
             // `$$…$$` written mid-paragraph is lifted out the same way, since
             // Obsidian sets it apart from the text around it.
             SpanKind::Math { display: true } => None,
-            _ => match measure_picture(span, ctx, width) {
-                Some(picture) => Some(picture),
+            _ => match lift(span, ctx, width, rest_pad) {
+                Some(found) => Some(found),
                 None => {
                     let mut span = span.clone();
                     if lifted && run.is_empty() {
@@ -939,10 +968,17 @@ fn render_styled_spans(
             run.clear();
         }
 
-        let Some((source, size)) = picture else {
-            let pad = if out.is_empty() { first_pad } else { rest_pad };
-            display_math(&span.text, ctx.palette, width, pad, out);
-            continue;
+        let (source, size) = match lifted_out {
+            None => {
+                let pad = if out.is_empty() { first_pad } else { rest_pad };
+                display_math(&span.text, ctx.palette, width, pad, out);
+                continue;
+            }
+            Some(Lift::Lines(drawn)) => {
+                out.extend(drawn);
+                continue;
+            }
+            Some(Lift::Picture(source, size)) => (source, size),
         };
         ctx.pictures.push(Picture {
             line: out.len(),
@@ -963,8 +999,19 @@ fn render_styled_spans(
     }
 }
 
-/// Works out where a span's picture is and how much room it needs.
-fn measure_picture(span: &markdown::Span, ctx: &mut Ctx, width: usize) -> Option<(Source, Size)> {
+/// What an inline span turns into when it is lifted out of its line of text.
+enum Lift {
+    /// Blank rows to draw a picture or a drawing over, and what to draw.
+    Picture(PictureSource, Size),
+    /// Rows of text that already are the drawing.
+    Lines(Vec<Line<'static>>),
+}
+
+/// Most rows an embedded drawing takes among the prose.
+const EMBEDDED_DRAWING_ROWS: usize = 24;
+
+/// Works out what a span lifts out to, if anything, and how much room it needs.
+fn lift(span: &markdown::Span, ctx: &mut Ctx, width: usize, pad: &str) -> Option<Lift> {
     let (target, embed) = match &span.kind {
         SpanKind::Image { src } => (src, false),
         // `![[x]]` embeds a note as often as a picture, and only the vault
@@ -977,15 +1024,12 @@ fn measure_picture(span: &markdown::Span, ctx: &mut Ctx, width: usize) -> Option
         _ => return None,
     };
 
-    let file = ctx
+    let Some(path) = ctx
         .index
         .attachment_path(target, ctx.note_dir.as_deref())
-        .filter(|path| crate::images::is_image(path));
-    let source = match file {
-        Some(path) => Source::File(path),
-        // A drawing or a Mermaid file is a note to the index, not an
-        // attachment, but embeds the same way.
-        None => embedded_diagram(target, ctx)?,
+        .filter(|path| images::is_image(path))
+    else {
+        return embedded_diagram(target, ctx, width, pad);
     };
 
     let images = ctx.images.as_deref_mut()?;
@@ -996,15 +1040,15 @@ fn measure_picture(span: &markdown::Span, ctx: &mut Ctx, width: usize) -> Option
         room.width = room.width.min(images.cells_wide(pixels)?);
     }
 
-    let size = images.measure(&source, room, Sizing::Inline)?;
-    (size.width > 0 && size.height > 0).then_some((source, size))
+    let size = images.measure(&path, room)?;
+    (size.width > 0 && size.height > 0).then_some(Lift::Picture(PictureSource::File(path), size))
 }
 
-/// The diagram an embed names, asked for and ready to draw.
+/// The drawing or Mermaid diagram an embed names, ready to be laid out.
 ///
-/// `None` while it is still being laid out, when it cannot be drawn, and when
-/// the target is not a diagram at all.
-fn embedded_diagram(target: &str, ctx: &mut Ctx) -> Option<Source> {
+/// `None` when the target is neither, can't be read, or can't be drawn: the
+/// embed stays a link then, rather than an error in the middle of a note.
+fn embedded_diagram(target: &str, ctx: &Ctx, width: usize, pad: &str) -> Option<Lift> {
     let decoded = target.replace("%20", " ");
     let index = ctx.index;
     let id = index.resolve(&decoded).or_else(|| {
@@ -1013,104 +1057,29 @@ fn embedded_diagram(target: &str, ctx: &mut Ctx) -> Option<Source> {
         let rel = emeraldian_core::note::relative_path(&index.vault.path, &path)?;
         index.id_of_rel(&rel)
     })?;
-    let kind = diagram::kind_of(&index.note(id)?.meta.rel)?;
-    let content = index.read(id).ok()?;
+    let rel = &index.note(id)?.meta.rel;
 
-    let look = Look::from_palette(ctx.palette);
-    let images = ctx.images.as_deref_mut()?;
-    if !images.draws_diagrams() {
-        return None;
+    if excalidraw::is_drawing(rel) {
+        let scene = excalidraw::parse(&index.read(id).ok()?)?;
+        let (cols, rows) = drawing::fit(&scene, width, EMBEDDED_DRAWING_ROWS)?;
+        return Some(Lift::Picture(
+            PictureSource::Drawing(Arc::new(scene)),
+            Size::new(cols, rows),
+        ));
     }
-    let source = images.diagram(kind, &content, &look);
-    (images.status(&source) == Status::Ready).then_some(source)
+    if is_mermaid_file(rel) {
+        let drawn = mermaid::lines(&index.read(id).ok()?, ctx.palette, pad).ok()?;
+        return Some(Lift::Lines(drawn));
+    }
+    None
 }
 
-/// A diagram laid out as the whole page: one picture, as large as the pane
-/// allows, centred. `None` when it cannot be drawn this way, and the caller
-/// shows the text instead.
-fn render_page(
-    ctx: &mut Ctx,
-    kind: Kind,
-    content: &str,
-    width: usize,
-    rows: u16,
-) -> Option<Vec<Line<'static>>> {
-    let look = Look::from_palette(ctx.palette);
-    let faint = Style::default().fg(ctx.palette.text_faint);
-    let images = ctx.images.as_deref_mut()?;
-    if !images.draws_diagrams() {
-        return None;
-    }
-    let source = images.diagram(kind, content, &look);
-    match images.status(&source) {
-        Status::Failed(_) => None,
-        Status::Pending => Some(vec![Line::from(Span::styled(
-            format!("{} drawing …", icons::IMAGE),
-            faint,
-        ))]),
-        Status::Ready => {
-            let room = Size::new(u16::try_from(width).unwrap_or(u16::MAX), rows.max(1));
-            let size = images.measure(&source, room, Sizing::Page)?;
-            let spare = usize::from(room.width.saturating_sub(size.width));
-            ctx.pictures.push(Picture {
-                line: 0,
-                indent: u16::try_from(spare / 2).unwrap_or(0),
-                size,
-                source,
-            });
-            Some(vec![Line::from(""); usize::from(size.height)])
-        }
-    }
-}
-
-/// A Mermaid block turned into a picture, or why it stayed text.
-///
-/// Appends the picture's rows to `out` and returns `true` when it drew one.
-/// Otherwise `out` is untouched and `note` holds a line to put above the
-/// source, if there is something to say.
-fn mermaid_picture(
-    source: &str,
-    ctx: &mut Ctx,
-    width: usize,
-    indent: usize,
-    out: &mut Vec<Line<'static>>,
-    note: &mut Option<(String, bool)>,
-) -> bool {
-    let look = Look::from_palette(ctx.palette);
-    let Some(images) = ctx.images.as_deref_mut() else {
-        return false;
-    };
-    if !images.draws_diagrams() {
-        return false;
-    }
-    let picture = images.diagram(Kind::Mermaid, source, &look);
-    match images.status(&picture) {
-        Status::Pending => {
-            *note = Some(("drawing …".into(), false));
-            false
-        }
-        Status::Failed(why) => {
-            *note = Some((why.to_string(), true));
-            false
-        }
-        Status::Ready => {
-            let room = Size::new(u16::try_from(width).unwrap_or(u16::MAX), u16::MAX);
-            let Some(size) = images.measure(&picture, room, Sizing::Inline) else {
-                return false;
-            };
-            ctx.pictures.push(Picture {
-                line: out.len(),
-                indent: indent as u16,
-                size,
-                source: picture,
-            });
-            out.extend(std::iter::repeat_n(
-                Line::from(""),
-                usize::from(size.height),
-            ));
-            true
-        }
-    }
+/// Whether a note's file is Mermaid source rather than Markdown.
+fn is_mermaid_file(rel: &str) -> bool {
+    matches!(
+        emeraldian_core::note::own_extension(rel),
+        Some(".mmd" | ".mermaid")
+    )
 }
 
 /// Reads Obsidian's `|400` or `|400x300` embed size, in pixels.
@@ -2128,185 +2097,300 @@ mod tests {
         assert!(screen(&mut app).contains("the second version"));
     }
 
-    /// Draws the app at a fixed size and returns what is on screen as text.
-    fn screen(app: &mut App) -> String {
-        let backend = ratatui::backend::TestBackend::new(100, 40);
+    /// What is on screen after drawing the app at a fixed size, one string per
+    /// row.
+    fn screen_rows(app: &mut App) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(200, 40);
         let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
         terminal
             .draw(|frame| crate::ui::draw(frame, app))
             .expect("draw");
         let buffer = terminal.backend().buffer();
-        buffer.content.iter().map(|cell| cell.symbol()).collect()
+        let width = buffer.area.width as usize;
+        buffer
+            .content
+            .chunks(width)
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect())
+            .collect()
     }
 
-    /// Draws until `done` holds, as the main loop would while the worker thread
-    /// lays diagrams out, and returns the last screen.
-    fn draw_until(app: &mut App, done: impl Fn(&App) -> bool) -> String {
-        for _ in 0..600 {
-            screen(app);
-            app.images.poll();
-            if done(app) {
-                return screen(app);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        panic!("the diagram never came up:\n{}", screen(app));
+    fn screen_text(app: &mut App) -> String {
+        screen_rows(app).join("\n")
     }
 
-    const FLOW: &str = "flowchart LR\n  A[Vault] --> B{Index}\n  B --> C[Reader]";
-    const SCENE: &str = r##"{"type": "excalidraw", "elements": [
-        {"type": "rectangle", "x": 0, "y": 0, "width": 200, "height": 80,
-         "strokeColor": "#1e1e1e", "backgroundColor": "#a5d8ff", "fillStyle": "solid"},
-        {"type": "text", "x": 20, "y": 28, "width": 160, "height": 25,
-         "text": "Ingest", "fontSize": 20, "textAlign": "center"}]}"##;
+    fn braille_cells(rows: &[String]) -> usize {
+        rows.iter()
+            .flat_map(|row| row.chars())
+            .filter(|c| ('\u{2801}'..='\u{28ff}').contains(c))
+            .count()
+    }
 
-    fn app_with_pixels(vault: &TempVault, note: &str) -> App {
+    fn row_with(rows: &[String], needle: &str) -> usize {
+        rows.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no {needle:?} on screen:\n{}", rows.join("\n")))
+    }
+
+    fn open(vault: &TempVault, note: &str) -> App {
         let mut app = App::new(vault.vault(), crate::config::Config::default()).expect("app");
-        app.images = Images::kitty(100);
         let id = app.index.id_of_rel(note).expect("indexed");
         app.open_note(id);
         app
     }
 
+    const FLOW: &str = "flowchart LR\n  A[Vault] --> B{Index}\n  B --> C[Reader]";
+    const SCENE: &str = r##"{"type": "excalidraw", "elements": [
+        {"type": "rectangle", "x": 0, "y": 0, "width": 240, "height": 96,
+         "strokeColor": "#e03131"},
+        {"type": "text", "x": 20, "y": 30, "width": 200, "height": 25,
+         "text": "Ingest", "fontSize": 20}]}"##;
+
     #[test]
-    fn a_mermaid_block_is_drawn_as_a_picture_where_the_terminal_has_pixels() {
+    fn a_mermaid_block_is_drawn_among_the_prose() {
         let vault = TempVault::new("mermaid-inline");
         vault.write(
             "A.md",
             &format!("Before\n\n```mermaid\n{FLOW}\n```\n\nAfter\n"),
         );
-        let mut app = app_with_pixels(&vault, "A.md");
+        let mut app = open(&vault, "A.md");
 
-        let screen = draw_until(&mut app, |app| !app.reading.pictures.is_empty());
-        assert_eq!(app.reading.pictures.len(), 1, "one block, one picture");
-        assert!(matches!(app.reading.pictures[0].source, Source::Diagram(_)));
+        let rows = screen_rows(&mut app);
+        let shown = rows.join("\n");
         assert!(
-            !screen.contains("flowchart LR"),
-            "the source is replaced by the drawing"
+            !shown.contains("flowchart LR"),
+            "source is replaced:\n{shown}"
         );
+        assert!(shown.contains('┌') && shown.contains('▶'), "{shown}");
+        let (before, vault_row, after) = (
+            row_with(&rows, "Before"),
+            row_with(&rows, "Vault"),
+            row_with(&rows, "After"),
+        );
+        assert!(before < vault_row && vault_row < after, "{shown}");
+        assert!(rows[vault_row].contains("Index") && rows[vault_row].contains("Reader"));
+    }
+
+    #[test]
+    fn a_mermaid_block_that_cannot_be_drawn_keeps_its_source_and_says_why() {
+        let vault = TempVault::new("mermaid-fallback");
+        vault.write(
+            "A.md",
+            "```mermaid\nsequenceDiagram\n  A->>B: hello\n```\n\n```mermaid\nflowchart TD\n  X -->\n```\n",
+        );
+        let mut app = open(&vault, "A.md");
+
+        let shown = screen_text(&mut app);
+        assert!(shown.contains("A->>B: hello"), "the source stays:\n{shown}");
         assert!(
-            screen.contains("After"),
-            "and the prose below still follows"
+            shown.contains("sequenceDiagram diagrams are not drawn"),
+            "with the reason above it:\n{shown}"
+        );
+        assert!(shown.contains("X -->"), "{shown}");
+        assert!(shown.contains("an edge has no node at its end"), "{shown}");
+    }
+
+    #[test]
+    fn mermaid_files_open_as_their_drawing() {
+        let vault = TempVault::new("mermaid-files");
+        vault.write("Flow.mmd", FLOW);
+        vault.write("Other.mermaid", "graph TD\n  Top --> Bottom");
+        let mut app = open(&vault, "Flow.mmd");
+        let shown = screen_text(&mut app);
+        assert!(shown.contains("Vault") && shown.contains('▶'), "{shown}");
+        assert!(!shown.contains("flowchart LR"), "{shown}");
+
+        let mut other = open(&vault, "Other.mermaid");
+        let rows = screen_rows(&mut other);
+        assert!(row_with(&rows, "Top") < row_with(&rows, "Bottom"));
+    }
+
+    #[test]
+    fn a_mermaid_file_that_is_not_a_flowchart_shows_its_source() {
+        let vault = TempVault::new("mermaid-file-source");
+        vault.write("Seq.mmd", "sequenceDiagram\n  A->>B: hello\n");
+        let mut app = open(&vault, "Seq.mmd");
+        let shown = screen_text(&mut app);
+        assert!(shown.contains("A->>B: hello"), "{shown}");
+        assert!(shown.contains("not drawn"), "{shown}");
+    }
+
+    #[test]
+    fn excalidraw_files_open_as_a_braille_drawing() {
+        let vault = TempVault::new("excalidraw-file");
+        vault.write("Flow.excalidraw", SCENE);
+        let mut app = open(&vault, "Flow.excalidraw");
+        let rows = screen_rows(&mut app);
+        assert!(braille_cells(&rows) > 20, "{}", rows.join("\n"));
+        assert!(
+            !rows.join("\n").contains("excalidraw\""),
+            "not the JSON it is stored as"
         );
     }
 
     #[test]
-    fn a_mermaid_block_stays_source_without_pixels() {
-        let vault = TempVault::new("mermaid-text");
-        vault.write("A.md", &format!("```mermaid\n{FLOW}\n```\n"));
-        let mut app = App::new(vault.vault(), crate::config::Config::default()).expect("app");
-        app.images = Images::halfblocks(100);
-        let id = app.index.id_of_rel("A.md").expect("indexed");
-        app.open_note(id);
-
-        let screen = screen(&mut app);
-        assert!(
-            screen.contains("flowchart LR"),
-            "half-blocks can't carry a diagram"
-        );
-        assert!(app.reading.pictures.is_empty());
-    }
-
-    #[test]
-    fn a_broken_mermaid_block_says_why_and_keeps_its_source() {
-        let vault = TempVault::new("mermaid-broken");
-        vault.write("A.md", "```mermaid\nthis is not mermaid {{{\n```\n");
-        let mut app = app_with_pixels(&vault, "A.md");
-
-        let screen = draw_until(&mut app, |app| {
-            app.reading.lines.iter().any(|line| {
-                line.spans
-                    .iter()
-                    .any(|span| span.content.contains("Mermaid diagram header"))
-            })
-        });
-        assert!(screen.contains("this is not mermaid"), "the source stays");
-        assert!(
-            screen.contains("unexpected token"),
-            "with the renderer's complaint above it"
-        );
-        assert!(app.reading.pictures.is_empty());
-    }
-
-    #[test]
-    fn a_drawing_embeds_in_a_note_wherever_it_lives() {
+    fn a_drawing_embedded_in_a_note_is_traced_where_it_is_embedded() {
         let vault = TempVault::new("excalidraw-embed");
         vault.write("drawings/Flow.excalidraw", SCENE);
         vault.write(
             "A.md",
-            "Look:\n\n![[Flow.excalidraw]]\n\nand\n\n![](drawings/Flow.excalidraw)\n",
+            "Look:\n\n![[Flow.excalidraw]]\n\nand\n\n![](drawings/Flow.excalidraw)\n\nEnd\n",
         );
-        let mut app = app_with_pixels(&vault, "A.md");
+        let mut app = open(&vault, "A.md");
 
-        draw_until(&mut app, |app| app.reading.pictures.len() == 2);
+        let rows = screen_rows(&mut app);
+        let shown = rows.join("\n");
+        assert_eq!(app.reading.pictures.len(), 2, "{shown}");
         assert!(
             app.reading
                 .pictures
                 .iter()
-                .all(|picture| matches!(picture.source, Source::Diagram(_)))
+                .all(|picture| matches!(picture.source, PictureSource::Drawing(_)))
         );
+        assert!(braille_cells(&rows) > 40, "{shown}");
+        let (look, and, end) = (
+            row_with(&rows, "Look:"),
+            row_with(&rows, "and"),
+            row_with(&rows, "End"),
+        );
+        assert!(
+            look < and && and < end,
+            "the prose keeps its place:\n{shown}"
+        );
+        // The ink is between the words, not over them.
+        let ink_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| braille_cells(std::slice::from_ref(row)) > 0)
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            ink_rows
+                .iter()
+                .all(|&row| row != look && row != and && row != end)
+        );
+        assert!(ink_rows.iter().any(|&row| look < row && row < and));
+        assert!(ink_rows.iter().any(|&row| and < row && row < end));
     }
 
     #[test]
-    fn a_drawing_in_a_markdown_wrapper_embeds_too() {
+    fn an_obsidian_drawing_note_embeds_by_either_name() {
         let vault = TempVault::new("excalidraw-md-embed");
-        let wrapped = format!(
-            "---\nexcalidraw-plugin: parsed\n---\n\n## Drawing\n```json\n{SCENE}\n```\n%%\n"
+        vault.write(
+            "Flow.excalidraw.md",
+            &format!(
+                "---\nexcalidraw-plugin: parsed\n---\n\n## Drawing\n```json\n{SCENE}\n```\n%%\n"
+            ),
         );
-        vault.write("Flow.excalidraw.md", &wrapped);
-        vault.write("A.md", "![[Flow.excalidraw]]\n");
-        let mut app = app_with_pixels(&vault, "A.md");
-        draw_until(&mut app, |app| app.reading.pictures.len() == 1);
+        vault.write("A.md", "![[Flow.excalidraw]]\n\n![[Flow.excalidraw.md]]\n");
+        let mut app = open(&vault, "A.md");
+        let rows = screen_rows(&mut app);
+        assert_eq!(app.reading.pictures.len(), 2, "{}", rows.join("\n"));
+        assert!(braille_cells(&rows) > 40);
     }
 
     #[test]
-    fn a_plain_excalidraw_file_opens_as_one_picture() {
-        let vault = TempVault::new("excalidraw-file");
-        vault.write("Flow.excalidraw", SCENE);
-        let mut app = app_with_pixels(&vault, "Flow.excalidraw");
-
-        draw_until(&mut app, |app| !app.reading.pictures.is_empty());
-        let picture = &app.reading.pictures[0];
-        assert_eq!(picture.line, 0, "the picture is the page");
-        assert!(
-            picture.size.width > 20 && picture.size.height > 5,
-            "{picture:?}"
-        );
-        assert!(
-            usize::from(picture.size.height) <= 40,
-            "and it fits the pane, which is all of it that there is"
-        );
-    }
-
-    #[test]
-    fn a_plain_excalidraw_file_is_traced_in_braille_without_pixels() {
-        let vault = TempVault::new("excalidraw-braille");
-        vault.write("Flow.excalidraw", SCENE);
-        let mut app = App::new(vault.vault(), crate::config::Config::default()).expect("app");
-        let id = app.index.id_of_rel("Flow.excalidraw").expect("indexed");
-        app.open_note(id);
-
-        let screen = screen(&mut app);
-        assert!(
-            screen
-                .chars()
-                .any(|c| ('\u{2801}'..='\u{28ff}').contains(&c)),
-            "the old canvas drawing is still there for terminals without graphics"
-        );
-        assert!(app.reading.pictures.is_empty());
-    }
-
-    #[test]
-    fn a_mermaid_file_opens_as_a_diagram_or_as_its_source() {
-        let vault = TempVault::new("mermaid-file");
+    fn a_mermaid_file_embeds_as_its_drawing() {
+        let vault = TempVault::new("mermaid-embed");
         vault.write("Flow.mmd", FLOW);
-        let mut app = app_with_pixels(&vault, "Flow.mmd");
-        draw_until(&mut app, |app| !app.reading.pictures.is_empty());
+        vault.write("A.md", "Intro\n\n![[Flow.mmd]]\n\nOutro\n");
+        let mut app = open(&vault, "A.md");
+        let rows = screen_rows(&mut app);
+        let shown = rows.join("\n");
+        assert!(shown.contains('┌') && shown.contains("Reader"), "{shown}");
+        assert!(row_with(&rows, "Intro") < row_with(&rows, "Vault"));
+        assert!(row_with(&rows, "Vault") < row_with(&rows, "Outro"));
+    }
 
-        let mut plain = App::new(vault.vault(), crate::config::Config::default()).expect("app");
-        let id = plain.index.id_of_rel("Flow.mmd").expect("indexed");
-        plain.open_note(id);
-        assert!(screen(&mut plain).contains("flowchart LR"));
+    #[test]
+    fn an_embed_that_is_missing_or_unreadable_stays_a_link() {
+        let vault = TempVault::new("embed-broken");
+        vault.write("Bad.excalidraw", "this is not json");
+        vault.write("Empty.excalidraw", r#"{"elements": []}"#);
+        vault.write("Seq.mmd", "sequenceDiagram\n  A->>B: hi\n");
+        vault.write(
+            "A.md",
+            "![[Nope.excalidraw]]\n\n![[Bad.excalidraw]]\n\n![[Empty.excalidraw]]\n\n![[Seq.mmd]]\n",
+        );
+        let mut app = open(&vault, "A.md");
+        let shown = screen_text(&mut app);
+        assert!(app.reading.pictures.is_empty(), "{shown}");
+        for name in [
+            "Nope.excalidraw",
+            "Bad.excalidraw",
+            "Empty.excalidraw",
+            "Seq.mmd",
+        ] {
+            assert!(shown.contains(name), "{name} is still there:\n{shown}");
+        }
+    }
+
+    #[test]
+    fn an_embedded_drawing_scrolls_off_the_top_without_spilling() {
+        let vault = TempVault::new("excalidraw-scroll");
+        vault.write("Flow.excalidraw", SCENE);
+        vault.write(
+            "A.md",
+            &format!(
+                "![[Flow.excalidraw]]\n\nAfter the drawing\n{}",
+                "filler\n\n".repeat(60)
+            ),
+        );
+        let mut app = open(&vault, "A.md");
+        let rows = screen_rows(&mut app);
+        let all_ink = braille_cells(&rows);
+        let height = app.reading.pictures[0].size.height as usize;
+        assert!(height >= 4, "tall enough to cut in half: {height}");
+
+        app.active_mut().expect("a tab").scroll = height / 2;
+        let rows = screen_rows(&mut app);
+        let some_ink = braille_cells(&rows);
+        assert!(
+            some_ink > 0 && some_ink < all_ink,
+            "half of it is still showing: {some_ink} of {all_ink}"
+        );
+        assert!(rows.join("\n").contains("After the drawing"));
+    }
+
+    #[test]
+    fn the_reason_a_mermaid_block_stays_source_wraps_instead_of_running_off_the_pane() {
+        let vault = TempVault::new("mermaid-reason-wrap");
+        let index = vault.index();
+        let palette = palette();
+        let document = markdown::parse("```mermaid\nsequenceDiagram\n  A->>B: hi\n```\n");
+        let mut ctx = Ctx::text(&palette, &index);
+        let rows = text_of(&render_document(&document, &mut ctx, 30));
+
+        assert!(
+            rows.iter().all(|row| row.chars().count() <= 30),
+            "{rows:#?}"
+        );
+        let words: Vec<&str> = rows.iter().flat_map(|row| row.split_whitespace()).collect();
+        let sentence = words.join(" ");
+        assert!(
+            sentence.contains(
+                "mermaid: sequenceDiagram diagrams are not drawn yet, only flowchart and graph"
+            ),
+            "every word of it is still there: {sentence}"
+        );
+        assert!(sentence.contains("A->>B: hi"), "and so is the source");
+    }
+
+    #[test]
+    fn a_mermaid_diagram_in_a_quote_or_list_is_indented_with_it() {
+        let vault = TempVault::new("mermaid-nested");
+        let index = vault.index();
+        let palette = palette();
+        let document = markdown::parse("> ```mermaid\n> graph TD\n>   A --> B\n> ```\n");
+        let mut ctx = Ctx::text(&palette, &index);
+        let rows = text_of(&render_document(&document, &mut ctx, 60));
+        let shown = rows.join("\n");
+        assert!(shown.contains('┌') && shown.contains('▼'), "{shown}");
+        assert!(
+            rows.iter()
+                .filter(|row| row.contains('┌') || row.contains('│'))
+                .all(|row| row.starts_with(icons::QUOTE_BAR)),
+            "every row of it sits behind the quote bar:\n{shown}"
+        );
     }
 
     fn text_of(lines: &[Line<'_>]) -> Vec<String> {

@@ -236,17 +236,19 @@ impl VaultIndex {
             }
         }
         for (id, note) in self.notes.iter().enumerate() {
+            if note::own_extension(&note.meta.rel).is_some() {
+                // A diagram file is linked by its whole name, as Obsidian
+                // links any non-Markdown file: `![[Flow.excalidraw]]`. Its
+                // bare stem stays free for a Markdown note of the same name.
+                let name = note.meta.rel.rsplit('/').next().unwrap_or(&note.meta.rel);
+                self.lookup.entry(name.to_lowercase()).or_insert(id);
+                continue;
+            }
             // First note wins a contested filename, matching the sorted scan
             // order so the result is deterministic rather than filesystem-dependent.
             self.lookup
                 .entry(note.meta.stem.to_lowercase())
                 .or_insert(id);
-            // A diagram file is also linked by its whole name, as Obsidian
-            // links any non-Markdown file: `![[Flow.excalidraw]]`.
-            if note::own_extension(&note.meta.rel).is_some() {
-                let name = note.meta.rel.rsplit('/').next().unwrap_or(&note.meta.rel);
-                self.lookup.entry(name.to_lowercase()).or_insert(id);
-            }
         }
         for (id, note) in self.notes.iter().enumerate() {
             let rel = note.meta.rel.to_lowercase();
@@ -523,7 +525,7 @@ impl VaultIndex {
         let note = &mut self.notes[id];
         note.meta.title = frontmatter
             .title()
-            .unwrap_or_else(|| note.meta.stem.clone());
+            .unwrap_or_else(|| note::default_title(&note.meta.rel, &note.meta.stem));
         note.meta.size = body.len() as u64;
         note.aliases = frontmatter.aliases();
         note.headings = links::extract_headings(body);
@@ -912,6 +914,36 @@ mod tests {
             None
         );
         assert_eq!(index.attachment_path("nothing.png", None), None);
+    }
+
+    #[test]
+    fn a_diagram_file_is_titled_with_its_whole_name_so_it_is_not_taken_for_a_note() {
+        let vault = TempVault::new("diagram-title");
+        vault.write("Flow.excalidraw", "{}");
+        vault.write("Flow.md", "The note.\n");
+        vault.write("sub/Seq.mmd", "graph TD\n  A --> B");
+        vault.write("Wrapped.excalidraw.md", "---\ntitle: Pretty\n---\n");
+
+        let mut index = vault.index();
+        let title = |index: &VaultIndex, rel: &str| {
+            index
+                .note(index.id_of_rel(rel).unwrap())
+                .unwrap()
+                .meta
+                .title
+                .clone()
+        };
+        assert_eq!(title(&index, "Flow.excalidraw"), "Flow.excalidraw");
+        assert_eq!(title(&index, "Flow.md"), "Flow");
+        assert_eq!(title(&index, "sub/Seq.mmd"), "Seq.mmd");
+        assert_eq!(title(&index, "Wrapped.excalidraw.md"), "Pretty");
+
+        for rel in ["Flow.excalidraw", "sub/Seq.mmd"] {
+            let id = index.id_of_rel(rel).unwrap();
+            index.refresh_note(id).expect("refresh");
+        }
+        assert_eq!(title(&index, "Flow.excalidraw"), "Flow.excalidraw");
+        assert_eq!(title(&index, "sub/Seq.mmd"), "Seq.mmd");
     }
 
     #[test]

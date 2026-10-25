@@ -13,7 +13,6 @@ mod auth;
 mod cli;
 mod clipboard;
 mod config;
-mod diagram;
 mod editor;
 mod explorer;
 mod images;
@@ -311,11 +310,6 @@ fn run(app: &mut App) -> io::Result<()> {
     // an unusable shell.
     let hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // A diagram renderer that panics is reported as a diagram that could
-        // not be drawn; the terminal stays as it is.
-        if diagram::in_guarded_render() {
-            return;
-        }
         let _ = crossterm::execute!(
             std::io::stdout(),
             crossterm::event::DisableMouseCapture,
@@ -1521,5 +1515,10 @@ mod tests {
             not_a_note.contains("not a folder, a Markdown note or a diagram"),
             "{not_a_note}"
         );
+        assert!(
+            locate(&vault.write("Flow.excalidraw", "{}")).is_ok(),
+            "a drawing opens like a note"
+        );
+        assert!(locate(&vault.write("Seq.mmd", "graph TD")).is_ok());
     }
 }

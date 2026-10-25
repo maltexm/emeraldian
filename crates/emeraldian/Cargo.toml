@@ -26,8 +26,6 @@ anyhow.workspace = true
 unicode-width.workspace = true
 serde_json.workspace = true
 rmpv.workspace = true
-mermaid-rs-renderer.workspace = true
-resvg.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 rustix.workspace = true

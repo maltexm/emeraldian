@@ -8,14 +8,29 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
-- **Excalidraw drawings and Mermaid diagrams as real pictures.** In a terminal
-  with a graphics protocol, `.excalidraw` files, `.excalidraw.md` notes,
-  ```` ```mermaid ```` blocks and `.mmd` / `.mermaid` files are drawn as
-  vector pictures rasterised at the size of the cells they sit in, in the
-  theme's colours. Drawings and Mermaid files appear in the explorer and open
-  like notes; `![[Flow.excalidraw]]` and `![[flow.mmd]]` embed them in a note.
-  Renaming, moving and deleting them keeps their extension. Other terminals keep
-  the braille drawing and the Mermaid source.
+- **Excalidraw drawings and Mermaid flowcharts inline, and as files of their
+  own.** `![[Flow.excalidraw]]`, `![[Flow.excalidraw.md]]` and
+  `![](drawings/flow.excalidraw)` trace the drawing on the braille canvas right
+  in the note, among the prose. A ```` ```mermaid ```` block is drawn as a
+  flowchart on the character grid (boxes, lines, arrowheads, decision diamonds,
+  edge labels, all four directions) instead of showing its source, and
+  `![[flow.mmd]]` embeds a Mermaid file the same way. `.excalidraw`, `.mmd` and
+  `.mermaid` files appear in the explorer and open like notes. No pictures and
+  no new dependency: everything is text and braille, so it looks the same in
+  every terminal. Diagram types other than flowcharts, subgraphs, and sources
+  that do not parse stay as source with a line saying why.
+- Renaming, moving and deleting a diagram file keeps its extension, and renaming
+  or moving it rewrites the links that name it (`![[Flow.excalidraw]]`,
+  `![[drawings/Flow.excalidraw|400]]`, `[[Flow.mmd#part]]`, the escaped `\|` of a
+  table). Links that spell out `.md` follow a Markdown note's rename too.
+
+### Fixed
+
+- Renaming a note no longer rewrites `[[Name]]` inside Mermaid and Excalidraw
+  files, where `A[[Name]]` is a subroutine node and not a link.
+- A bare `[[Flow]]` means the Markdown note `Flow.md`, never a `Flow.excalidraw`
+  or `Flow.mmd` next to it; diagram files are linked by their whole name, as
+  Obsidian links any file that is not Markdown.
 
 ## [0.8.0] — 2026-10-22
 

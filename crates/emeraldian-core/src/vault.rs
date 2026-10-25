@@ -197,8 +197,8 @@ fn walk(
 
             out.notes.push(NoteMeta {
                 path,
+                title: note::default_title(&rel, &stem),
                 rel,
-                title: stem.clone(),
                 stem,
                 modified,
                 created,

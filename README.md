@@ -358,23 +358,30 @@ works. Decoding happens off the draw loop, and the space a picture needs is
 worked out before it is decoded, so nothing jumps as it appears. A picture that
 can't be drawn leaves its alt text where it was.
 
-**Excalidraw.** Drawings are pictures in the reading pane, wherever they are:
-a `.excalidraw` file or an Obsidian `.excalidraw.md` note opens as the drawing,
-not as JSON or the wall of compressed base64 it is stored as, and
-`![[Flow.excalidraw]]` or `![](drawings/flow.excalidraw)` shows one inside a
-note. In a terminal with a graphics protocol (Kitty, Ghostty, WezTerm, iTerm2,
-sixel) the scene is written out as SVG and rasterised at the exact pixel size of
-the cells it sits in, in the colours of the theme (dark themes get Excalidraw's
-own dark mode), so text stays sharp at any pane width. Everywhere else it is
-traced as vectors on a braille canvas, scaled to the pane's width and scrolled
-vertically.
+**Excalidraw.** A `.excalidraw.md` note, or a plain `.excalidraw` file, opens as
+the drawing, not as the wall of compressed base64 or JSON it is stored as.
+Shapes, arrows, freehand strokes and labels are drawn as vectors on a braille
+canvas, so a diagram reads the same in every terminal whether or not it can show
+pictures. Scaled to the pane's width and scrolled vertically, like the prose it
+replaces. `![[Flow.excalidraw]]` (or `![[Flow.excalidraw.md]]`, or
+`![](drawings/flow.excalidraw)`) draws the same braille picture inside a note,
+among the prose, sized to the pane and no taller than a screen.
 
-**Mermaid.** A ```` ```mermaid ```` block in a note is drawn as a diagram in the
-same way, in the theme's colours, and so is a `.mmd` or `.mermaid` file opened
-on its own or embedded with `![[flow.mmd]]`. It is laid out in-process, with no
-browser and no Node. A diagram that doesn't parse stays as its source, with the
-reason above it; in a terminal without a graphics protocol the source is shown
-as it always was.
+**Mermaid.** A ```` ```mermaid ```` block in a note is drawn on the character
+grid, in the same pictureless style: flowcharts (`flowchart` and `graph`, in all
+four directions) become boxes of box-drawing characters joined by lines with
+arrowheads, with diamonds for decisions, round nodes, dotted and thick edges and
+edge labels. The layout is done in-process, with no browser and no extra
+dependency. A `.mmd` or `.mermaid` file opens as its diagram, and
+`![[flow.mmd]]` embeds one in a note. Subgraphs, other diagram types (sequence,
+class, state, …) and anything that doesn't parse are not drawn: the source is
+shown instead, under a line saying why. A diagram wider than the pane pans like
+a table.
+
+Both kinds of file are listed in the explorer and open like notes; rename, move
+and delete keep their extension, and a rename or move rewrites the
+`![[Flow.excalidraw]]`-style links that name them. Their contents are never
+searched for links or tags.
 
 **Explorer.** The file tree opens with your most recently edited notes at the
 top, which is usually where you left off. `s` steps through the other orders:
