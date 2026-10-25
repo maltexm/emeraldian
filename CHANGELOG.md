@@ -65,9 +65,35 @@ All notable changes to this project are documented here. The format follows
   or moving it rewrites the links that name it (`![[Flow.excalidraw]]`,
   `![[drawings/Flow.excalidraw|400]]`, `[[Flow.mmd#part]]`, the escaped `\|` of a
   table). Links that spell out `.md` follow a Markdown note's rename too.
+- **A readable, centred text column in the reading view.** Prose wraps at
+  `[ui] reading_width` (default 100; `0` uses the whole pane) and sits in the
+  middle of the note pane; `F8` focus mode uses the same width. Content that
+  cannot wrap (tables, code, Mermaid and Excalidraw drawings, pictures) stays
+  in the column when it fits, is centred on the pane when it needs more, and
+  starts at the pane edge when it needs more than the pane.
+- **Jump between links in reading mode.** `]` and `[` select the next and
+  previous link of the note (wrapping); the picked link is marked with a star
+  in the margin, and `Enter` follows it (with none picked it still follows the
+  first link). External links and attachments stay put and say so. A link
+  inside a fenced code block is not a link.
 
 ### Fixed
 
+- **`Ctrl+Shift+G` opens the local graph while a note is open in the embedded
+  Neovim.** The chord reached nvim as `<C-S-g>`, which nothing maps. Exactly
+  that chord is now reserved; plain `Ctrl+G` and chords with an extra modifier
+  stay with nvim.
+- **Link jumps are accurate in nvim and in reading mode.** In nvim, `[` from
+  ordinary text lands on the nearest preceding link instead of skipping it, and
+  counts wrap correctly. A fenced block only ends at a matching closing fence
+  (a longer fence with a different marker, or a shorter one, no longer ends it
+  or exposes links inside it). Standalone Mermaid and Excalidraw source is not
+  searched for links, and a Markdown link whose destination contains spaces is
+  found and followed.
+- **A click on a link in the reading view hits the link that was drawn there.**
+  Two links with the same text, a link whose label wraps over two rows, and
+  prose that reads like a link's label no longer open the wrong link or none.
+  The selection star no longer moves the text.
 - **Obsidian syntax no longer leaks into the reading view.** `%%comments%%`
   (inline, and across lines; one that never closes hides the rest of the note,
   as in Obsidian) and trailing `^block-ids` are hidden, and a link to an id
