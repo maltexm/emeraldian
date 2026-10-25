@@ -166,12 +166,20 @@ fn route(app: &mut App, key: KeyEvent, command: bool) {
     // there.
     // `⌘C`, `⌘X` and `⌘V` do to a visual selection what vim's own `Ctrl` ones
     // do, rather than what they do to an ordinary one.
+    // Neither layer applies while nvim owns the note pane either: the text
+    // handler would read a reserved chord (`Alt+←`) as a motion and, through
+    // `with_editor_out`, create the built-in editor behind the pane nvim is
+    // drawing. Reserved keys here are the app's, exactly as without vim.
     let visual = matches!(
         app.vim.mode,
         crate::vim::VimMode::Visual | crate::vim::VimMode::VisualLine
     );
     let clipboard = matches!(key.code, KeyCode::Char('c' | 'C' | 'x' | 'X' | 'v' | 'V'));
-    if app.config.editor.vim && app.view == View::Notes && (!command || (visual && clipboard)) {
+    if app.config.editor.vim
+        && app.view == View::Notes
+        && !crate::nvim::pane_has_input(app)
+        && (!command || (visual && clipboard))
+    {
         let key = normalize_legacy_ctrl(key);
         if !crate::vim::is_typing(app) && crate::vim::navigation(app, key) {
             return;
@@ -1598,6 +1606,129 @@ mod tests {
         handle(&mut app, key(KeyCode::Enter));
 
         assert_eq!(app.active().expect("tab").scroll, 0, "no frame, no crash");
+    }
+
+    /// An app whose note pane belongs to nvim: the nvim backend, `B.md` open
+    /// in edit mode with `A.md` behind it in the history. No nvim process is
+    /// started — the keys under test are reserved, so they never reach a
+    /// session, which is exactly the path the regression covers.
+    fn nvim_pane_app(vim: bool) -> (TempVault, App) {
+        let vault = TempVault::new("keys-nvim-pane");
+        vault.write("A.md", "# A\n\n[[B]]\n");
+        vault.write("B.md", "# B\n");
+        let mut config = Config::default();
+        config.editor.backend = crate::config::EditorBackend::Nvim;
+        config.editor.vim = vim;
+        config.ui.reading_mode = false;
+        let mut app = App::new(vault.vault(), config).expect("app");
+        let a = app.index.id_of_rel("A.md").expect("indexed");
+        app.open_note(a);
+        let b = app.index.id_of_rel("B.md").expect("indexed");
+        app.open_note(b);
+        (vault, app)
+    }
+
+    #[test]
+    fn reserved_keys_skip_the_legacy_vim_editor_while_nvim_owns_the_note() {
+        // While nvim edits the note, the reserved chords are the app's, not
+        // vim's text motions: the legacy layer behind them reads an arrow as
+        // `h`/`l` and, through `with_editor_out`, conjures the built-in editor
+        // up behind the nvim pane. Both vim settings route them the same way.
+        for vim in [true, false] {
+            let (_v, mut app) = nvim_pane_app(vim);
+            assert!(app.nvim_editing() && app.focus == Focus::Note, "vim={vim}");
+            assert_eq!(app.note_title(app.active_note().expect("open")), "B");
+
+            // History: `Alt+Left` back to A, `Alt+Right` forward to B again.
+            handle(&mut app, KeyEvent::new(KeyCode::Left, KeyModifiers::ALT));
+            assert_eq!(
+                app.note_title(app.active_note().expect("open")),
+                "A",
+                "vim={vim}: Alt+Left must go back"
+            );
+            handle(&mut app, KeyEvent::new(KeyCode::Right, KeyModifiers::ALT));
+            assert_eq!(
+                app.note_title(app.active_note().expect("open")),
+                "B",
+                "vim={vim}: Alt+Right must go forward"
+            );
+
+            // A plain letter is nvim's and must not be typed anywhere here.
+            handle(&mut app, key(KeyCode::Char('x')));
+            // The rest of the fixed reservations: `Ctrl+E` toggles the mode
+            // and `Ctrl+Tab` steps through the tabs.
+            handle(&mut app, ctrl(KeyCode::Char('e')));
+            assert_eq!(
+                app.active().map(|t| t.mode),
+                Some(Mode::Reading),
+                "vim={vim}: Ctrl+E reads the note"
+            );
+            handle(&mut app, ctrl(KeyCode::Char('e')));
+            assert_eq!(
+                app.active().map(|t| t.mode),
+                Some(Mode::Editing),
+                "vim={vim}: Ctrl+E edits it again"
+            );
+            handle(&mut app, KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL));
+            assert_eq!(
+                app.note_title(app.active_note().expect("open")),
+                "A",
+                "vim={vim}: Ctrl+Tab steps on"
+            );
+            handle(
+                &mut app,
+                KeyEvent::new(KeyCode::Tab, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            );
+            assert_eq!(
+                app.note_title(app.active_note().expect("open")),
+                "B",
+                "vim={vim}: Ctrl+Shift+Tab steps back"
+            );
+
+            // Nothing along the way may have created the built-in editor.
+            assert!(
+                app.active().expect("tab").editor.is_none(),
+                "vim={vim}: the built-in editor stayed unused"
+            );
+        }
+    }
+
+    #[test]
+    fn an_alt_chord_remap_reaches_its_action_while_nvim_owns_the_note() {
+        // A `[keys]` remap is reserved in the nvim pane only when it needs
+        // Alt or an F-key; it must dispatch there rather than fall into the
+        // inactive editors.
+        for vim in [true, false] {
+            let vault = TempVault::new("keys-nvim-remap");
+            vault.write("A.md", "# A\n\n[[B]]\n");
+            vault.write("B.md", "# B\n");
+            let mut config = Config::default();
+            config.editor.backend = crate::config::EditorBackend::Nvim;
+            config.editor.vim = vim;
+            config.ui.reading_mode = false;
+            config.keys.insert("back".to_string(), "alt+b".to_string());
+            let mut app = App::new(vault.vault(), config).expect("app");
+            let a = app.index.id_of_rel("A.md").expect("indexed");
+            app.open_note(a);
+            let b = app.index.id_of_rel("B.md").expect("indexed");
+            app.open_note(b);
+            drop(vault);
+
+            handle(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('b'), KeyModifiers::ALT),
+            );
+
+            assert_eq!(
+                app.note_title(app.active_note().expect("open")),
+                "A",
+                "vim={vim}: the Alt remap dispatched"
+            );
+            assert!(
+                app.active().expect("tab").editor.is_none(),
+                "vim={vim}: the built-in editor stayed unused"
+            );
+        }
     }
 }
 

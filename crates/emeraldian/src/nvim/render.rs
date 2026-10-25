@@ -53,7 +53,14 @@ pub fn draw(frame: &mut Frame, area: Rect, grid: &Grid, palette: &Palette, focus
             // it, which nvim sends as `""`. Only a character both sides agree
             // is two wide may use both: when ratatui would skip a cell nvim
             // thinks is separate, everything after it on the row shifts.
-            let wide = cell_width(cell) == 2 && next.is_some_and(|next| next.text.is_empty());
+            // Only when the continuation is inside the pane, too — ratatui
+            // writes the second half of the glyph into the cell after it, and
+            // a glyph sitting in the pane's last column would erase the cell
+            // *outside* the pane, which this frame may be borrowing from
+            // another widget mid-resize. A clipped half draws as a space.
+            let wide = cell_width(cell) == 2
+                && next.is_some_and(|next| next.text.is_empty())
+                && col + 1 < columns;
             if cell.text.is_empty() {
                 // The continuation of a wide character that was cut off by the
                 // pane's edge or by a scroll; the space keeps the columns.
@@ -240,6 +247,67 @@ mod tests {
         assert_eq!(cell.fg, Color::Rgb(0xFF, 0x00, 0x00));
         assert_eq!(cell.bg, Color::Rgb(0x00, 0x00, 0xFF));
         assert!(cell.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn render_clips_a_wide_glyph_at_the_pane_edge() {
+        // A resize on its way to nvim leaves the pane narrower than its grid
+        // for a frame (the `draw` contract supports exactly this). The last
+        // pane column can then hold the first half of a double-width glyph —
+        // and ratatui writes such a glyph into the cell *after* it too, which
+        // would erase whatever sits outside the pane.
+        let mut grid = Grid::new(4, 1);
+        grid.cells[0].text = "a".to_string();
+        grid.cells[1].text = "漢".to_string();
+        grid.cells[2].text = String::new();
+        grid.cells[3].text = "b".to_string();
+
+        let mut terminal = Terminal::new(TestBackend::new(6, 1)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                for col in 0..6 {
+                    frame.buffer_mut()[(col, 0)].set_symbol("X");
+                }
+                draw(frame, Rect::new(1, 0, 2, 1), &grid, &palette(), false);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let symbols: Vec<&str> = (0..6)
+            .map(|col| buffer.cell((col, 0)).expect("cell").symbol())
+            .collect();
+        assert_eq!(
+            symbols,
+            ["X", "a", " ", "X", "X", "X"],
+            "a clipped wide glyph must become a placeholder inside the pane, \\
+             never a two-cell write into the column beyond it"
+        );
+
+        // When both halves fit, the glyph still renders in full up to the
+        // pane's edge, and the exterior stays untouched.
+        let mut fitting = Grid::new(4, 1);
+        fitting.cells[0].text = "a".to_string();
+        fitting.cells[1].text = "b".to_string();
+        fitting.cells[2].text = "漢".to_string();
+        fitting.cells[3].text = String::new();
+
+        let mut terminal = Terminal::new(TestBackend::new(6, 1)).expect("terminal");
+        terminal
+            .draw(|frame| {
+                for col in 0..6 {
+                    frame.buffer_mut()[(col, 0)].set_symbol("X");
+                }
+                draw(frame, Rect::new(1, 0, 4, 1), &fitting, &palette(), false);
+            })
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        let symbols: Vec<&str> = (0..6)
+            .map(|col| buffer.cell((col, 0)).expect("cell").symbol())
+            .collect();
+        assert_eq!(
+            symbols,
+            ["X", "a", "b", "漢", " ", "X"],
+            "a wide glyph whose continuation fits must render whole"
+        );
     }
 
     #[test]

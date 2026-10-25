@@ -138,7 +138,12 @@ pub fn poll_timeout(app: &App, tick: Duration) -> Duration {
 }
 
 /// Whether the keyboard, the clipboard and the caret belong to nvim right now.
-fn pane_has_input(app: &App) -> bool {
+///
+/// Public because the key router needs the same answer: while this holds, the
+/// legacy vim layers must stand down rather than act on the built-in editor
+/// that nvim has replaced.
+#[must_use]
+pub fn pane_has_input(app: &App) -> bool {
     app.nvim_editing() && app.focus == Focus::Note && app.modal.is_none()
 }
 
