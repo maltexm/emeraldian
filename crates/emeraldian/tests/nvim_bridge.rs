@@ -216,6 +216,234 @@ fn bridge_enter_without_a_link_keeps_its_default() {
     assert!(follows(&seen).is_empty(), "events were {seen:?}");
 }
 
+// ---------------------------------------------------------------------------
+// Maps the user had before the bridge took `<CR>`, `gf` and `<C-]>` over
+// ---------------------------------------------------------------------------
+
+/// `start`, plus user config that is there before the bridge and before any
+/// note is opened, the way the maps of an init file are: each entry is run as
+/// an Ex command through `--cmd`.
+fn start_configured(vault: &Path, config: &[&str]) -> Option<Session> {
+    if !nvim_available() {
+        eprintln!("skip: nvim not on PATH");
+        return None;
+    }
+    let mut args = vec!["--clean", "--cmd", "set noswapfile"];
+    for command in config {
+        args.push("--cmd");
+        args.push(command);
+    }
+    Some(
+        Session::start_with(&EditorConfig::default(), vault, (60, 12), &args)
+            .expect("start nvim --embed"),
+    )
+}
+
+/// The row of the marker `A!<Esc>`, if one is on screen.
+fn marker_row(grid: &Grid) -> Option<u16> {
+    (0..grid.height).find(|&row| row_text(grid, row).contains('!'))
+}
+
+/// Types `keys` and then a marker behind them. The marker lands where the
+/// cursor is once `keys` are done, so this answers where they left it, and
+/// that they are done: a key that has not taken effect yet cannot be told from
+/// one that never will.
+fn row_after(session: &mut Session, keys: &str) -> (u16, Vec<BridgeEvent>) {
+    session.input(&format!("{keys}A!<Esc>"));
+    let mut row = None;
+    let seen = collect(session, |session, _| {
+        row = marker_row(session.grid());
+        row.is_some()
+    });
+    let seen = seen.unwrap_or_else(|seen| seen);
+    (
+        row.unwrap_or_else(|| panic!("no marker after {keys:?}; events were {seen:?}")),
+        seen,
+    )
+}
+
+const THREE_LINES: &str = "one\ntwo\nthree\n";
+const FIVE_LINES: &str = "l0\nl1\nl2\nl3\nl4\n";
+
+/// Opens `text` as a note after `config` and types `keys`: the row the cursor
+/// ends on, and what the bridge reported.
+fn keys_with_config(config: &[&str], text: &str, keys: &str) -> Option<(u16, Vec<BridgeEvent>)> {
+    let vault = TempVault::new("nvim-bridge-premap");
+    let path = vault.write("Expr.md", text);
+    let mut session = start_configured(vault.path(), config)?;
+    session.open(&path).expect("open");
+    Some(row_after(&mut session, keys))
+}
+
+/// An expression map the user had made for the key stays theirs when no link
+/// is under the cursor: a Lua callback or an expression string, on each of the
+/// three keys. (`G` is the same, typed without any map: row 2.)
+#[test]
+fn bridge_keeps_a_users_expression_map_without_a_link() {
+    let cases: [(&str, &str); 6] = [
+        (
+            "lua vim.keymap.set('n', 'gf', function() return 'G' end, { expr = true })",
+            "gg0gf",
+        ),
+        ("nnoremap <expr> gf 'G'", "gg0gf"),
+        (
+            "lua vim.keymap.set('n', '<CR>', function() return 'G' end, { expr = true })",
+            "gg0<CR>",
+        ),
+        ("nnoremap <expr> <CR> 'G'", "gg0<CR>"),
+        (
+            "lua vim.keymap.set('n', '<C-]>', function() return 'G' end, { expr = true })",
+            "gg0<C-]>",
+        ),
+        ("nnoremap <expr> <C-]> 'G'", "gg0<C-]>"),
+    ];
+    for (config, keys) in cases {
+        let Some((row, seen)) = keys_with_config(&[config], THREE_LINES, keys) else {
+            return;
+        };
+        assert_eq!(row, 2, "{config} then {keys}");
+        assert!(follows(&seen).is_empty(), "{config}: events were {seen:?}");
+    }
+}
+
+/// What an expression map returns is typed as nvim types it for the map
+/// itself: keycodes are translated, a count typed before the key still counts,
+/// and the result is remapped only when the map is a remappable one.
+#[test]
+fn bridge_replays_expression_maps_as_nvim_would() {
+    let cases: [(&[&str], &str, u16, &str); 8] = [
+        (
+            &[
+                "lua vim.keymap.set('n', 'gf', function() return '<Down><Down>' end, { expr = true })",
+            ],
+            "gf",
+            2,
+            "lua expression, key notation in the result",
+        ),
+        (
+            &[r#"nnoremap <expr> gf "\<Down>\<Down>""#],
+            "gf",
+            2,
+            "expression string, real keycodes in the result",
+        ),
+        (
+            &[
+                "lua vim.keymap.set('n', 'gf', function() return vim.api.nvim_replace_termcodes('<Down><Down>', true, false, true) end, { expr = true, replace_keycodes = false })",
+            ],
+            "gf",
+            2,
+            "lua expression that already translated its keys",
+        ),
+        (
+            &["nnoremap <expr> gf 'j'"],
+            "3gf",
+            3,
+            "a count typed before the key",
+        ),
+        (
+            &[
+                "lua vim.keymap.set('n', 'gf', function() return vim.v.count .. 'j' end, { expr = true })",
+            ],
+            "2gf",
+            // `2` typed, then the result `2j`: the digits join to `22j`, as for the
+            // map itself, and the buffer ends at the last row.
+            4,
+            "v:count seen by the callback",
+        ),
+        (
+            &["nnoremap <F9> G", "nmap <expr> gf '<F9>'"],
+            "gg0gf",
+            4,
+            "a remappable expression map's result is remapped",
+        ),
+        (
+            &["nnoremap <F9> G", "nnoremap <expr> gf '<F9>'"],
+            "gg0gf",
+            0,
+            "a noremap expression map's result is not",
+        ),
+        (
+            &[
+                "nnoremap <F9> G",
+                "lua vim.keymap.set('n', 'gf', function() return '<F9>' end, { expr = true, remap = true })",
+            ],
+            "gg0gf",
+            4,
+            "a remappable lua expression map's result is remapped",
+        ),
+    ];
+    for (config, keys, want, what) in cases {
+        let Some((row, _)) = keys_with_config(config, FIVE_LINES, keys) else {
+            return;
+        };
+        assert_eq!(row, want, "{what}: {config:?} then {keys}");
+    }
+}
+
+/// The two kinds of map that already worked still do: a Lua callback that is
+/// no expression, and a plain string for the right-hand side.
+#[test]
+fn bridge_keeps_a_users_plain_maps_without_a_link() {
+    let cases: [(&str, &str); 3] = [
+        (
+            "lua vim.keymap.set('n', '<CR>', function() vim.api.nvim_win_set_cursor(0, { 3, 0 }) end)",
+            "gg0<CR>",
+        ),
+        ("nnoremap gf G", "gg0gf"),
+        ("nmap <C-]> G", "gg0<C-]>"),
+    ];
+    for (config, keys) in cases {
+        let Some((row, seen)) = keys_with_config(&[config], THREE_LINES, keys) else {
+            return;
+        };
+        assert_eq!(row, 2, "{config} then {keys}");
+        assert!(follows(&seen).is_empty(), "{config}: events were {seen:?}");
+    }
+}
+
+/// A key the user mapped nothing to keeps its default, whatever else they
+/// mapped: `<CR>` still goes down a line.
+#[test]
+fn bridge_default_stays_next_to_an_expression_map_on_another_key() {
+    let Some((row, seen)) = keys_with_config(&["nnoremap <expr> gf 'G'"], THREE_LINES, "gg0<CR>")
+    else {
+        return;
+    };
+    assert_eq!(row, 1);
+    assert!(follows(&seen).is_empty(), "events were {seen:?}");
+}
+
+/// A link under the cursor is followed, and the user's map does not run: on
+/// every key, for an expression map as for the others.
+#[test]
+fn bridge_link_wins_over_a_users_map() {
+    let text = "see [[Alpha]] now\ntwo\nthree\n";
+    let cases: [(&str, &str); 4] = [
+        (
+            "lua vim.keymap.set('n', 'gf', function() return 'G' end, { expr = true })",
+            "gf",
+        ),
+        ("nnoremap <expr> <CR> 'G'", "<CR>"),
+        ("nnoremap <expr> <C-]> 'G'", "<C-]>"),
+        ("nnoremap gf G", "gf"),
+    ];
+    for (config, key) in cases {
+        let Some((row, seen)) = keys_with_config(&[config], text, &format!("f[{key}")) else {
+            return;
+        };
+        assert_eq!(
+            follows(&seen),
+            [&BridgeEvent::Follow(LinkTarget {
+                note: "Alpha".to_string(),
+                anchor: None,
+                source: None,
+            })],
+            "{config} then {key}"
+        );
+        assert_eq!(row, 0, "{config}: the map ran on a link");
+    }
+}
+
 /// `:w` reports the written note.
 #[test]
 fn bridge_write_notifies() {

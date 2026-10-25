@@ -306,10 +306,45 @@ end
 
 -- Buffer-local maps ----------------------------------------------------------
 
+--- The private name an expression map of `lhs` is kept under.
+local function kept_name(lhs)
+  return "<Plug>(emeraldian-previous-" .. lhs:gsub("%W", "_") .. ")"
+end
+
+--- Keeps the user's expression map of `lhs` (`previous`, from `maparg`) under a
+--- private `<Plug>` name in `buf`. Its result cannot be had by calling it or
+--- evaluating its `rhs` here: whether keycodes in the result are translated,
+--- whether it is remapped, `v:count` and `silent` all belong to the map, and
+--- nvim applies them to a map it runs itself. Sets `previous.kept` on success.
+local function keep_expr_map(buf, lhs, previous)
+  local rhs = previous.rhs
+  local map_opts = {
+    expr = true,
+    noremap = previous.noremap == 1,
+    silent = previous.silent == 1,
+    nowait = previous.nowait == 1,
+    script = previous.script == 1,
+  }
+  if previous.callback then
+    rhs = ""
+    map_opts.callback = previous.callback
+    map_opts.replace_keycodes = previous.replace_keycodes == 1
+  elseif not rhs or rhs == "" then
+    return
+  end
+  previous.kept = pcall(vim.api.nvim_buf_set_keymap, buf, "n", kept_name(lhs), rhs, map_opts)
+end
+
 --- What `lhs` did before the bridge took it over: the user's own map if there
 --- was one, the key's default otherwise.
 local function fallback(lhs, previous)
   local count = vim.v.count > 0 and tostring(vim.v.count) or ""
+  if previous and previous.kept then
+    -- The kept map is found by remapping; what it returns is remapped or not
+    -- as the map itself says. "i": in front of what is typed ahead.
+    local keys = vim.api.nvim_replace_termcodes(kept_name(lhs), true, false, true)
+    return vim.api.nvim_feedkeys(count .. keys, "mi", false)
+  end
   if previous and previous.expr ~= 1 then
     if previous.callback then
       return previous.callback()
@@ -338,6 +373,9 @@ local function attach(buf)
     local previous = vim.api.nvim_buf_call(buf, function()
       return vim.fn.maparg(lhs, "n", false, true)
     end)
+    if previous.expr == 1 then
+      keep_expr_map(buf, lhs, previous)
+    end
     vim.keymap.set("n", lhs, function()
       if not M.follow() then
         fallback(lhs, previous)
