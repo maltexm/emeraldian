@@ -142,7 +142,8 @@ full list in the app.
 | `Ctrl+\` / `Ctrl+]` | Toggle the sidebars (hard to type on some layouts — [remap them](#configuration)) |
 | `Tab` / `Shift+Tab` | Move between panes (`Esc` first while typing in a note) |
 | `hjkl`, `g`, `G` | Move within a pane |
-| `Enter` | Open / follow a link |
+| `]` / `[` | Next / previous link while reading (wraps) |
+| `Enter` | Open / follow the selected link |
 | `Alt+←` / `Alt+→` | Back / forward through the notes you've visited |
 | `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next / previous tab, as do `Ctrl+PgDn` / `Ctrl+PgUp` |
 | `Ctrl+Shift+T` | Reopen the last tab closed |
@@ -341,7 +342,8 @@ only if it uses `Alt` or an F-key; a plain `Ctrl` remap goes to nvim there. So
 `Space` all mean what nvim says. The built-in vim layer stands down completely
 while nvim owns the pane.
 
-**Links.** In a vault note, `<CR>` (Normal mode), `gf` and `Ctrl+]` follow the
+**Links.** In a vault note, `]l` and `[l` (Normal mode, with a count) jump to
+the next and previous link, wrapping; `<CR>`, `gf` and `Ctrl+]` follow the
 link under the cursor: `[[Note]]`, `[[Note|alias]]`, `[[Folder/Note#Heading]]`,
 `[[Note#^block]]` and relative `[text](../Note.md)` links, which resolve from the
 folder of the note they are in. A heading or block anchor jumps to its line.

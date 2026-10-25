@@ -89,6 +89,9 @@ pub struct Tab {
     pub hscroll: usize,
     /// Built lazily, the first time the tab is edited.
     pub editor: Option<Editor>,
+    /// Index into the note's links of the one the reading view has selected
+    /// for `Enter`; `None` until the user picks one.
+    pub selected_link: Option<usize>,
 }
 
 impl Tab {
@@ -840,6 +843,7 @@ impl App {
                 scroll: 0,
                 hscroll: 0,
                 editor: None,
+                selected_link: None,
             });
             self.active_tab = Some(self.tabs.len() - 1);
         }
@@ -1206,7 +1210,11 @@ impl App {
             if snapshot.active == Some(position) {
                 active = Some(tabs.len());
             }
-            tabs.push(Tab { note: id, ..tab });
+            tabs.push(Tab {
+                note: id,
+                selected_link: None,
+                ..tab
+            });
         }
         self.active_tab = active.or(if tabs.is_empty() { None } else { Some(0) });
         self.tabs = tabs;

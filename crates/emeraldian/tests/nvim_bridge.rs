@@ -171,6 +171,49 @@ fn bridge_follow_notifies() {
     );
 }
 
+/// `]l` / `[l` move the cursor from link to link, wrapping, and `<CR>` on the
+/// landed link still follows it. Insert mode does not have the map.
+#[test]
+fn bracket_l_jumps_between_links() {
+    let vault = TempVault::new("nvim-bridge-jump");
+    let path = vault.write(
+        "a.md",
+        "see [[Alpha]] first\n\nthen [there](Beta.md) and [[Gamma]]\n",
+    );
+    let Some(mut session) = start(vault.path(), false) else {
+        return;
+    };
+    session.open(&path).expect("open");
+    collect(&mut session, |_, seen| {
+        seen.iter()
+            .any(|event| matches!(event, BridgeEvent::Entered(_)))
+    })
+    .expect("note entered");
+
+    session.input("]l");
+    let landed = collect(&mut session, |session, _| {
+        row_text(session.grid(), session.grid().cursor.1).contains("Alpha")
+    });
+    let landed = landed.expect("cursor on Alpha");
+    let row = session.grid().cursor.1;
+    assert!(
+        row_text(session.grid(), row).contains("Alpha"),
+        "first ]l should land on Alpha, row {row}: {:?}",
+        row_text(session.grid(), row)
+    );
+
+    session.input("]l<CR>");
+    let seen = collect(&mut session, |_, seen| !follows(seen).is_empty())
+        .expect("Follow after the second ]l");
+    assert!(
+        matches!(
+            follows(&seen).first(),
+            Some(BridgeEvent::Follow(target)) if target.note.contains("Beta")
+        ),
+        "second ]l should land on the markdown link, saw {landed:?}"
+    );
+}
+
 /// A markdown link carries the note it was written in, so that a relative
 /// path can be resolved from that note's folder.
 #[test]

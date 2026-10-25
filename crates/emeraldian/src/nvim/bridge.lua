@@ -120,6 +120,52 @@ function M.link_at(line, col)
   return best
 end
 
+--- Every link in `lines`, in reading order, as `{ line, col }` (1-based line,
+--- 0-based column of the link's first byte).
+local function all_links(lines)
+  local found = {}
+  for lnum, line in ipairs(lines) do
+    for _, link in ipairs(scan(line)) do
+      found[#found + 1] = { lnum, link.s }
+    end
+  end
+  -- `scan` lists wikilinks before markdown links, not left to right.
+  table.sort(found, function(a, b)
+    return a[1] < b[1] or (a[1] == b[1] and a[2] < b[2])
+  end)
+  return found
+end
+
+--- Where `]l` / `[l` land. `delta` is signed and counts links: positive forward,
+--- negative back. A link the cursor is already on does not count as the next
+--- one. Wraps. nil when the buffer has no link.
+function M.next_link(lines, lnum, col, delta)
+  local links = all_links(lines)
+  local n = #links
+  if n == 0 or delta == 0 then
+    return nil
+  end
+  local here = 0
+  for i, pos in ipairs(links) do
+    if pos[1] < lnum or (pos[1] == lnum and pos[2] <= col) then
+      here = i
+    end
+  end
+  local step = delta > 0 and 1 or -1
+  local left = math.abs(delta) % n
+  if left == 0 then
+    left = n
+  end
+  -- `here` is 0 when the cursor is before every link. Lua's `%` on a negative
+  -- is negative, so the index is computed in 0-based space and shifted back.
+  local i = here == 0 and (step > 0 and 0 or 1) or here
+  while left > 0 do
+    i = (i - 1 + step) % n + 1
+    left = left - 1
+  end
+  return links[i]
+end
+
 --- 1-based line number of a heading (`kind = "heading"`, case-insensitive,
 --- closing `#`s ignored) or of a block id (`kind = "block"`, `^id` ending the
 --- line), or nil.
@@ -608,6 +654,22 @@ local function follow_or_fallback(lhs, previous)
   end
 end
 
+--- `]l` / `[l`. A count jumps that many links. No link in the buffer: nothing
+--- moves. Insert mode is untouched; this map is normal-mode only.
+local function jump_link(delta)
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local count = vim.v.count > 0 and vim.v.count or 1
+  local pos = M.next_link(
+    vim.api.nvim_buf_get_lines(0, 0, -1, false),
+    cursor[1],
+    cursor[2],
+    delta * count
+  )
+  if pos then
+    vim.api.nvim_win_set_cursor(0, pos)
+  end
+end
+
 local function attach(buf)
   if
     vim.b[buf].emeraldian_attached
@@ -628,6 +690,12 @@ local function attach(buf)
       follow_or_fallback(lhs, previous)
     end, { buffer = buf, silent = true, desc = "emeraldian: follow the link under the cursor" })
   end
+  vim.keymap.set("n", "]l", function()
+    jump_link(1)
+  end, { buffer = buf, silent = true, desc = "emeraldian: next link" })
+  vim.keymap.set("n", "[l", function()
+    jump_link(-1)
+  end, { buffer = buf, silent = true, desc = "emeraldian: previous link" })
   vim.keymap.set("n", "ZZ", function()
     if M.last_window() then
       M.leave(true)

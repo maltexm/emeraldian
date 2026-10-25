@@ -95,6 +95,26 @@ eq("block must end the line", M.find_anchor({ "x ^blk1 more" }, "block", "blk1")
 eq("action check", M.is_action({ "switcher", "search" }, "switcher"), true)
 eq("action check, unknown", M.is_action({ "switcher", "search" }, "nope"), false)
 
+-- `]l` / `[l`: the next or previous link in the buffer, counted from the cursor.
+-- 1-based line, 0-based column, as nvim reports them.
+local function jump(lines, lnum, col, delta)
+  local pos = M.next_link(lines, lnum, col, delta)
+  return pos and { pos[1], pos[2] } or nil
+end
+
+local note = {
+  "see [[Alpha]] first",
+  "plain text",
+  "then [there](Beta.md) and [[Gamma]]",
+}
+eq("next from the top", jump(note, 1, 0, 1), { 1, 4 })
+eq("next skips the link under the cursor", jump(note, 1, 4, 1), { 3, 5 })
+eq("next wraps to the first", jump(note, 3, 26, 1), { 1, 4 })
+eq("prev from the top wraps to the last", jump(note, 1, 0, -1), { 3, 26 })
+eq("prev steps back", jump(note, 3, 26, -1), { 3, 5 })
+eq("count jumps that many links", jump(note, 1, 0, 3), { 3, 26 })
+eq("no link anywhere", jump({ "nothing here" }, 1, 0, 1), nil)
+
 if #failures > 0 then
   io.stderr:write(table.concat(failures, "\n"), "\n")
   io.stderr:write(string.format("%d of %d cases failed\n", #failures, count))
