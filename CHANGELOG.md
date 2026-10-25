@@ -8,6 +8,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **Embedded Neovim as the editor.** `[editor] backend = "nvim"` runs the edit
+  mode in a real `nvim --embed` drawn in the note pane (`nvim` and
+  `nvim_appname` choose the program and its config; `"builtin"` stays the
+  default and the fallback). Key policy: everything goes to nvim except
+  `Ctrl+Q`, `Ctrl+E`, `F1`/`F2`/`F3`/`F5`/`F8`, `Alt+←/→` and the tab keys.
+  `<CR>`, `gf` and `Ctrl+]` follow wikilinks and relative Markdown links
+  (with heading and block anchors), saving re-indexes the note, `:q` returns to
+  the reading view, and `:Emeraldian <action>` reaches the switcher, search,
+  graph, assistant, explorer and sidebars from nvim maps. The assistant reads
+  the unsaved buffer and its write tools refuse a note with unsaved edits. A
+  missing or too-old nvim (below 0.10), or one that dies, falls back with a
+  status error instead of losing text. Tested on Linux with Neovim 0.12.6
+  only; see the README for the key policy and the known limitations.
 - **Excalidraw drawings and Mermaid flowcharts inline, and as files of their
   own.** `![[Flow.excalidraw]]`, `![[Flow.excalidraw.md]]` and
   `![](drawings/flow.excalidraw)` trace the drawing on the braille canvas right

@@ -314,16 +314,112 @@ undoes as far back as you like while the tab is open.
 ## Embedded Neovim
 
 With `[editor] backend = "nvim"` the edit mode runs inside a real `nvim --embed`
-instead of the built-in editor (`"builtin"` stays the default and the fallback
-when `nvim` is missing or older than 0.10). `[editor] nvim` names the program,
-`[editor] nvim_appname` picks its config (`NVIM_APPNAME`); empty runs your own.
+instead of the built-in editor: your Neovim, your config, your plugins, drawn in
+the note pane. Reading mode, the sidebars, the graph, the assistant and the
+index stay emeraldian's. This is tested on Linux with Neovim 0.12.6 only; the
+version guard asks for 0.10 or newer, and nothing else is claimed.
 
-The author's profile for it is `nvim-notes` (Space as leader, `<leader>o`
-switcher, `<leader>/` search, `<leader>g`/`G` graph, `<leader>a` assistant,
-`<leader>e` explorer, `<leader>b` backlinks, `<leader>n` new, `<leader>d` daily,
-`[[` completes note titles). It lives in the author's dotfiles, not in this
-repository; the `:Emeraldian <action>` command and the `emeraldian.notes`
-request it builds on are defined by the bridge in `crates/emeraldian/src/nvim/`.
+```toml
+[editor]
+backend = "nvim"          # "builtin" (default) or "nvim"
+nvim = "nvim"             # the program to run
+nvim_appname = ""         # NVIM_APPNAME; empty runs your own config
+```
+
+`"builtin"` stays the default and the fallback. A missing `nvim`, one older than
+0.10, an unknown backend word, or an nvim that dies mid-session each leave a
+status error and the built-in editor or the reading view; none of them panics or
+hangs, and the next `Ctrl+E` after a crash starts a fresh nvim. With
+`[ui] reading_mode = false` a note opens straight into nvim.
+
+**Keys.** Everything goes to nvim except a small reserved set that stays with
+emeraldian: `Ctrl+Q` (quit), `Ctrl+E` (back to reading), `F1`, `F2`, `F3`, `F5`,
+`F8`, `Alt+←`/`Alt+→` (history), `Ctrl+Tab`/`Ctrl+Shift+Tab` and
+`Ctrl+PgUp`/`Ctrl+PgDn` (tabs). A `[keys]` remap applies inside the nvim pane
+only if it uses `Alt` or an F-key; a plain `Ctrl` remap goes to nvim there. So
+`Ctrl+O`, `Ctrl+R`, `Ctrl+W`, `Ctrl+D`, `Ctrl+N`, `Ctrl+P`, `Ctrl+]`, `Tab` and
+`Space` all mean what nvim says. The built-in vim layer stands down completely
+while nvim owns the pane.
+
+**Links.** In a vault note, `<CR>` (Normal mode), `gf` and `Ctrl+]` follow the
+link under the cursor: `[[Note]]`, `[[Note|alias]]`, `[[Folder/Note#Heading]]`,
+`[[Note#^block]]` and relative `[text](../Note.md)` links, which resolve from the
+folder of the note they are in. A heading or block anchor jumps to its line.
+With no link under the cursor the key does what it did before, including a map
+of your own on it. A native `:edit`, `:bnext` or jump to another vault note
+opens or activates the matching tab, so history, backlinks and the assistant's
+context follow what nvim shows. `:q`, `:wq` and `:x` on the last window mean
+"leave editing" and return to the reading view; they do not kill nvim.
+
+**Commands for your own maps.** The bridge that emeraldian injects defines
+`:Emeraldian <action>` in the embedded instance, so a mapping can reach what
+nvim cannot:
+
+```
+switcher  search  graph  local_graph  chat  explorer  backlinks
+outline   focus_left  focus_right  new  daily
+```
+
+It also answers the request `emeraldian.notes` (note titles and aliases), which
+a completion source can ask for. `vim.rpcrequest(chan, "emeraldian.notes")` is
+how the profile below completes `[[`.
+
+**Saving and safety.** With `[editor] auto_save` on, a note is written about a
+second after you leave Insert mode or stop changing text, when you leave its
+buffer, and when the window loses focus; `Ctrl+E` and quitting write everything.
+With it off, closing a tab, switching vault and quitting ask before they drop
+unsaved text, and nvim's swap files (enable `'swapfile'` in your config) cover a
+crash. Saving re-indexes the note, so backlinks, outline and graph follow. The
+assistant reads the buffer, not the file, so it sees unsaved edits, and its
+write tools refuse a note whose buffer is modified ("note has unsaved edits in
+the editor") instead of overwriting it. Renaming the open note moves its buffer
+and rewrites links through it.
+
+**The author's profile** is `nvim-notes` (`nvim_appname = "nvim-notes"`): Space
+as leader, `<leader>o` switcher, `<leader>/` search, `<leader>g`/`G` graph,
+`<leader>a` assistant, `<leader>e` explorer, `<leader>b` backlinks, `<leader>n`
+new, `<leader>d` daily, `[[` completes note titles, and no LSP, file tree,
+statusline or dashboard. It lives in the author's dotfiles, not in this
+repository. On first start it clones lazy.nvim and the plugins from GitHub (and
+`blink.cmp` fetches its prebuilt library at the first Markdown file); the
+plugins are pinned by `lazy-lock.json`, lazy.nvim itself tracks its `stable`
+branch and is not.
+
+**Build and roll back (Linux).**
+
+```sh
+cargo build --release
+cp ~/.local/bin/emeraldian ~/.local/bin/emeraldian-0.8.0     # once, keep the old one
+cp target/release/emeraldian ~/.local/bin/emeraldian
+# back to 0.8.0:
+cp ~/.local/bin/emeraldian-0.8.0 ~/.local/bin/emeraldian
+```
+
+**Speed.** On a Linux laptop, 200 characters typed into Insert mode took a
+median of 6.0 ms in kitty (95th percentile 9.8 ms) and 5.0 ms in tmux (9.2 ms)
+from handing the key to nvim to applying its redraw. Set
+`EMERALDIAN_NVIM_LATENCY=/path/file` to log that figure, one line per redraw in
+microseconds, on your own machine. It stops short of the terminal's own paint.
+
+**Known limitations.**
+
+- `[[` completion is a blocking request from nvim to emeraldian, answered in
+  emeraldian's loop. While emeraldian is itself waiting on nvim (a save, a
+  rewrite of the buffer) the two wait on each other until emeraldian's 2 s
+  timeout. The profile caches the names for 5 s to make this rare.
+- A map of your own on `<CR>`, `gf` or `Ctrl+]` is kept for the fallback when no
+  link is under the cursor. A map defined after a note first opened is not seen
+  by that fallback. One whose result contains its own key is replayed a bounded
+  number of times, not forever.
+- Only Linux with Neovim 0.12.6 has been run. Windows, macOS and other Neovim
+  versions are untested.
+- Under tmux, about a third of starts draw nothing at all (4 of 12 detached
+  starts here). That is the upstream 0.8.0 problem
+  [#47](https://github.com/iamrohithrnair/emeraldian/issues/47), unchanged and
+  not specific to the nvim backend; kitty drew on every one of its starts here.
+- `app.rs` is about 2,100 lines and tab handling would be easier to review in a
+  `tabs.rs` of its own.
+
 The design is in `docs/superpowers/specs/2026-10-24-nvim-embed-design.md`.
 
 ## Mouse
