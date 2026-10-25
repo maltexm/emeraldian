@@ -311,6 +311,21 @@ One thing worth knowing: `editor.auto_save` is on by default, so a note mangled
 by a mistyped command is written to disk when you switch tabs or close it. `u`
 undoes as far back as you like while the tab is open.
 
+## Embedded Neovim
+
+With `[editor] backend = "nvim"` the edit mode runs inside a real `nvim --embed`
+instead of the built-in editor (`"builtin"` stays the default and the fallback
+when `nvim` is missing or older than 0.10). `[editor] nvim` names the program,
+`[editor] nvim_appname` picks its config (`NVIM_APPNAME`); empty runs your own.
+
+The author's profile for it is `nvim-notes` (Space as leader, `<leader>o`
+switcher, `<leader>/` search, `<leader>g`/`G` graph, `<leader>a` assistant,
+`<leader>e` explorer, `<leader>b` backlinks, `<leader>n` new, `<leader>d` daily,
+`[[` completes note titles). It lives in the author's dotfiles, not in this
+repository; the `:Emeraldian <action>` command and the `emeraldian.notes`
+request it builds on are defined by the bridge in `crates/emeraldian/src/nvim/`.
+The design is in `docs/superpowers/specs/2026-10-24-nvim-embed-design.md`.
+
 ## Mouse
 
 The ribbon icons are buttons, and most of the UI is clickable:
