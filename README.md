@@ -333,7 +333,8 @@ hangs, and the next `Ctrl+E` after a crash starts a fresh nvim. With
 `[ui] reading_mode = false` a note opens straight into nvim.
 
 **Keys.** Everything goes to nvim except a small reserved set that stays with
-emeraldian: `Ctrl+Q` (quit), `Ctrl+E` (back to reading), `F1`, `F2`, `F3`, `F5`,
+emeraldian: `Ctrl+Q` (quit), `Ctrl+E` (back to reading), `Ctrl+Shift+G` (local
+graph), `F1`, `F2`, `F3`, `F5`,
 `F8`, `Alt+←`/`Alt+→` (history), `Ctrl+Tab`/`Ctrl+Shift+Tab` and
 `Ctrl+PgUp`/`Ctrl+PgDn` (tabs). A `[keys]` remap applies inside the nvim pane
 only if it uses `Alt` or an F-key; a plain `Ctrl` remap goes to nvim there. So

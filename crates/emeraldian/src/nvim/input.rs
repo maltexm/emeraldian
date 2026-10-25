@@ -216,8 +216,9 @@ fn button_name(button: MouseButton) -> &'static str {
 
 /// Key policy A: while the nvim pane has focus, is this key emeraldian's?
 ///
-/// Kept: `Ctrl+Q`, `Ctrl+E`, the F-keys it dispatches (`F1`, `F2`, `F3`, `F5`,
-/// `F8`), history on `Alt+←/→`, and tab switching on `Ctrl+Tab`,
+/// Kept: `Ctrl+Q`, `Ctrl+E`, `Ctrl+Shift+G` (the local graph), the F-keys it
+/// dispatches (`F1`, `F2`, `F3`, `F5`, `F8`), history on `Alt+←/→`, and tab
+/// switching on `Ctrl+Tab`,
 /// `Ctrl+Shift+Tab`, `Ctrl+PgUp` and `Ctrl+PgDn`. Everything else — `Ctrl+O`,
 /// `Ctrl+R`, `Ctrl+W`, `Ctrl+D`, `Ctrl+N/P`, `Ctrl+]`, `Tab`, Space — goes to
 /// nvim, which is the point: those are the keys nvim users type without
@@ -237,7 +238,13 @@ pub fn is_reserved(key: &KeyEvent, keymap: &Keymap) -> bool {
     let ctrl_only = without_shift == KeyModifiers::CONTROL;
 
     let kept = match key.code {
-        KeyCode::Char(ch) => ctrl_only && matches!(ch.to_ascii_lowercase(), 'q' | 'e'),
+        KeyCode::Char(ch) => {
+            let ch = ch.to_ascii_lowercase();
+            // The local graph needs its Shift: plain `Ctrl+G` is nvim's file
+            // info. The other two take Shift as part of typing the key.
+            (ctrl_only && matches!(ch, 'q' | 'e'))
+                || (ch == 'g' && modifiers == KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+        }
         // Only unmodified F-keys: a modified one is the user asking for
         // something else, and emeraldian's own handlers are plain.
         KeyCode::F(1 | 2 | 3 | 5 | 8) => modifiers.is_empty(),
@@ -512,6 +519,10 @@ mod tests {
             (KeyCode::BackTab, ctrl | KeyModifiers::SHIFT),
             (KeyCode::PageUp, ctrl),
             (KeyCode::PageDown, ctrl),
+            // The local graph. Both spellings of the chord: the Kitty protocol
+            // reports the key or the shifted character.
+            (KeyCode::Char('g'), ctrl | KeyModifiers::SHIFT),
+            (KeyCode::Char('G'), ctrl | KeyModifiers::SHIFT),
         ] {
             assert!(
                 is_reserved(&press(code, modifiers), &defaults),
@@ -528,6 +539,9 @@ mod tests {
             (KeyCode::Char('n'), ctrl),
             (KeyCode::Char('p'), ctrl),
             (KeyCode::Char(']'), ctrl),
+            // `Ctrl+G` is nvim's file info; only the shifted chord is the graph.
+            (KeyCode::Char('g'), ctrl),
+            (KeyCode::Char('G'), KeyModifiers::SHIFT),
             (KeyCode::Char('i'), ctrl),
             (KeyCode::Char('['), ctrl),
             (KeyCode::Tab, none),
@@ -561,6 +575,8 @@ mod tests {
             (KeyCode::Tab, alt),
             (KeyCode::Char('q'), ctrl_alt),
             (KeyCode::Char('e'), ctrl | sup),
+            (KeyCode::Char('g'), ctrl_alt | KeyModifiers::SHIFT),
+            (KeyCode::Char('G'), ctrl | sup | KeyModifiers::SHIFT),
             (KeyCode::Left, ctrl_alt),
             (KeyCode::Right, alt | KeyModifiers::SHIFT),
             (KeyCode::Left, alt | sup),
