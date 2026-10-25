@@ -214,6 +214,7 @@ pub(super) fn render_block(
                     Span::styled(format!("{} ", icons::QUOTE_BAR), Style::default().fg(color)),
                 ];
                 spans.extend(line.spans);
+                paint_panel(&mut spans, palette.callout_bg, width, line.alignment);
                 out.push(Line {
                     alignment: line.alignment,
                     ..Line::from(spans)
@@ -232,6 +233,7 @@ pub(super) fn render_block(
                     Span::styled(format!("{} ", icons::QUOTE_BAR), Style::default().fg(color)),
                 ];
                 spans.extend(line.spans);
+                paint_panel(&mut spans, palette.callout_bg, width, line.alignment);
                 out.push(Line {
                     alignment: line.alignment,
                     ..Line::from(spans)
@@ -291,6 +293,39 @@ pub(super) fn render_block(
             format!("{pad}{}", "─".repeat(inner_width)),
             Style::default().fg(palette.hr),
         ))),
+    }
+}
+
+/// Puts a callout row on the callout panel: every span without a surface of its
+/// own (a tag chip or code panel keeps theirs) gets the panel color, and the
+/// row is filled out to `width` so the panel reads as one block. The first
+/// span is the indent, which stays outside it. A `reset` panel is the
+/// terminal's own page: nothing to paint, the row is left alone.
+fn paint_panel(
+    spans: &mut Vec<Span<'static>>,
+    panel: ratatui::style::Color,
+    width: usize,
+    alignment: Option<ratatui::layout::Alignment>,
+) {
+    if panel == ratatui::style::Color::Reset {
+        return;
+    }
+    for span in spans.iter_mut().skip(1) {
+        if span.style.bg.is_none() {
+            span.style = span.style.bg(panel);
+        }
+    }
+    // A centred row (display maths) is placed by its width, so it must not be
+    // stretched to the whole block.
+    if alignment == Some(ratatui::layout::Alignment::Center) {
+        return;
+    }
+    let used: usize = spans.iter().map(Span::width).sum();
+    if used < width {
+        spans.push(Span::styled(
+            " ".repeat(width - used),
+            Style::default().bg(panel),
+        ));
     }
 }
 

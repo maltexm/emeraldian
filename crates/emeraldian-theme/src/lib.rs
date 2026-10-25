@@ -16,6 +16,8 @@
 #![forbid(unsafe_code)]
 
 pub mod color;
+pub mod contrast;
+pub mod omarchy;
 pub mod presets;
 pub mod seed;
 pub mod theme;

@@ -146,6 +146,7 @@ fn main() -> io::Result<()> {
     }
 
     app.restore_ui_state();
+    app.start_omarchy();
     apply_startup_args(&mut app, &args);
     run(&mut app)
 }
@@ -542,6 +543,12 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Res
 
         if agent::poll(app) {
             needs_redraw = true;
+        }
+
+        // Omarchy switched theme: recolour. One `stat` twice a second.
+        if app.poll_omarchy() {
+            needs_redraw = true;
+            last_status = Instant::now();
         }
 
         // Whatever nvim drew since the last turn, and starting it or pointing

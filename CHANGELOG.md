@@ -8,6 +8,32 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The `terminal` theme follows the active Omarchy theme.** With Omarchy
+  installed, `theme = "terminal"` reads
+  `~/.local/state/omarchy/current/theme/colors.toml` and gives every role its
+  own colour instead of the terminal's 16: headings as in Omarchy's Obsidian
+  template (H1 red, H2 green, H3 yellow, H4 blue, H5 and H6 magenta), links
+  blue, accent and quote bar `accent`, muted and faint text really dimmer than
+  body text, and a subtle surface for code blocks and callouts (a few percent
+  toward the foreground). The page and body text stay the terminal's own, so a
+  translucent terminal stays translucent. When Omarchy switches theme, a
+  running emeraldian recolours within about half a second (one `stat` of the
+  file per poll); a file caught mid-write or missing keeps the last good
+  palette, and one that stays unusable is reported once in the status line.
+  `[ui] follow_omarchy = false` keeps the plain ANSI theme, and
+  `EMERALDIAN_OMARCHY_THEME_DIR` points at another folder holding a
+  `colors.toml`. Other themes are unchanged.
+- **A contrast guard for the reading view.** Every text-on-background pair the
+  reading view draws (body 4.5:1; links, code and tag-chip text 4.5:1; headings,
+  dim text, callout titles, selection and the picked link 3:1) is listed in
+  `emeraldian_theme::contrast::PAIRS`. The Omarchy palette is repaired until it
+  passes, and a test measures all 24 Omarchy colour sets (the 23 stock themes
+  and the live one it was written on). This fixes the tag chip on light themes
+  (catppuccin-latte was 1.22:1). The built-in named themes are measured by no
+  test and not adjusted. Callouts now sit on a panel (new `callout_bg` theme
+  slot; in the named themes it defaults to their `bg_alt`, the same surface as
+  code blocks).
+
 - **Embedded Neovim as the editor.** `[editor] backend = "nvim"` runs the edit
   mode in a real `nvim --embed` drawn in the note pane (`nvim` and
   `nvim_appname` choose the program and its config; `"builtin"` stays the

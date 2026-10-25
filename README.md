@@ -537,6 +537,28 @@ Gruvbox, Nord, Solarized, Dracula, Rosé Pine, Everforest, and a `terminal` them
 that inherits your terminal's palette. Drop a TOML file in the themes directory
 to add your own; unset colours inherit from whichever theme it `extends`.
 
+**Omarchy.** With `theme = "terminal"` on a machine running Omarchy, the
+reading view takes its roles from the active theme's `colors.toml`
+(`~/.local/state/omarchy/current/theme/`) instead of the terminal's 16 ANSI
+colours, which have no slot for "muted" or "code panel": headings follow
+Omarchy's Obsidian template (H1 red, H2 green, H3 yellow, H4 blue, H5/H6
+magenta), links are blue, accent and quote bar use the theme's `accent`, muted
+text is the foreground at 70%, and code blocks and callouts sit on a surface a
+few percent toward the foreground. The page and body text stay the terminal's
+own, so a translucent terminal stays translucent. Switching the Omarchy theme
+recolours a running emeraldian within about half a second; a file that is
+missing or caught mid-write keeps the last good colours. Text colours that
+would fall short of 4.5:1 (body, links) or 3:1 (headings, dim text, callout
+titles, chips) on their background are nudged until they pass.
+
+```toml
+[ui]
+follow_omarchy = true     # false keeps the plain ANSI `terminal` theme
+```
+
+`EMERALDIAN_OMARCHY_THEME_DIR=/some/dir` reads `/some/dir/colors.toml` instead,
+which is how to try a theme without switching to it.
+
 **Assistant.** A chat panel that operates on the vault through the same
 commands you use. It can search, read, create, edit, rename, link and delete
 notes, and open them or the graph on your screen. Every tool call is shown in

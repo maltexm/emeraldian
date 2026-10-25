@@ -64,6 +64,26 @@ macro_rules! define_slots {
                 )*
                 self
             }
+
+            /// The text of the slot called `name`, for tables of slots such as
+            /// [`crate::contrast::PAIRS`].
+            pub fn slot_mut(&mut self, name: &str) -> Option<&mut String> {
+                match name {
+                    $(stringify!($slot) => Some(&mut self.$slot),)*
+                    _ => None,
+                }
+            }
+        }
+
+        impl Palette {
+            /// The resolved color of the slot called `name`.
+            #[must_use]
+            pub fn slot(&self, name: &str) -> Option<Color> {
+                match name {
+                    $(stringify!($slot) => Some(self.$slot),)*
+                    _ => None,
+                }
+            }
         }
 
         impl From<&Theme> for Palette {
@@ -179,6 +199,8 @@ define_slots! {
     callout_success,
     callout_question,
     callout_quote,
+    /// Panel behind a callout's title and body.
+    callout_bg,
 
     // ---- graph view ----------------------------------------------------
     graph_bg,
@@ -300,6 +322,7 @@ impl Theme {
             callout_success: s.green.into(),
             callout_question: s.yellow.into(),
             callout_quote: s.muted.into(),
+            callout_bg: s.bg_alt.into(),
 
             graph_bg: s.bg.into(),
             graph_node: s.text.into(),

@@ -449,6 +449,18 @@ pub struct App {
     pub index: VaultIndex,
     pub config: Config,
     pub theme: ActiveTheme,
+    /// Where Omarchy keeps its active theme's colors, when it is there.
+    omarchy: Option<emeraldian_theme::omarchy::Source>,
+    /// The last colors read from it that parsed. Kept while the file is
+    /// missing or mid-write, so a theme switch never blanks the palette.
+    omarchy_colors: Option<emeraldian_theme::omarchy::Colors>,
+    /// Looks in a row that found a file it could not use.
+    omarchy_failures: u32,
+    /// The status line is the message about a file that stayed unusable, so
+    /// that a good file can take it away again.
+    omarchy_reported: bool,
+    /// When the file was last looked at by [`App::poll_omarchy`].
+    omarchy_polled: std::time::Instant,
     /// Every theme available in the picker, built-ins plus user files.
     pub themes: Vec<emeraldian_theme::Theme>,
 
@@ -583,6 +595,11 @@ impl App {
             nvim_failed: false,
             quit: false,
             theme: ActiveTheme::new(theme),
+            omarchy: None,
+            omarchy_colors: None,
+            omarchy_failures: 0,
+            omarchy_reported: false,
+            omarchy_polled: std::time::Instant::now(),
             themes,
             config,
             index,
@@ -1494,11 +1511,116 @@ impl App {
 
     pub fn set_theme(&mut self, name: &str) {
         if let Some(theme) = self.themes.iter().find(|t| t.name == name).cloned() {
-            self.theme = ActiveTheme::new(theme);
             self.config.theme = name.to_string();
+            self.theme = ActiveTheme::new(self.resolve_theme(theme));
+            // Picking `terminal` should show Omarchy's colors now, not at the
+            // next look at the file.
+            self.check_omarchy();
             self.info(format!("theme: {name}"));
         } else {
             self.error(format!("no theme named {name}"));
+        }
+    }
+
+    /// Whether the theme in use takes its colors from Omarchy: only the
+    /// `terminal` theme does, since it is the one that has no colors of its own.
+    fn follows_omarchy(&self) -> bool {
+        self.config.theme == "terminal" && self.config.ui.follow_omarchy
+    }
+
+    /// The theme to show for `theme`: for `terminal`, Omarchy's palette when it
+    /// has been read.
+    fn resolve_theme(&self, theme: emeraldian_theme::Theme) -> emeraldian_theme::Theme {
+        match &self.omarchy_colors {
+            Some(colors) if theme.name == "terminal" && self.config.ui.follow_omarchy => {
+                emeraldian_theme::omarchy::theme(colors)
+            }
+            _ => theme,
+        }
+    }
+
+    /// Starts following Omarchy's active theme, wherever Omarchy keeps it
+    /// (`EMERALDIAN_OMARCHY_THEME_DIR` overrides). Called once at startup, so
+    /// that building an `App` still touches nothing outside the vault.
+    pub fn start_omarchy(&mut self) {
+        if let Some(dir) = emeraldian_theme::omarchy::theme_dir() {
+            self.watch_omarchy(dir);
+        }
+    }
+
+    /// Follows the `colors.toml` in `dir` instead of Omarchy's own.
+    pub fn watch_omarchy(&mut self, dir: std::path::PathBuf) {
+        self.omarchy = Some(emeraldian_theme::omarchy::Source::new(dir));
+        self.omarchy_colors = None;
+        self.omarchy_failures = 0;
+        self.check_omarchy();
+    }
+
+    /// How often the main loop looks at Omarchy's file: a `stat` twice a
+    /// second, so a theme switch shows within about half a second.
+    const OMARCHY_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+    /// [`App::check_omarchy`], at most every [`App::OMARCHY_POLL`]. Returns
+    /// whether the screen needs redrawing.
+    pub fn poll_omarchy(&mut self) -> bool {
+        if self.omarchy_polled.elapsed() < Self::OMARCHY_POLL {
+            return false;
+        }
+        self.omarchy_polled = std::time::Instant::now();
+        self.check_omarchy()
+    }
+
+    /// Looks at Omarchy's file now and recolours if it changed. Returns whether
+    /// the palette (or the status line) changed.
+    ///
+    /// Nothing is replaced unless a new file parsed, so a theme switch caught
+    /// half way through the write, or a file that is gone, leaves the colors on
+    /// screen as they were. A file that stays unusable is reported once.
+    pub fn check_omarchy(&mut self) -> bool {
+        use emeraldian_theme::omarchy::Poll;
+
+        if !self.follows_omarchy() {
+            return false;
+        }
+        let Some(source) = self.omarchy.as_mut() else {
+            return false;
+        };
+        match source.poll() {
+            Poll::Unchanged | Poll::Missing => {
+                self.omarchy_failures = 0;
+                false
+            }
+            Poll::Loaded(colors) => {
+                let was_reported = std::mem::take(&mut self.omarchy_reported);
+                if was_reported {
+                    self.status = Status::default();
+                }
+                self.omarchy_failures = 0;
+                if self.omarchy_colors.as_ref() == Some(&colors) {
+                    return was_reported;
+                }
+                self.omarchy_colors = Some(colors);
+                if let Some(theme) = self
+                    .themes
+                    .iter()
+                    .find(|t| t.name == self.config.theme)
+                    .cloned()
+                {
+                    self.theme = ActiveTheme::new(self.resolve_theme(theme));
+                }
+                true
+            }
+            Poll::Failed(why) => {
+                // A write caught half way is whole a moment later: only a
+                // file that is still unusable on the next look is worth saying.
+                self.omarchy_failures += 1;
+                if self.omarchy_failures == 2 {
+                    self.error(format!("omarchy theme ignored: {why}"));
+                    self.omarchy_reported = true;
+                    return true;
+                }
+                false
+            }
         }
     }
 
@@ -1998,6 +2120,180 @@ mod tests {
             "a bad name leaves the theme alone"
         );
         assert!(app.status.is_error);
+    }
+
+    const GRUVBOX: &str =
+        include_str!("../../emeraldian-theme/tests/fixtures/omarchy/gruvbox.toml");
+    const LATTE: &str =
+        include_str!("../../emeraldian-theme/tests/fixtures/omarchy/catppuccin-latte.toml");
+
+    fn omarchy_dir(tag: &str, colors: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "emeraldian-app-omarchy-{tag}-{}",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).expect("theme dir");
+        std::fs::write(dir.join("colors.toml"), colors).expect("colors.toml");
+        dir
+    }
+
+    fn terminal_app(vault: &TempVault, dir: &std::path::Path) -> App {
+        let mut app = app(vault);
+        app.set_theme("terminal");
+        app.watch_omarchy(dir.to_path_buf());
+        app
+    }
+
+    #[test]
+    fn the_terminal_theme_takes_its_roles_from_omarchy() {
+        let vault = sample();
+        let dir = omarchy_dir("roles", GRUVBOX);
+        let app = terminal_app(&vault, &dir);
+
+        let p = &app.theme.palette;
+        assert_eq!(app.theme.name(), "terminal");
+        assert_eq!(p.accent, ratatui::style::Color::Rgb(0x7d, 0xae, 0xa3));
+        assert_ne!(p.code_bg, ratatui::style::Color::Reset, "a code panel");
+        assert_ne!(p.text_muted, ratatui::style::Color::Gray, "not ANSI 7");
+        assert_eq!(
+            p.bg_primary,
+            ratatui::style::Color::Reset,
+            "the page stays the terminal's"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_named_theme_ignores_omarchy() {
+        let vault = sample();
+        let dir = omarchy_dir("named", GRUVBOX);
+        let mut app = app(&vault);
+        app.set_theme("nord");
+        let before = app.theme.palette.clone();
+        app.watch_omarchy(dir.clone());
+        std::fs::write(dir.join("colors.toml"), LATTE).expect("switch");
+        assert!(
+            !app.check_omarchy(),
+            "a named theme has no business with Omarchy"
+        );
+        assert_eq!(app.theme.palette, before);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_theme_switch_recolours_a_running_terminal_theme() {
+        let vault = sample();
+        let dir = omarchy_dir("hot", GRUVBOX);
+        let mut app = terminal_app(&vault, &dir);
+        let gruvbox = app.theme.palette.clone();
+        assert!(!app.check_omarchy(), "nothing changed yet");
+
+        std::fs::write(dir.join("colors.toml"), LATTE).expect("switch");
+        assert!(app.check_omarchy(), "the switch is noticed");
+        let latte = app.theme.palette.clone();
+        assert_ne!(latte, gruvbox);
+        assert_eq!(latte.accent, ratatui::style::Color::Rgb(0x1e, 0x66, 0xf5));
+        assert!(!latte.dark);
+        assert!(!app.check_omarchy(), "and only once");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_half_written_file_keeps_the_last_palette_and_a_finished_one_replaces_it() {
+        let vault = sample();
+        let dir = omarchy_dir("torn", GRUVBOX);
+        let mut app = terminal_app(&vault, &dir);
+        let good = app.theme.palette.clone();
+
+        std::fs::write(dir.join("colors.toml"), "background = \"#00").expect("torn");
+        assert!(!app.check_omarchy());
+        assert_eq!(app.theme.palette, good, "kept");
+        assert!(!app.status.is_error, "one torn read is not worth a message");
+
+        std::fs::write(dir.join("colors.toml"), LATTE).expect("finished");
+        assert!(app.check_omarchy());
+        assert_ne!(app.theme.palette, good);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_file_that_stays_broken_is_said_once() {
+        let vault = sample();
+        let dir = omarchy_dir("broken", GRUVBOX);
+        let mut app = terminal_app(&vault, &dir);
+        let good = app.theme.palette.clone();
+
+        std::fs::write(dir.join("colors.toml"), "nonsense").expect("break");
+        assert!(!app.check_omarchy());
+        assert!(app.check_omarchy(), "the second look says so");
+        assert!(app.status.is_error);
+        assert!(app.status.text.contains("omarchy"), "{}", app.status.text);
+        assert_eq!(app.theme.palette, good);
+        assert!(!app.check_omarchy(), "but does not repeat itself");
+        assert!(!app.check_omarchy());
+        assert!(
+            !app.status.text.contains('\n'),
+            "a status line is one line: {:?}",
+            app.status.text
+        );
+
+        // Fixed again: the message that was about this goes away with it.
+        std::fs::write(dir.join("colors.toml"), LATTE).expect("fixed");
+        assert!(app.check_omarchy());
+        assert!(app.status.text.is_empty(), "{:?}", app.status.text);
+        assert!(!app.status.is_error);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_vanished_file_keeps_the_last_palette() {
+        let vault = sample();
+        let dir = omarchy_dir("gone", GRUVBOX);
+        let mut app = terminal_app(&vault, &dir);
+        let good = app.theme.palette.clone();
+
+        std::fs::remove_file(dir.join("colors.toml")).expect("remove");
+        assert!(!app.check_omarchy());
+        assert_eq!(app.theme.palette, good);
+        assert!(!app.status.is_error);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn without_omarchy_the_terminal_theme_is_plain_ansi() {
+        let vault = sample();
+        let mut app = app(&vault);
+        app.set_theme("terminal");
+        app.watch_omarchy(std::path::PathBuf::from("/nonexistent/emeraldian/omarchy"));
+        let plain = emeraldian_theme::presets::builtin_by_name("terminal").expect("terminal");
+        assert_eq!(app.theme.palette, emeraldian_theme::Palette::from(&plain));
+        assert!(!app.status.is_error, "a machine without Omarchy is normal");
+    }
+
+    #[test]
+    fn follow_omarchy_off_keeps_the_ansi_theme() {
+        let vault = sample();
+        let dir = omarchy_dir("off", GRUVBOX);
+        let mut app = app(&vault);
+        app.config.ui.follow_omarchy = false;
+        app.set_theme("terminal");
+        app.watch_omarchy(dir.clone());
+        let plain = emeraldian_theme::presets::builtin_by_name("terminal").expect("terminal");
+        assert_eq!(app.theme.palette, emeraldian_theme::Palette::from(&plain));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn picking_the_terminal_theme_later_uses_omarchys_colors_at_once() {
+        let vault = sample();
+        let dir = omarchy_dir("later", GRUVBOX);
+        let mut app = app(&vault);
+        app.set_theme("nord");
+        app.watch_omarchy(dir.clone());
+        app.set_theme("terminal");
+        assert_ne!(app.theme.palette.code_bg, ratatui::style::Color::Reset);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

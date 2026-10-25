@@ -46,14 +46,14 @@ Screenshots, attached to the card:
 | Heading folding | ❌ none | `handle_reading` in `keys.rs` has no fold key; no fold state in `note.rs` |
 | TOC / outline jump | ✅ outline panel; Enter jumps | moving 9 rows down + Enter landed on `Table` with `┌───────────┬…` at the top |
 | Frontmatter / properties | ⚠️ plain `key: value` lines + a 60-column rule; lists joined; no types, no hide option | `tags: projekt/emeraldian, lesen` |
-| Tags | ✅ inline chips | dark themes fine. On catppuccin-latte the chip is magenta `#ea76cb` on muted `#acb0be` = **1.22:1** contrast (computed) |
+| Tags | ✅ inline chips; fixed in R4 for the light-theme chip | was: on catppuccin-latte the chip was magenta `#ea76cb` on muted `#acb0be` = **1.22:1** contrast (computed). Now the chip text is derived against its chip and is at least 4.5:1 in all 24 Omarchy fixtures (`the_latte_tag_chip_is_readable`, `every_reading_view_pair_reaches_its_contrast`) |
 | Note embeds `![[note]]`, `![[note#heading]]`, `![[note#^id]]` | ❌ shown as a link only | `Other › Section` / `Other › ^blk7` / `Other`; deliberate, test `an_obsidian_embed_of_an_image_is_a_picture_but_of_a_note_is_not` |
 | Image / Excalidraw / Mermaid embeds | ✅ | the image is drawn with Kitty unicode placeholders (screen text is U+10EEEE cells), the braille drawing and the Mermaid boxes as cells |
 | Block references | ⚠️ the link renders and the trailing `^id` is hidden since R3b; following the link still does not scroll | was: `A block with an id. ^para1` visible |
 | Heading/block anchors when following a link in reading mode | ❌ the target opens at the top | `[[Other#Later]]` + Enter shows `Other` / `Intro paragraph…` at the top. `App::jump_to_anchor` returns unless nvim is editing; `follow_first_link` builds `LinkTarget::plain` |
 | Maths | ✅ inline and display, centred | `Inline E = mc² …`, `∫₀¹ x² dx = ─` with a stacked fraction |
 | Code highlighting | ⚠️ keyword highlighter for rust/python/js/ts/sh/go only; toml, yaml, lua and the rest are plain | `toml` block plain in all themes (shots) |
-| Code block panel | ❌ under Malte's `theme = "terminal"` | `code_bg = bg_alt = reset`, so code sits on the page background; vision and shots agree |
+| Code block panel | ✅ fixed in R4 for `theme = "terminal"` on Omarchy: code and callouts sit on a surface 8% / 6% toward the foreground | was: `code_bg = bg_alt = reset`, so code sat on the page background. Now `reading::tests::the_omarchy_palette_reaches_the_screen_and_follows_a_theme_switch`, shots `docs/reading-view/shots/r4-*.png` |
 | Copy a code block | ❌ no key; mouse capture is on (`main.rs:408`) | `handle_reading` has no copy action |
 | Link hover / preview popup | ❌ none | `handle_mouse` handles Down/Drag/Up/Scroll only; no popup code |
 | Backlink peek | ⚠️ backlinks panel with raw, ~30-column snippets, one row per occurrence | `Showcase` / `…==highlight==, \`inline cod…` repeated 4× |

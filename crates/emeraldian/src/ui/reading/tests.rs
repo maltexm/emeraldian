@@ -2,6 +2,7 @@ use super::embeds::MAX_EMBED_DEPTH;
 use super::*;
 use emeraldian_core::test_support::TempVault;
 use emeraldian_theme::{Palette, presets};
+use ratatui::style::Color;
 
 #[test]
 fn prose_wraps_in_a_centred_hundred_column_measure() {
@@ -1484,6 +1485,161 @@ fn callouts_render_with_a_colored_bar_and_title() {
     assert!(rendered[0].contains(icons::QUOTE_BAR));
     assert!(rendered[0].contains("Careful"));
     assert!(rendered.len() > 1, "the body renders too");
+}
+
+#[test]
+fn callouts_sit_on_a_panel_as_wide_as_the_block() {
+    let vault = TempVault::new("callout-panel");
+    let index = vault.index();
+    let palette = palette();
+    assert_ne!(palette.callout_bg, Color::Reset);
+
+    let document = markdown::parse(
+        "> [!warning] Careful\n> body #tag and `code`\n>\n> ```rust\n> let x = 1;\n> ```\n",
+    );
+    let lines = render_document(&document, &mut Ctx::text(&palette, &index), 40);
+
+    for line in &lines {
+        assert_eq!(line.width(), 40, "{:?}", line.to_string());
+        // The bar and everything after it is on the panel, unless a span
+        // brings a surface of its own (the tag chip, the code panel).
+        for span in line.spans.iter().skip(1) {
+            let own = [palette.tag_bg, palette.code_bg];
+            assert!(
+                span.style.bg == Some(palette.callout_bg)
+                    || span.style.bg.is_some_and(|bg| own.contains(&bg)),
+                "{:?} is on {:?}",
+                span.content,
+                span.style.bg
+            );
+        }
+    }
+    let chip = style_of(&lines, "#tag");
+    assert_eq!(
+        chip.bg,
+        Some(palette.tag_bg),
+        "the chip keeps its own surface"
+    );
+    let code = style_of(&lines, "let");
+    assert_eq!(code.bg, Some(palette.code_bg), "code keeps its own panel");
+}
+
+#[test]
+fn a_callout_has_no_panel_when_the_theme_gives_none() {
+    // `reset` is the terminal's own page: nothing to fill, so the rows stay
+    // as short as their text, as they were before callouts had a panel.
+    let vault = TempVault::new("callout-no-panel");
+    let index = vault.index();
+    let mut palette = palette();
+    palette.callout_bg = Color::Reset;
+
+    let document = markdown::parse("> [!warning] Careful\n> body\n");
+    let lines = render_document(&document, &mut Ctx::text(&palette, &index), 40);
+
+    assert!(lines.iter().all(|line| line.width() < 40));
+    assert!(
+        lines
+            .iter()
+            .flat_map(|line| &line.spans)
+            .all(|span| span.style.bg.is_none())
+    );
+}
+
+#[test]
+fn a_callout_in_a_list_does_not_widen_past_its_block() {
+    let vault = TempVault::new("callout-panel-nested");
+    let index = vault.index();
+    let palette = palette();
+    let document = markdown::parse("- item\n\n  > [!tip] Nested\n  > body\n");
+    let lines = render_document(&document, &mut Ctx::text(&palette, &index), 40);
+    assert!(lines.iter().all(|line| line.width() <= 40), "{lines:?}");
+}
+
+/// The screen as cells, for tests that look at colours rather than text.
+fn screen_buffer(app: &mut App) -> ratatui::buffer::Buffer {
+    let backend = ratatui::backend::TestBackend::new(200, 40);
+    let mut terminal = ratatui::Terminal::new(backend).expect("terminal");
+    terminal
+        .draw(|frame| crate::ui::draw(frame, app))
+        .expect("draw");
+    terminal.backend().buffer().clone()
+}
+
+/// The first cell of the first occurrence of `needle` (plain text) on screen.
+fn cell_of<'a>(buffer: &'a ratatui::buffer::Buffer, needle: &str) -> &'a ratatui::buffer::Cell {
+    let width = usize::from(buffer.area.width);
+    for row in buffer.content.chunks(width) {
+        let mut text = String::new();
+        let mut starts = Vec::new();
+        for cell in row {
+            starts.push(text.len());
+            text.push_str(cell.symbol());
+        }
+        if let Some(at) = text.find(needle)
+            && let Some(column) = starts.iter().position(|&start| start == at)
+        {
+            return &row[column];
+        }
+    }
+    panic!("no {needle:?} on screen");
+}
+
+const OMARCHY_GRUVBOX: &str =
+    include_str!("../../../../emeraldian-theme/tests/fixtures/omarchy/gruvbox.toml");
+const OMARCHY_LATTE: &str =
+    include_str!("../../../../emeraldian-theme/tests/fixtures/omarchy/catppuccin-latte.toml");
+
+#[test]
+fn the_omarchy_palette_reaches_the_screen_and_follows_a_theme_switch() {
+    let vault = TempVault::new("omarchy-screen");
+    vault.write(
+        "A.md",
+        "# Title\n\nplain words\n\n> quoted words\n\n> [!note] Panel\n> inside the callout\n\n```rust\nlet x = 1;\n```\n\n#chip\n",
+    );
+    let dir =
+        std::env::temp_dir().join(format!("emeraldian-omarchy-screen-{}", std::process::id()));
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::create_dir_all(&dir).expect("theme dir");
+    std::fs::write(dir.join("colors.toml"), OMARCHY_GRUVBOX).expect("colors.toml");
+
+    let mut app = open(&vault, "A.md");
+    app.set_theme("terminal");
+    app.watch_omarchy(dir.clone());
+
+    let before = screen_buffer(&mut app);
+    let p = app.theme.palette.clone();
+    assert_eq!(
+        cell_of(&before, "Title").fg,
+        p.h1,
+        "the heading hue is Omarchy's"
+    );
+    assert_eq!(cell_of(&before, "let").bg, p.code_bg, "the code panel");
+    assert_eq!(
+        cell_of(&before, "inside").bg,
+        p.callout_bg,
+        "the callout panel"
+    );
+    assert_eq!(cell_of(&before, "#chip").bg, p.tag_bg);
+    assert_ne!(p.code_bg, Color::Reset);
+    assert_ne!(
+        cell_of(&before, "quoted").fg,
+        cell_of(&before, "plain").fg,
+        "quoted text is muted, not body-coloured"
+    );
+
+    // Omarchy switches to a light theme while the app runs.
+    std::fs::write(dir.join("colors.toml"), OMARCHY_LATTE).expect("switch");
+    assert!(app.check_omarchy());
+    let after = screen_buffer(&mut app);
+    let q = app.theme.palette.clone();
+    assert_ne!(p, q);
+    assert_eq!(cell_of(&after, "Title").fg, q.h1);
+    assert_eq!(cell_of(&after, "let").bg, q.code_bg);
+    assert_ne!(cell_of(&after, "Title").fg, cell_of(&before, "Title").fg);
+    let chip = cell_of(&after, "#chip");
+    let ratio = emeraldian_theme::color::contrast(chip.fg, chip.bg).expect("true colours");
+    assert!(ratio >= 4.5, "the latte tag chip reads: {ratio:.2}:1");
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]

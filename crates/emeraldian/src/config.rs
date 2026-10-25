@@ -71,6 +71,11 @@ pub struct UiConfig {
     pub reading_mode: bool,
     /// Maximum reading prose width; zero uses the full pane.
     pub reading_width: u16,
+    /// With `theme = "terminal"`, take the roles (muted text, panels,
+    /// heading hues, accent) from the active Omarchy theme's `colors.toml`
+    /// and recolour when Omarchy switches theme. Off keeps the terminal's
+    /// plain ANSI colors. Has no effect on other themes, or without Omarchy.
+    pub follow_omarchy: bool,
     /// How the explorer orders notes within a folder. One of `modified`,
     /// `modified-asc`, `created`, `created-asc`, `name` or `name-desc`.
     ///
@@ -108,6 +113,7 @@ impl Default for UiConfig {
             line_numbers: true,
             reading_mode: true,
             reading_width: 100,
+            follow_omarchy: true,
             sort_order: SortOrder::default().key().to_string(),
             keyboard: "auto".into(),
         }
@@ -602,6 +608,14 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(agent.effort(), Effort::High);
+    }
+
+    #[test]
+    fn omarchy_following_is_on_unless_switched_off() {
+        let config: Config = toml::from_str("theme = \"terminal\"\n").expect("parse");
+        assert!(config.ui.follow_omarchy, "older files get the new default");
+        let off: Config = toml::from_str("[ui]\nfollow_omarchy = false\n").expect("parse");
+        assert!(!off.ui.follow_omarchy);
     }
 
     #[test]
