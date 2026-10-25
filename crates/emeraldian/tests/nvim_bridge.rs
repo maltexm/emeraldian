@@ -380,6 +380,157 @@ fn bridge_replays_expression_maps_as_nvim_would() {
     }
 }
 
+/// Runs the user script `script` (`name` says whether it is Lua or Vim script)
+/// before the bridge, opens `text` as a note and types `keys`. `{calls}` in the
+/// script is a file it counts its evaluations in. Returns the row the cursor
+/// ended on and that count.
+///
+/// A script that loops has to stop itself: every counting script here ends the
+/// loop at 3000 evaluations (the "fuse"), so a regression shows as a wrong
+/// count rather than a hang. `row_after` is the watchdog on top of that: it
+/// gives up after `LIMIT` and `Session` kills nvim when the test unwinds.
+fn keys_with_script(name: &str, script: &str, text: &str, keys: &str) -> Option<(u16, usize)> {
+    let vault = TempVault::new("nvim-bridge-script");
+    let note = vault.write("Loop.md", text);
+    let calls = vault.path().join("calls.txt");
+    let file = vault.write(
+        name,
+        &script.replace("{calls}", &calls.display().to_string()),
+    );
+    let command = format!(
+        "{} {}",
+        if name.ends_with(".lua") {
+            "luafile"
+        } else {
+            "source"
+        },
+        file.display()
+    );
+    let mut session = start_configured(vault.path(), &[&command])?;
+    session.open(&note).expect("open");
+    let (row, _) = row_after(&mut session, keys);
+    let count = std::fs::read_to_string(&calls)
+        .ok()
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0);
+    Some((row, count))
+}
+
+/// A remappable expression map whose result starts with its own key: nvim
+/// evaluates it once and then runs the key's default, whatever
+/// `maxmapdepth` says. The bridge must not turn that into a loop.
+#[test]
+fn bridge_expression_map_returning_its_own_key_runs_once() {
+    let lua = "vim.o.maxmapdepth = 50\n\
+        local calls = 0\n\
+        vim.keymap.set('n', '<CR>', function()\n\
+          calls = calls + 1\n\
+          vim.fn.writefile({ tostring(calls) }, '{calls}')\n\
+          if calls >= 3000 then return '' end\n\
+          return '<CR>'\n\
+        end, { expr = true, remap = true })\n";
+    let vim = "set maxmapdepth=50\n\
+        let g:calls = 0\n\
+        function! Bump()\n\
+          let g:calls += 1\n\
+          call writefile([g:calls], '{calls}')\n\
+          if g:calls >= 3000 | return '' | endif\n\
+          return \"\\<CR>\"\n\
+        endfunction\n\
+        nmap <expr> <CR> Bump()\n";
+    let cases = [
+        ("lua.lua", lua, "gg0<CR>", 1),
+        ("lua.lua", lua, "gg03<CR>", 3),
+        ("string.vim", vim, "gg0<CR>", 1),
+        ("string.vim", vim, "gg02<CR>", 2),
+        // Typed ahead, each press is its own evaluation and its own default.
+        ("lua.lua", lua, "gg0<CR><CR>", 2),
+        ("string.vim", vim, "gg0<CR><CR>", 2),
+    ];
+    for (name, script, keys, want_row) in cases {
+        let Some((row, calls)) = keys_with_script(name, script, FIVE_LINES, keys) else {
+            return;
+        };
+        assert_eq!(
+            calls,
+            keys.matches("<CR>").count(),
+            "{name} then {keys}: evaluations"
+        );
+        assert_eq!(row, want_row, "{name} then {keys}: the key's default ran");
+    }
+}
+
+/// A chain of maps that comes back to the key is cut by `maxmapdepth`, as it is
+/// without the bridge (E223), and the editor stays usable.
+#[test]
+fn bridge_cuts_a_chain_of_maps_that_returns_to_the_key() {
+    let lua = "vim.o.maxmapdepth = 50\n\
+        local calls = 0\n\
+        vim.keymap.set('n', 'gf', function()\n\
+          calls = calls + 1\n\
+          vim.fn.writefile({ tostring(calls) }, '{calls}')\n\
+          if calls >= 3000 then return '' end\n\
+          return 'x'\n\
+        end, { expr = true, remap = true })\n\
+        vim.keymap.set('n', 'x', 'gf', { remap = true })\n";
+    let Some((row, calls)) = keys_with_script("chain.lua", lua, THREE_LINES, "gg0gf") else {
+        return;
+    };
+    assert_eq!(row, 0, "nothing moved");
+    assert!(
+        (2..=60).contains(&calls),
+        "the chain ran {calls} times, maxmapdepth is 50"
+    );
+}
+
+/// The same for a plain string right-hand side, which starts with its own key
+/// (`nmap <CR> <CR>j`: the default, then `j`) or comes back to it.
+#[test]
+fn bridge_plain_map_returning_to_its_own_key_ends() {
+    let cases: [(&[&str], &str, u16, &str); 3] = [
+        (
+            &["nmap <CR> <CR>j"],
+            "gg0<CR>",
+            2,
+            "remappable, starts with the key",
+        ),
+        (
+            &["nnoremap <CR> <CR>j"],
+            "gg0<CR>",
+            2,
+            "noremap, starts with the key",
+        ),
+        (
+            &["set maxmapdepth=50", "nmap gf x", "nmap x gf"],
+            "gg0gf",
+            0,
+            "a chain back to the key",
+        ),
+    ];
+    for (config, keys, want, what) in cases {
+        let Some((row, _)) = keys_with_config(config, FIVE_LINES, keys) else {
+            return;
+        };
+        assert_eq!(row, want, "{what}: {config:?} then {keys}");
+    }
+}
+
+/// `<SID>` in a user's map means the script it was written in: an expression
+/// string that calls a script function, and a plain right-hand side that goes
+/// through a `<SID>` map.
+#[test]
+fn bridge_replays_maps_that_use_sid() {
+    let expr = "function! s:Last()\n  return 'G'\nendfunction\n\
+        nnoremap <expr> gf <SID>Last()\n";
+    let plain = "nnoremap <SID>last G\nnmap gf <SID>last\n";
+    for (script, what) in [(expr, "expression"), (plain, "plain")] {
+        let Some((row, _)) = keys_with_script("sid.vim", script, FIVE_LINES, "gg0gf") else {
+            return;
+        };
+        assert_eq!(row, 4, "{what}");
+    }
+}
+
 /// The two kinds of map that already worked still do: a Lua callback that is
 /// no expression, and a plain string for the right-hand side.
 #[test]

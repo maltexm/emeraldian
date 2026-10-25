@@ -311,28 +311,129 @@ local function kept_name(lhs)
   return "<Plug>(emeraldian-previous-" .. lhs:gsub("%W", "_") .. ")"
 end
 
+local function termcodes(keys)
+  return vim.api.nvim_replace_termcodes(keys, true, false, true)
+end
+
+-- A replay goes back through the typeahead, so what it produces can reach the
+-- bridge's own map again. For a map nvim expands itself that is bounded
+-- (`maxmapdepth`), and a result that starts with the map's own lhs is not
+-- remapped at that point. Every replay here is a fresh `nvim_feedkeys`, which
+-- resets both, so the bridge keeps the two rules itself:
+--   * `armed[lhs]`: the replay produced a remappable result that starts with
+--     `lhs`. The next run of the bridge's map for `lhs` is that leading `lhs`,
+--     which is not remapped: the key does its default.
+--   * `depth`: replays since nvim last looked for input. Past `maxmapdepth`
+--     the chain is cut with the error nvim gives for it (E223).
+-- Both are reset when the event loop runs again, i.e. once the keys are done.
+local replay = { depth = 0, armed = {} }
+local reset_pending = false
+
+local function reset_soon()
+  if reset_pending then
+    return
+  end
+  reset_pending = true
+  vim.schedule(function()
+    reset_pending = false
+    replay.depth = 0
+    replay.armed = {}
+  end)
+end
+
+--- Counts one replay; false (after saying why) once the chain is too deep.
+local function replay_allowed()
+  replay.depth = replay.depth + 1
+  reset_soon()
+  if replay.depth > vim.o.maxmapdepth then
+    vim.notify("E223: Recursive mapping", vim.log.levels.ERROR)
+    return false
+  end
+  return true
+end
+
+--- Notes what a replay for `lhs` produced (`keys`, as typed: keycodes
+--- translated): when it is remapped and starts with `lhs`, the bridge's map
+--- runs next for that leading `lhs`.
+local function note_replay_keys(lhs, remapped, keys)
+  if remapped and type(keys) == "string" and vim.startswith(keys, termcodes(lhs)) then
+    replay.armed[lhs] = true
+    reset_soon()
+  end
+end
+
+--- The key a kept expression string belongs to, by an id without `<...>`,
+--- which nvim would translate inside the string.
+local kept_keys = {}
+
+--- Called by a kept expression string (see `keep_expr_map`) with its result,
+--- which is passed on unchanged.
+function M.expr_result(id, remapped, result)
+  local lhs = kept_keys[id]
+  if lhs then
+    note_replay_keys(lhs, remapped == 1, type(result) == "string" and result or tostring(result))
+  end
+  return result
+end
+
 --- Keeps the user's expression map of `lhs` (`previous`, from `maparg`) under a
 --- private `<Plug>` name in `buf`. Its result cannot be had by calling it or
 --- evaluating its `rhs` here: whether keycodes in the result are translated,
 --- whether it is remapped, `v:count` and `silent` all belong to the map, and
---- nvim applies them to a map it runs itself. Sets `previous.kept` on success.
+--- nvim applies them to a map it runs itself. The result is only looked at on
+--- its way out, to arm the self-lhs rule above. Sets `previous.kept` on success.
 local function keep_expr_map(buf, lhs, previous)
-  local rhs = previous.rhs
-  local map_opts = {
-    expr = true,
-    noremap = previous.noremap == 1,
-    silent = previous.silent == 1,
-    nowait = previous.nowait == 1,
-    script = previous.script == 1,
-  }
+  local name = kept_name(lhs)
+  local remapped = previous.noremap ~= 1 and previous.script ~= 1
   if previous.callback then
-    rhs = ""
-    map_opts.callback = previous.callback
-    map_opts.replace_keycodes = previous.replace_keycodes == 1
-  elseif not rhs or rhs == "" then
-    return
+    local callback = previous.callback
+    local translated = previous.replace_keycodes == 1
+    previous.kept = pcall(vim.api.nvim_buf_set_keymap, buf, "n", name, "", {
+      expr = true,
+      noremap = previous.noremap == 1,
+      silent = previous.silent == 1,
+      nowait = previous.nowait == 1,
+      script = previous.script == 1,
+      replace_keycodes = translated,
+      callback = function()
+        local result = callback()
+        if translated and type(result) == "string" then
+          note_replay_keys(lhs, remapped, termcodes(result))
+        else
+          note_replay_keys(lhs, remapped, result)
+        end
+        return result
+      end,
+    })
+  elseif previous.rhs and previous.rhs ~= "" then
+    -- `mapset` brings the map's script id along, which `<SID>` in the
+    -- expression needs; `nvim_buf_set_keymap` has none.
+    local id = lhs:gsub("%W", "_")
+    kept_keys[id] = lhs
+    local copy = vim.tbl_extend("force", previous, {
+      mode = "n",
+      buffer = 1, -- the current buffer, as `previous` may be a global map
+      lhs = name,
+      lhsraw = termcodes(name),
+      rhs = string.format(
+        "v:lua.require'emeraldian'.expr_result('%s', %d, %s)",
+        id,
+        remapped and 1 or 0,
+        previous.rhs
+      ),
+    })
+    copy.lhsrawalt = nil
+    previous.kept = pcall(vim.api.nvim_buf_call, buf, function()
+      vim.fn.mapset(copy)
+    end)
   end
-  previous.kept = pcall(vim.api.nvim_buf_set_keymap, buf, "n", kept_name(lhs), rhs, map_opts)
+end
+
+--- `lhs` with no map and no link: its default, in front of what is typed ahead
+--- (`i`) so the key finishes before the keys that came after it.
+local function native_default(lhs)
+  local count = vim.v.count > 0 and tostring(vim.v.count) or ""
+  vim.api.nvim_feedkeys(count .. termcodes(lhs), "ni", false)
 end
 
 --- What `lhs` did before the bridge took it over: the user's own map if there
@@ -340,24 +441,43 @@ end
 local function fallback(lhs, previous)
   local count = vim.v.count > 0 and tostring(vim.v.count) or ""
   if previous and previous.kept then
+    if not replay_allowed() then
+      return
+    end
     -- The kept map is found by remapping; what it returns is remapped or not
     -- as the map itself says. "i": in front of what is typed ahead.
-    local keys = vim.api.nvim_replace_termcodes(kept_name(lhs), true, false, true)
-    return vim.api.nvim_feedkeys(count .. keys, "mi", false)
+    return vim.api.nvim_feedkeys(count .. termcodes(kept_name(lhs)), "mi", false)
   end
   if previous and previous.expr ~= 1 then
     if previous.callback then
       return previous.callback()
     elseif previous.rhs and previous.rhs ~= "" then
-      local keys = vim.api.nvim_replace_termcodes(previous.rhs, true, false, true)
-      local mode = previous.noremap == 1 and "ni" or "mi"
-      return vim.api.nvim_feedkeys(count .. keys, mode, false)
+      if not replay_allowed() then
+        return
+      end
+      local rhs = previous.rhs
+      if previous.sid and previous.sid > 0 then
+        rhs = rhs:gsub("<SID>", "<SNR>" .. previous.sid .. "_")
+      end
+      local keys = termcodes(rhs)
+      local remapped = previous.noremap ~= 1 and previous.script ~= 1
+      note_replay_keys(lhs, remapped, keys)
+      return vim.api.nvim_feedkeys(count .. keys, remapped and "mi" or "ni", false)
     end
   end
-  local keys = vim.api.nvim_replace_termcodes(lhs, true, false, true)
-  -- "i": in front of what is typed ahead, not behind it, so the key does its
-  -- default before the keys that came after it.
-  vim.api.nvim_feedkeys(count .. keys, "ni", false)
+  native_default(lhs)
+end
+
+--- The bridge's map for `lhs`.
+local function follow_or_fallback(lhs, previous)
+  if replay.armed[lhs] then
+    -- The leading `lhs` of a replay's result: not remapped, so its default.
+    replay.armed[lhs] = nil
+    return native_default(lhs)
+  end
+  if not M.follow() then
+    fallback(lhs, previous)
+  end
 end
 
 local function attach(buf)
@@ -377,9 +497,7 @@ local function attach(buf)
       keep_expr_map(buf, lhs, previous)
     end
     vim.keymap.set("n", lhs, function()
-      if not M.follow() then
-        fallback(lhs, previous)
-      end
+      follow_or_fallback(lhs, previous)
     end, { buffer = buf, silent = true, desc = "emeraldian: follow the link under the cursor" })
   end
   vim.keymap.set("n", "ZZ", function()
