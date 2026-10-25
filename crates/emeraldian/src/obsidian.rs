@@ -14,6 +14,7 @@
 //!    Markdown directly; the CLI is only used for the things that need the app
 //!    itself — listing the vaults it knows about, and opening a note in the GUI.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -42,29 +43,16 @@ impl std::fmt::Display for Error {
     }
 }
 
-/// Locations the CLI is installed to, in the order the docs describe them.
+/// Locations the CLI is installed to when it is not on `PATH`, in the order the
+/// docs describe them.
 ///
-/// The symlink Obsidian creates is the first hit; the in-bundle binary is the
-/// last resort, so a user who never enabled the setting still gets a working
-/// "open in Obsidian" on macOS.
-fn candidates() -> Vec<PathBuf> {
-    candidates_with(std::env::var_os("OBSIDIAN_CLI").map(PathBuf::from))
-}
-
-/// The same list, for a given override.
-///
-/// Taking the override rather than reading it here is what lets a test check
-/// the ordering without `set_var`. Writing to the environment from a test is
-/// undefined behaviour, not merely untidy: the harness runs tests on several
-/// threads, this module reads `OBSIDIAN_CLI` and `PATH`, and `setenv` may
-/// reallocate the block `getenv` is walking.
-fn candidates_with(explicit: Option<PathBuf>) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    if let Some(explicit) = explicit {
-        paths.push(explicit);
-    }
-    paths.push(PathBuf::from("/usr/local/bin/obsidian"));
-    paths.push(PathBuf::from("/opt/homebrew/bin/obsidian"));
+/// The in-bundle binary is the last resort, so a user who never enabled the
+/// setting still gets a working "open in Obsidian" on macOS.
+fn fallbacks() -> Vec<PathBuf> {
+    let mut paths = vec![
+        PathBuf::from("/usr/local/bin/obsidian"),
+        PathBuf::from("/opt/homebrew/bin/obsidian"),
+    ];
     if let Some(home) = dirs::home_dir() {
         paths.push(home.join(".local/bin/obsidian"));
     }
@@ -74,21 +62,54 @@ fn candidates_with(explicit: Option<PathBuf>) -> Vec<PathBuf> {
     paths
 }
 
-/// Finds the CLI, preferring anything already on `PATH`.
+/// Finds the CLI.
+///
+/// `OBSIDIAN_CLI` decides first. Every command the CLI runs launches an
+/// Obsidian window when none is open, so tests and scripted runs need a way to
+/// guarantee that never happens: `off` (or an empty value) means "no CLI", and
+/// a path means "exactly this binary". Only when the variable is unset does the
+/// search go on to `PATH` and the usual install locations.
 #[must_use]
 pub fn locate() -> Option<PathBuf> {
-    // `PATH` first: if the user enabled the setting, that symlink is the one
-    // matching their installed app version.
-    if let Some(found) = on_path("obsidian") {
-        return Some(found);
-    }
-    candidates().into_iter().find(|p| is_executable(p))
+    locate_with(
+        std::env::var_os("OBSIDIAN_CLI").as_deref(),
+        std::env::var_os("PATH").as_deref(),
+    )
 }
 
-/// Searches `PATH` for an executable, the way a shell would.
-fn on_path(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
+/// [`locate`] for a given `OBSIDIAN_CLI` and `PATH`.
+///
+/// Taking them rather than reading them here is what lets a test check the
+/// ordering without `set_var`. Writing to the environment from a test is
+/// undefined behaviour, not merely untidy: the harness runs tests on several
+/// threads, this module reads `OBSIDIAN_CLI` and `PATH`, and `setenv` may
+/// reallocate the block `getenv` is walking.
+fn locate_with(explicit: Option<&OsStr>, path: Option<&OsStr>) -> Option<PathBuf> {
+    if let Some(explicit) = explicit {
+        // An override that doesn't resolve is an answer, not a reason to keep
+        // looking: falling through to `PATH` would reach the very binary the
+        // override was set to avoid.
+        if is_disabled(explicit) {
+            return None;
+        }
+        return Some(PathBuf::from(explicit)).filter(|p| is_executable(p));
+    }
+    // `PATH` before the guesses: if the user enabled the setting, that symlink
+    // is the one matching their installed app version.
+    path.and_then(|path| on_path("obsidian", path))
+        .or_else(|| fallbacks().into_iter().find(|p| is_executable(p)))
+}
+
+/// Whether an `OBSIDIAN_CLI` value switches the CLI off.
+fn is_disabled(value: &OsStr) -> bool {
+    let value = value.to_string_lossy();
+    let value = value.trim();
+    value.is_empty() || value.eq_ignore_ascii_case("off")
+}
+
+/// Searches a `PATH` value for an executable, the way a shell would.
+fn on_path(name: &str, path: &OsStr) -> Option<PathBuf> {
+    std::env::split_paths(path)
         .map(|dir| dir.join(name))
         .find(|candidate| is_executable(candidate))
 }
@@ -111,7 +132,12 @@ fn is_executable(path: &Path) -> bool {
 /// `obsidian <command> key=value`, and mirroring it keeps the slash command
 /// honest about what it is really doing.
 pub fn run(args: &[String]) -> Result<String, Error> {
-    let binary = locate().ok_or(Error::NotInstalled)?;
+    run_binary(locate(), args)
+}
+
+/// [`run`] against an already-located binary; `None` spawns nothing.
+fn run_binary(binary: Option<PathBuf>, args: &[String]) -> Result<String, Error> {
+    let binary = binary.ok_or(Error::NotInstalled)?;
     let output = Command::new(&binary)
         .args(args)
         .output()
@@ -205,10 +231,40 @@ mod tests {
         assert!(err.to_string().contains("app is not running"));
     }
 
+    /// A directory holding an executable named `name`, removed on drop.
+    struct Fixture(PathBuf);
+
+    impl Fixture {
+        fn new(tag: &str, name: &str, body: &str) -> Self {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir()
+                .join(format!("emeraldian-obsidian-{tag}-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("mkdir");
+            let file = dir.join(name);
+            std::fs::write(&file, body).expect("write");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+            Self(dir)
+        }
+
+        fn dir(&self) -> &Path {
+            &self.0
+        }
+
+        fn bin(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
-    fn the_bundled_binary_is_the_last_candidate() {
-        let candidates = candidates();
-        let last = candidates.last().expect("candidates are never empty");
+    fn the_bundled_binary_is_the_last_fallback() {
+        let fallbacks = fallbacks();
+        let last = fallbacks.last().expect("fallbacks are never empty");
         assert!(
             last.ends_with("obsidian-cli"),
             "the in-bundle binary is a fallback, not a preference: {last:?}"
@@ -216,17 +272,68 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_override_wins() {
-        // `OBSIDIAN_CLI` is the escape hatch for an install the search doesn't
-        // know about, so it has to be tried before any of the guesses.
-        let explicit = PathBuf::from("/tmp/obsidian-test-binary");
-        let candidates = candidates_with(Some(explicit.clone()));
-        assert_eq!(candidates[0], explicit);
-        assert_eq!(
-            candidates.len(),
-            candidates_with(None).len() + 1,
-            "the override is added to the usual list, not a replacement for it"
+    fn an_explicit_override_beats_path() {
+        // `OBSIDIAN_CLI` is the escape hatch, so it has to beat a binary that
+        // is already on `PATH`, not merely be tried after it.
+        let on_path = Fixture::new("beats-path-a", "obsidian", "#!/bin/sh\n");
+        let chosen = Fixture::new("beats-path-b", "stub", "#!/bin/sh\n");
+        let found = locate_with(
+            Some(chosen.bin("stub").as_os_str()),
+            Some(on_path.dir().as_os_str()),
         );
+        assert_eq!(found, Some(chosen.bin("stub")));
+    }
+
+    #[test]
+    fn an_unresolvable_override_does_not_fall_back_to_path() {
+        // Falling through would reach the real binary the override was set to
+        // avoid.
+        let on_path = Fixture::new("no-fallthrough", "obsidian", "#!/bin/sh\n");
+        let found = locate_with(
+            Some(OsStr::new("/nonexistent/obsidian-stub")),
+            Some(on_path.dir().as_os_str()),
+        );
+        assert_eq!(found, None);
+    }
+
+    #[test]
+    fn without_an_override_path_is_searched() {
+        let on_path = Fixture::new("path-search", "obsidian", "#!/bin/sh\n");
+        let found = locate_with(None, Some(on_path.dir().as_os_str()));
+        assert_eq!(found, Some(on_path.bin("obsidian")));
+    }
+
+    #[test]
+    fn off_and_empty_disable_the_cli_even_with_one_on_path() {
+        let on_path = Fixture::new("off-locate", "obsidian", "#!/bin/sh\n");
+        for value in ["off", "OFF", "", "  "] {
+            assert_eq!(
+                locate_with(Some(OsStr::new(value)), Some(on_path.dir().as_os_str())),
+                None,
+                "OBSIDIAN_CLI={value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn off_never_spawns() {
+        // The binary on `PATH` leaves a marker if it is ever executed.
+        let marker = std::env::temp_dir().join(format!(
+            "emeraldian-obsidian-spawned-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&marker);
+        let on_path = Fixture::new(
+            "off-spawn",
+            "obsidian",
+            &format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        );
+
+        let located = locate_with(Some(OsStr::new("off")), Some(on_path.dir().as_os_str()));
+        let result = run_binary(located, &["vaults".to_string()]);
+
+        assert_eq!(result, Err(Error::NotInstalled));
+        assert!(!marker.exists(), "the stub was executed");
     }
 
     #[test]
