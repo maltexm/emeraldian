@@ -427,6 +427,10 @@ fn run(app: &mut App) -> io::Result<()> {
 
     let result = event_loop(&mut terminal, app);
 
+    // Before the terminal is given back, so a slow nvim shows nothing odd, and
+    // before the config is saved, which does not depend on it.
+    nvim::shutdown(app);
+
     if enhanced {
         let _ = crossterm::execute!(
             std::io::stdout(),
@@ -457,6 +461,9 @@ fn run(app: &mut App) -> io::Result<()> {
 fn cursor_style(app: &App) -> Option<crossterm::cursor::SetCursorStyle> {
     use crossterm::cursor::SetCursorStyle;
 
+    if let Some(style) = nvim::cursor_style(app) {
+        return Some(style);
+    }
     if !app.config.editor.vim || !app.editing() || app.focus != app::Focus::Note {
         return None;
     }
@@ -515,7 +522,7 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Res
             tty::ensure_stdin_raw();
         }
 
-        if event::poll(TICK)? {
+        if event::poll(nvim::poll_timeout(app, TICK))? {
             match event::read()? {
                 Event::Key(key) => {
                     keys::handle(app, key);
@@ -533,6 +540,12 @@ fn event_loop(terminal: &mut ratatui::DefaultTerminal, app: &mut App) -> io::Res
         }
 
         if agent::poll(app) {
+            needs_redraw = true;
+        }
+
+        // Whatever nvim drew since the last turn, and starting it or pointing
+        // it at another note when the tab changed.
+        if nvim::poll(app) {
             needs_redraw = true;
         }
 
@@ -576,6 +589,12 @@ fn handle_mouse(app: &mut App, mouse: crossterm::event::MouseEvent) -> bool {
     use crossterm::event::{MouseButton, MouseEventKind};
 
     let point = (mouse.column, mouse.row);
+
+    // Inside the nvim pane the mouse is nvim's. An overlay still gets the
+    // first click, which only dismisses it.
+    if app.modal.is_none() && nvim::handle_mouse(app, mouse) {
+        return true;
+    }
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {

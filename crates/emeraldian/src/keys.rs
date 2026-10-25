@@ -52,6 +52,12 @@ pub fn handle(app: &mut App, key: KeyEvent) {
     // A message from the last action is stale as soon as the user acts again.
     app.status.text.clear();
 
+    // While nvim edits the note it gets every key except the few emeraldian
+    // keeps for itself, and before the shortcuts below could claim any.
+    if crate::nvim::handle_key(app, key) {
+        return;
+    }
+
     // With the Kitty protocol a terminal tells these apart from the keys they
     // were always sent as, and nothing here wants the difference: `Ctrl+[` is
     // Escape to everyone who types it, and `Ctrl+M` is Enter.
@@ -868,6 +874,10 @@ fn handle_editing(app: &mut App, key: KeyEvent) {
 /// message, and a pasted `d` from running as a vim command.
 pub fn paste(app: &mut App, text: &str) {
     app.status.text.clear();
+    // nvim has its own paste handling and wants the text as it came.
+    if crate::nvim::handle_paste(app, text) {
+        return;
+    }
     let text = crate::clipboard::normalize(text);
 
     let typing_field = matches!(app.modal, Some(Modal::Picker(_) | Modal::Prompt(_)))

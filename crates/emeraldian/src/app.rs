@@ -347,6 +347,9 @@ pub struct Regions {
     /// Wrapping means the cursor's position depends on how wide the text was
     /// drawn, so keys that move between rows read this too, not just the mouse.
     pub editor: Option<(Rect, usize)>,
+    /// The area the embedded Neovim's grid is drawn into, which is also the
+    /// size nvim is told its screen has.
+    pub nvim: Option<Rect>,
     /// Which rendered row each block of the reading pane started on, as
     /// `(source line, row)`, so the outline can scroll to a heading.
     pub anchors: Vec<(usize, usize)>,
@@ -444,6 +447,14 @@ pub struct App {
     /// so leaving it puts back exactly what was there, and saving settings
     /// while in it doesn't save an empty layout.
     pub focus_mode: bool,
+    /// The embedded Neovim, started the first time a note is edited with
+    /// `[editor] backend = "nvim"`. One per app; every tab being edited is one
+    /// of its buffers.
+    pub nvim: Option<crate::nvim::session::Session>,
+    /// Neovim could not be started, so the built-in editor is used instead.
+    /// Kept for the rest of the run: trying again on every frame would block
+    /// the loop on a program that is not there.
+    pub nvim_failed: bool,
     pub quit: bool,
 }
 
@@ -496,6 +507,8 @@ impl App {
             keymap: crate::keymap::Keymap::new(&config.keys),
             config_dir: None,
             focus_mode: false,
+            nvim: None,
+            nvim_failed: false,
             quit: false,
             theme: ActiveTheme::new(theme),
             themes,
@@ -636,6 +649,16 @@ impl App {
     #[must_use]
     pub fn editing(&self) -> bool {
         self.active().is_some_and(|tab| tab.mode == Mode::Editing)
+    }
+
+    /// Whether the open note is being edited in the embedded Neovim rather
+    /// than in the built-in editor.
+    #[must_use]
+    pub fn nvim_editing(&self) -> bool {
+        self.config.editor.backend == crate::config::EditorBackend::Nvim
+            && !self.nvim_failed
+            && self.view == View::Notes
+            && self.editing()
     }
 
     #[must_use]

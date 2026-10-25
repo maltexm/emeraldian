@@ -1418,6 +1418,20 @@ fn capitalize(text: &str) -> String {
 // Editing mode
 // ---------------------------------------------------------------------------
 
+/// Paints the embedded Neovim's grid into the note pane.
+///
+/// The area is recorded for the session to size its screen to. Until the
+/// session exists, and in the one frame before its first redraw, the pane is
+/// just the theme's background.
+fn draw_nvim(frame: &mut Frame, app: &App, palette: &Palette, area: Rect, regions: &mut Regions) {
+    regions.nvim = Some(area);
+    let Some(session) = app.nvim.as_ref() else {
+        return;
+    };
+    let focused = app.focus == crate::app::Focus::Note;
+    crate::nvim::render::draw(frame, area, session.grid(), palette, focused);
+}
+
 fn draw_editing(
     frame: &mut Frame,
     app: &mut App,
@@ -1426,6 +1440,13 @@ fn draw_editing(
     gutter: u16,
     regions: &mut Regions,
 ) {
+    // The embedded Neovim draws its own line numbers, wrapping and scrollbar
+    // into the whole pane, so none of the built-in editor's layout applies.
+    if app.nvim_editing() {
+        draw_nvim(frame, app, palette, area, regions);
+        return;
+    }
+
     let wrap = app.config.editor.wrap;
     // A caret in an unfocused pane claims input that would go somewhere else.
     let focused = app.focus == crate::app::Focus::Note;
