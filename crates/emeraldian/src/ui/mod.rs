@@ -360,6 +360,7 @@ fn hints_for(app: &App) -> &'static [(&'static str, &'static str)] {
                 // looks for the way back to the explorer.
                 _ => &[
                     ("^E", "edit"),
+                    ("]/[", "links"),
                     ("F4", "vim"),
                     ("Enter", "follow link"),
                     ("Tab", "panes"),

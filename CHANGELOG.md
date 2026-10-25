@@ -14,7 +14,9 @@ All notable changes to this project are documented here. The format follows
   default and the fallback). Key policy: everything goes to nvim except
   `Ctrl+Q`, `Ctrl+E`, `F1`/`F2`/`F3`/`F5`/`F8`, `Alt+←/→` and the tab keys.
   `<CR>`, `gf` and `Ctrl+]` follow wikilinks and relative Markdown links
-  (with heading and block anchors), saving re-indexes the note, `:q` returns to
+  (with heading and block anchors), and `]` / `[` jump to the next and previous
+  link (Normal mode, count, wrap; a map you already have on those keys is kept).
+  Saving re-indexes the note, `:q` returns to
   the reading view, and `:Emeraldian <action>` reaches the switcher, search,
   graph, assistant, explorer and sidebars from nvim maps. The assistant reads
   the unsaved buffer and its write tools refuse a note with unsaved edits. A

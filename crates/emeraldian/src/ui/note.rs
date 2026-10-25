@@ -21,7 +21,7 @@ use emeraldian_core::index::VaultIndex;
 use emeraldian_core::markdown::{self, Align, Block, BlockKind, Marker, SpanKind, Table};
 use emeraldian_theme::Palette;
 
-use crate::app::{App, Mode, Regions};
+use crate::app::{App, Mode, Regions, Reveal};
 use crate::editor::{Cursor, Row};
 use crate::images::{self, Images};
 use crate::ui::{drawing, icons, math, mermaid, scrollbar, truncate};
@@ -478,6 +478,18 @@ fn draw_reading(
         .take(height)
         .cloned()
         .collect();
+    let mut visible = visible;
+    // `]`/`[` pick one link. Mark that row so Enter's target is visible. The
+    // scroll that brings it on screen happens in the key handler, not here:
+    // this runs every frame, and moving the scroll here would snap the view
+    // back the moment `j`/`k` left the selection.
+    if let Some(row) = selected_link_row(app, id)
+        && row >= scroll
+        && row < scroll + height
+        && let Some(line) = visible.get_mut(row - scroll)
+    {
+        mark_selected_link(line, palette);
+    }
     Paragraph::new(visible)
         .scroll((0, u16::try_from(hscroll).unwrap_or(u16::MAX)))
         .render(area, frame.buffer_mut());
@@ -595,6 +607,40 @@ pub fn render_document(
         render_block(block, ctx, width, 0, &mut lines);
     }
     lines
+}
+
+/// The rendered row of the link `]`/`[` picked, if one is picked and still
+/// exists. File line is body-relative plus the frontmatter offset, matching
+/// the anchors `render_document` records.
+fn selected_link_row(app: &App, id: usize) -> Option<usize> {
+    let idx = app.active()?.selected_link?;
+    let reveal = Reveal::for_link(app.index.note(id)?, idx)?;
+    let start = anchor_row(&app.reading.anchors, reveal.line);
+    Some(
+        row_showing(
+            &app.reading.lines,
+            &app.reading.anchors,
+            start,
+            &reveal.text,
+            reveal.nth,
+        )
+        .unwrap_or(start),
+    )
+}
+
+/// Paints the picked link's row with the theme accent and a star, so the
+/// selection is visible without reading colors.
+fn mark_selected_link(line: &mut Line<'_>, palette: &Palette) {
+    let mark = Style::default()
+        .fg(palette.text_on_accent)
+        .bg(palette.accent);
+    if let Some(first) = line.spans.first_mut() {
+        first.content = format!("★ {}", first.content).into();
+        first.style = mark;
+    }
+    for span in line.spans.iter_mut().skip(1) {
+        span.style = span.style.bg(palette.accent).fg(palette.text_on_accent);
+    }
 }
 
 /// The rendered row a source line was drawn on.
@@ -2176,6 +2222,65 @@ mod tests {
         vault.write("A.md", "the second version\n");
         app.index.refresh_note(id).expect("refresh");
         assert!(screen(&mut app).contains("the second version"));
+    }
+
+    /// `]`/`[` pick a link; the reading view must mark that one, not the first.
+    #[test]
+    fn the_selected_link_is_marked_on_its_row() {
+        let vault = TempVault::new("highlight-link");
+        vault.write("X.md", "# X\n\n[[Alpha]]\n\n[[Beta]]\n\n[[Gamma]]\n");
+        let mut app = App::new(vault.vault(), crate::config::Config::default()).expect("app");
+        let id = app.index.id_of_rel("X.md").expect("indexed");
+        app.open_note(id);
+        app.active_mut().unwrap().selected_link = Some(1);
+
+        let rows = screen_rows(&mut app);
+        let beta = rows
+            .iter()
+            .find(|r| r.contains("Beta"))
+            .expect("Beta on screen");
+        assert!(
+            beta.contains('★'),
+            "second link's row should be marked, got: {beta}"
+        );
+        let alpha = rows
+            .iter()
+            .find(|r| r.contains("Alpha"))
+            .expect("Alpha on screen");
+        assert!(!alpha.contains('★'), "first link unmarked, got: {alpha}");
+        let gamma = rows
+            .iter()
+            .find(|r| r.contains("Gamma"))
+            .expect("Gamma on screen");
+        assert!(!gamma.contains('★'), "third link unmarked, got: {gamma}");
+    }
+
+    /// Scrolling away from a selected link must stay scrolled away. The mark
+    /// follows the link back into view on the next `]`/`[`, not on a redraw.
+    #[test]
+    fn scrolling_away_from_a_selected_link_stays_away() {
+        let vault = TempVault::new("scroll-away");
+        let body = (0..200)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        vault.write("X.md", &format!("# X\n\n[[Alpha]]\n\n{body}\n"));
+        let mut app = App::new(vault.vault(), crate::config::Config::default()).expect("app");
+        let id = app.index.id_of_rel("X.md").expect("indexed");
+        app.open_note(id);
+        app.active_mut().unwrap().selected_link = Some(0);
+
+        let _ = screen_rows(&mut app);
+        let brought = app.active().unwrap().scroll;
+        app.active_mut().unwrap().scroll = brought + 12;
+        let away = app.active().unwrap().scroll;
+
+        let _ = screen_rows(&mut app);
+        assert_eq!(
+            app.active().unwrap().scroll,
+            away,
+            "a redraw must not snap the scroll back to the selected link"
+        );
     }
 
     /// What is on screen after drawing the app at a fixed size, one string per

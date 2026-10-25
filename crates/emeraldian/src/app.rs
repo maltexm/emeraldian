@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use ratatui::layout::Rect;
 
 use emeraldian_core::graph::{Graph, GraphOptions, Simulation, Vec2};
-use emeraldian_core::index::{NoteId, VaultIndex};
+use emeraldian_core::index::{IndexedNote, NoteId, VaultIndex};
 use emeraldian_core::vault::{ScanOptions, Vault};
 use emeraldian_theme::{ActiveTheme, presets};
 
@@ -89,6 +89,9 @@ pub struct Tab {
     pub hscroll: usize,
     /// Built lazily, the first time the tab is edited.
     pub editor: Option<Editor>,
+    /// Index into the note's links of the one the reading view has selected
+    /// for `Enter`; `None` until the user picks one.
+    pub selected_link: Option<usize>,
 }
 
 impl Tab {
@@ -416,6 +419,28 @@ pub struct Reveal {
     /// paragraph or a code block can show the same words several times, and
     /// it is the one picked that should come into view.
     pub nth: usize,
+}
+
+impl Reveal {
+    /// The reveal for the `idx`-th link of `note`: where `]`/`[` picked it.
+    /// `None` when the note has no such link.
+    #[must_use]
+    pub fn for_link(note: &IndexedNote, idx: usize) -> Option<Self> {
+        let link = note.links.get(idx)?;
+        let text = link.display().to_string();
+        // Same text earlier in this block is another link, not this one.
+        let nth = note
+            .links
+            .iter()
+            .take(idx)
+            .filter(|earlier| earlier.raw.line == link.raw.line && earlier.display() == text)
+            .count();
+        Some(Self {
+            line: note.body_offset + link.raw.line,
+            text,
+            nth,
+        })
+    }
 }
 
 pub struct App {
@@ -840,6 +865,7 @@ impl App {
                 scroll: 0,
                 hscroll: 0,
                 editor: None,
+                selected_link: None,
             });
             self.active_tab = Some(self.tabs.len() - 1);
         }
@@ -1206,7 +1232,11 @@ impl App {
             if snapshot.active == Some(position) {
                 active = Some(tabs.len());
             }
-            tabs.push(Tab { note: id, ..tab });
+            tabs.push(Tab {
+                note: id,
+                selected_link: None,
+                ..tab
+            });
         }
         self.active_tab = active.or(if tabs.is_empty() { None } else { Some(0) });
         self.tabs = tabs;

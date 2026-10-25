@@ -9,7 +9,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::actions::{self, dispatch};
 use crate::agent;
-use crate::app::{Action, App, Focus, Mode, View};
+use crate::app::{Action, App, Focus, Mode, Reveal, View};
 use crate::modal::{Modal, PickerKind, Prompt, PromptIntent};
 use crate::nvim::bridge::LinkTarget;
 use crate::ui::panes::{SidebarTarget, sidebar_targets};
@@ -692,12 +692,89 @@ fn handle_reading(app: &mut App, key: KeyEvent) {
             }
         }
         KeyCode::Char('G') | KeyCode::End => step(app, 100_000),
+        // Walking the links of the note, the reading-mode equivalent of
+        // tabbing between them; `Enter` then follows the one picked here.
+        KeyCode::Char(']') => cycle_selected_link(app, 1),
+        KeyCode::Char('[') => cycle_selected_link(app, -1),
         // Following the first link on the page is the reading-mode equivalent
-        // of clicking one.
-        KeyCode::Enter => follow_first_link(app),
+        // of clicking one; the link picked with `]`/`[` wins when there is one.
+        KeyCode::Enter => follow_selected_link(app),
         KeyCode::Char('?') => dispatch(app, Action::OpenHelp),
         KeyCode::Char('q') => dispatch(app, Action::Quit),
         _ => {}
+    }
+}
+
+/// Moves the reading-mode link selection `delta` links through the note,
+/// wrapping at both ends. The first press picks the end the key walks from:
+/// `]` starts on the first link, `[` on the last.
+fn cycle_selected_link(app: &mut App, delta: isize) {
+    let Some(id) = app.active_note() else { return };
+    let Some(note) = app.index.note(id) else {
+        return;
+    };
+    let count = note.links.len();
+    if count == 0 {
+        return;
+    }
+    let current = app.active().and_then(|tab| tab.selected_link);
+    let next = match current {
+        None if delta > 0 => 0,
+        None => count - 1,
+        Some(i) => (i as isize + delta).rem_euclid(count as isize) as usize,
+    };
+    // The reading view brings the picked row on screen once, on the next
+    // frame, from the layout it has just drawn. Doing it in the draw pass
+    // every frame would pull the view back after a plain `j`/`k`.
+    let reveal = Reveal::for_link(note, next);
+    if let Some(tab) = app.active_mut() {
+        tab.selected_link = Some(next);
+    }
+    app.reveal = reveal;
+}
+
+/// Follows the link the reading view has selected; with nothing selected (or a
+/// selection the note has outgrown) it follows the first link, as before.
+fn follow_selected_link(app: &mut App) {
+    let Some(id) = app.active_note() else { return };
+    let selected = app.active().and_then(|tab| tab.selected_link);
+    let Some(link) = app
+        .index
+        .note(id)
+        .and_then(|note| selected.and_then(|i| note.links.get(i)))
+    else {
+        follow_first_link(app);
+        return;
+    };
+
+    /// What `Enter` does with the link it picked.
+    enum Pick {
+        Go(String),
+        Stay { what: String, kind: &'static str },
+    }
+
+    let pick = match &link.target {
+        emeraldian_core::index::LinkTarget::Note(target) => app
+            .index
+            .note(*target)
+            .map(|n| Pick::Go(n.meta.rel.clone())),
+        emeraldian_core::index::LinkTarget::Unresolved(name) => Some(Pick::Go(name.clone())),
+        emeraldian_core::index::LinkTarget::External(url) => Some(Pick::Stay {
+            what: url.clone(),
+            kind: "external link",
+        }),
+        emeraldian_core::index::LinkTarget::Attachment(path) => Some(Pick::Stay {
+            what: path.clone(),
+            kind: "attachment",
+        }),
+    };
+    // `link` borrowed the index; everything is owned now, so dispatch is free.
+
+    match pick {
+        Some(Pick::Go(name)) => dispatch(app, Action::FollowLink(LinkTarget::plain(name))),
+        Some(Pick::Stay { what, kind }) => app.info(format!("{kind}: {what}")),
+        // The target's index entry went away between reading and following.
+        None => follow_first_link(app),
     }
 }
 
@@ -1356,6 +1433,155 @@ mod tests {
         handle(&mut app, key(KeyCode::Char('k')));
         handle(&mut app, key(KeyCode::Char('k')));
         assert_eq!(app.active().unwrap().scroll, 0, "must not go negative");
+    }
+
+    #[test]
+    fn bracket_keys_cycle_the_selected_link() {
+        let vault = TempVault::new("links");
+        vault.write("X.md", "# X\n\n[[A]]\n\ntext [[B]] more\n\n[[C]]\n");
+        let mut app = App::new(vault.vault(), Config::default()).expect("app");
+        let x = app.index.id_of_rel("X.md").unwrap();
+        app.open_note(x);
+
+        // Nothing selected yet: `]` selects the first link.
+        handle(&mut app, key(KeyCode::Char(']')));
+        assert_eq!(app.active().unwrap().selected_link, Some(0));
+
+        handle(&mut app, key(KeyCode::Char(']')));
+        assert_eq!(app.active().unwrap().selected_link, Some(1));
+
+        handle(&mut app, key(KeyCode::Char(']')));
+        assert_eq!(app.active().unwrap().selected_link, Some(2));
+
+        // Wraps around at the end.
+        handle(&mut app, key(KeyCode::Char(']')));
+        assert_eq!(app.active().unwrap().selected_link, Some(0));
+
+        // `[` walks backwards, also wrapping.
+        handle(&mut app, key(KeyCode::Char('[')));
+        assert_eq!(app.active().unwrap().selected_link, Some(2));
+        handle(&mut app, key(KeyCode::Char('[')));
+        assert_eq!(app.active().unwrap().selected_link, Some(1));
+    }
+
+    #[test]
+    fn selecting_a_link_queues_a_reveal_for_the_reading_view() {
+        let vault = TempVault::new("reveal-link");
+        vault.write("X.md", "# X\n\n[[A]]\n\ntext [[B]] more\n");
+        let mut app = App::new(vault.vault(), Config::default()).expect("app");
+        let x = app.index.id_of_rel("X.md").unwrap();
+        app.open_note(x);
+
+        handle(&mut app, key(KeyCode::Char(']')));
+        handle(&mut app, key(KeyCode::Char(']')));
+
+        let reveal = app.reveal.clone().expect("a reveal is queued");
+        assert_eq!(reveal.text, "B", "the picked link's text");
+        assert_eq!(reveal.line, 4, "the source line it is on");
+    }
+
+    #[test]
+    fn enter_follows_the_selected_link() {
+        let vault = TempVault::new("follow");
+        vault.write("X.md", "# X\n\n[[A]]\n\n[[B]]\n");
+        vault.write("A.md", "# A\n");
+        vault.write("B.md", "# B\n");
+        let mut app = App::new(vault.vault(), Config::default()).expect("app");
+        let x = app.index.id_of_rel("X.md").unwrap();
+        let a = app.index.id_of_rel("A.md").unwrap();
+        let b = app.index.id_of_rel("B.md").unwrap();
+        app.open_note(x);
+
+        // Nothing selected yet: Enter keeps its old first-link behaviour.
+        handle(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            app.active().unwrap().note,
+            a,
+            "Enter with no selection follows the first link"
+        );
+
+        // Pick the second link and follow that one instead.
+        app.open_note(x);
+        handle(&mut app, key(KeyCode::Char(']')));
+        handle(&mut app, key(KeyCode::Char(']')));
+        handle(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            app.active().unwrap().note,
+            b,
+            "Enter follows the selected link"
+        );
+    }
+
+    #[test]
+    fn enter_reports_an_external_link_instead_of_following_it() {
+        let vault = TempVault::new("external");
+        vault.write("X.md", "# X\n\n[[A]]\n\n[ext](https://example.com)\n");
+        vault.write("A.md", "# A\n");
+        let mut app = App::new(vault.vault(), Config::default()).expect("app");
+        let x = app.index.id_of_rel("X.md").unwrap();
+        app.open_note(x);
+
+        handle(&mut app, key(KeyCode::Char(']'))); // first: [[A]]
+        handle(&mut app, key(KeyCode::Char(']'))); // second: external
+
+        handle(&mut app, key(KeyCode::Enter));
+
+        assert_eq!(
+            app.active().unwrap().note,
+            x,
+            "still on X — did not follow the external link"
+        );
+        assert!(app.status.text.contains("external link"));
+    }
+
+    /// The selection walks the note's indexed links in document order: a
+    /// wikilink with an alias and an anchor, a markdown link and an embed all
+    /// count, and a link written inside a fenced code block does not.
+    #[test]
+    fn cycling_skips_code_blocks_and_keeps_document_order() {
+        let vault = TempVault::new("order");
+        vault.write(
+            "X.md",
+            "\
+[[Page#Section|Nice Name]]
+
+[docs](https://example.com)
+
+![[Img.png]]
+
+```rust
+[[Hidden]]
+```
+
+[[After]]
+",
+        );
+        let mut app = App::new(vault.vault(), Config::default()).expect("app");
+        let x = app.index.id_of_rel("X.md").unwrap();
+        app.open_note(x);
+
+        let labels: Vec<String> = app
+            .index
+            .note(x)
+            .unwrap()
+            .links
+            .iter()
+            .map(|link| link.display().to_string())
+            .collect();
+        assert_eq!(
+            labels,
+            ["Nice Name", "docs", "Img.png", "After"],
+            "code-block link must not be indexed, order must be the document's: {labels:?}"
+        );
+
+        for _ in 0..5 {
+            handle(&mut app, key(KeyCode::Char(']')));
+        }
+        assert_eq!(
+            app.active().unwrap().selected_link,
+            Some(0),
+            "wraps after the last real link, never onto the fenced one"
+        );
     }
 
     #[test]

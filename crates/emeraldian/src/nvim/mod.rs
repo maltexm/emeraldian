@@ -136,6 +136,10 @@ fn handle_bridge(app: &mut App, event: BridgeEvent) -> bool {
         BridgeEvent::Entered(path) => follow_nvim(app, &path),
         BridgeEvent::Action(name) => run_action(app, &name),
         BridgeEvent::LeaveEditing => leave_editing(app),
+        BridgeEvent::Notice(text) => {
+            app.info(text);
+            true
+        }
     }
 }
 
