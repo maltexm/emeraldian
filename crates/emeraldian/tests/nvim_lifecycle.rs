@@ -381,3 +381,29 @@ fn shutdown_ends_the_process() {
         "nvim is still there"
     );
 }
+
+#[test]
+fn autosave_never_overwrites_a_file_that_changed_on_disk() {
+    let vault = TempVault::new("nvim-life-autosave-conflict");
+    let path = vault.write("A.md", "alpha\n");
+    let Some(mut session) = start(vault.path()) else {
+        return;
+    };
+    open(&mut session, &path);
+    session.input("ix<Esc>");
+    assert!(wait_until(&mut session, |s| s.is_modified(&path)));
+    // Another program rewrites the note while the buffer has unsaved edits.
+    std::fs::write(&path, "changed by someone else, and longer\n").expect("write");
+
+    // Long enough for the 1 s debounce to fire and nvim to act on it.
+    let until = Instant::now() + Duration::from_millis(2500);
+    while Instant::now() < until {
+        let _ = session.poll();
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        on_disk(&path),
+        "changed by someone else, and longer\n",
+        "auto-save wrote over a file it had not read"
+    );
+}

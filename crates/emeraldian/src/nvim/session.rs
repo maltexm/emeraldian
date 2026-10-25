@@ -123,6 +123,7 @@ impl Session {
             vec![Value::from(size.0), Value::from(size.1), options],
             ATTACH,
         )?;
+        require_supported_nvim(&rpc)?;
 
         // nvim starts in an unnamed buffer that is nobody's note. Left alone it
         // becomes the note's alternate file, so the first `Ctrl+O` -- or any
@@ -698,5 +699,56 @@ fn canonical(path: &Path) -> PathBuf {
             .map(|parent| parent.join(name))
             .unwrap_or_else(|_| path.to_path_buf()),
         _ => path.to_path_buf(),
+    }
+}
+
+/// Whether `version` (`"0.12"`: major, minor) is one the embedding works with.
+fn version_supported(version: &str) -> bool {
+    let mut parts = version.split('.').map(|part| part.parse::<u32>().ok());
+    match (parts.next().flatten(), parts.next().flatten()) {
+        (Some(major), Some(minor)) => (major, minor) >= (0, 10),
+        _ => false,
+    }
+}
+
+/// Refuses an nvim older than 0.10, which the grid events and the bridge
+/// rely on. Before 0.9 there is no `vim.version()` to ask, and that counts.
+fn require_supported_nvim(rpc: &Rpc) -> Result<()> {
+    let version = rpc
+        .request(
+            "nvim_exec_lua",
+            vec![
+                Value::from("local v = vim.version(); return v.major .. '.' .. v.minor"),
+                Value::Array(Vec::new()),
+            ],
+            CALL,
+        )
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_default();
+    if version_supported(&version) {
+        Ok(())
+    } else {
+        let found = if version.is_empty() {
+            "older"
+        } else {
+            &version
+        };
+        Err(anyhow!("nvim {found} is too old; 0.10 or newer is needed"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::version_supported;
+
+    #[test]
+    fn nvim_before_0_10_is_not_supported() {
+        for old in ["0.9", "0.5", "0.9.5", "garbage", ""] {
+            assert!(!version_supported(old), "{old}");
+        }
+        for fine in ["0.10", "0.12", "0.10.1", "1.0", "1.2"] {
+            assert!(version_supported(fine), "{fine}");
+        }
     }
 }
