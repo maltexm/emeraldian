@@ -602,6 +602,15 @@ impl Session {
         self.rpc.shutdown(SHUTDOWN);
     }
 
+    /// Ends nvim without a clean quit, which would delete the swap files: the
+    /// unsaved text is not lost on a path nobody confirmed. `:preserve` writes
+    /// the swap of every buffer first, so that what was typed since nvim last
+    /// wrote one is in it.
+    pub fn leave_for_recovery(self) {
+        let _ = self.request("nvim_command", vec![Value::from("preserve")]);
+        // Dropping the session kills the process, which leaves the swap files.
+    }
+
     /// The nvim buffer handle for `path`, as nvim has it right now: `None` when
     /// it holds no buffer for the file. Never remembered between calls (see
     /// `buffer_of` in `bridge.lua`).

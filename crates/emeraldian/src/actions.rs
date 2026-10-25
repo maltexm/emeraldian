@@ -711,6 +711,7 @@ pub fn dispatch(app: &mut App, action: Action) {
             app.info(format!("model: {}", app.config.agent.model()));
         }
         Action::OpenVault(path) => app.open_vault(path),
+        Action::ForceOpenVault(path) => app.switch_vault(path),
         Action::ToggleLineNumbers => {
             app.config.ui.line_numbers = !app.config.ui.line_numbers;
         }
@@ -761,17 +762,8 @@ pub fn dispatch(app: &mut App, action: Action) {
         Action::ForceQuit => {
             // Unsaved work is written out rather than silently dropped, and a
             // note that cannot be written keeps emeraldian from quitting on it.
-            if app.config.editor.auto_save {
-                for index in 0..app.tabs.len() {
-                    if app.tab_modified(index) && !app.try_save_tab(index) {
-                        let title = app.note_title(app.tabs[index].note);
-                        app.error(format!(
-                            "not quitting: \"{title}\" could not be saved ({})",
-                            app.status.text
-                        ));
-                        return;
-                    }
-                }
+            if app.config.editor.auto_save && !app.save_modified_tabs("not quitting") {
+                return;
             }
             app.quit = true;
         }

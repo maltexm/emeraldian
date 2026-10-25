@@ -349,6 +349,8 @@ pub enum Action {
     SetProvider(String),
     SetModel(String),
     OpenVault(PathBuf),
+    /// `OpenVault` after the question about unsaved edits was answered.
+    ForceOpenVault(PathBuf),
     ToggleLineNumbers,
     ToggleGraphLabels,
     ToggleGraphUnresolved,
@@ -925,7 +927,7 @@ impl App {
                 if !self.try_save_tab(index) {
                     return;
                 }
-            } else if self.tab_is_in_nvim(index) {
+            } else {
                 let title = self.note_title(self.tabs[index].note);
                 self.modal = Some(Modal::Confirm(Confirm {
                     message: format!("\"{title}\" has unsaved changes. Close it and discard them?"),
@@ -1354,8 +1356,78 @@ impl App {
         }
     }
 
-    /// Switches to another vault, keeping settings and theme.
+    /// The one question before anything that throws unsaved text away: when
+    /// auto-save is off and there is text that is not on disk, in a tab or in
+    /// a buffer nvim holds, asks `lead` plus what is at stake and runs `then`
+    /// only once that is confirmed; `false` then. `true` when `then` may run
+    /// at once: nothing is unsaved, or auto-save is on, in which case `then`
+    /// writes the text first and stays where it is if that fails.
+    ///
+    /// Every path that ends the nvim session or drops tabs on purpose goes
+    /// through here, so that a new one cannot forget to ask.
+    #[must_use]
+    pub fn confirm_unsaved(&mut self, lead: &str, then: Action) -> bool {
+        if self.config.editor.auto_save {
+            return true;
+        }
+        let message = match self.unsaved_count() {
+            0 => return true,
+            1 => format!("{lead} 1 note has unsaved changes."),
+            n => format!("{lead} {n} notes have unsaved changes."),
+        };
+        self.modal = Some(Modal::Confirm(Confirm {
+            message,
+            action: then,
+        }));
+        false
+    }
+
+    /// Writes every tab that has unsaved edits. `false` (with the reason in
+    /// the status bar, prefixed by `refusal`) when one cannot be written.
+    pub fn save_modified_tabs(&mut self, refusal: &str) -> bool {
+        for index in 0..self.tabs.len() {
+            if self.tab_modified(index) && !self.try_save_tab(index) {
+                let title = self.note_title(self.tabs[index].note);
+                self.error(format!(
+                    "{refusal}: \"{title}\" could not be saved ({})",
+                    self.status.text
+                ));
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Switches to another vault, keeping settings and theme. Asks first
+    /// while there are unsaved edits that auto-save would not write.
     pub fn open_vault(&mut self, path: PathBuf) {
+        let name = path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        let lead = format!("Open vault {name}?");
+        if self.confirm_unsaved(&lead, Action::ForceOpenVault(path.clone())) {
+            self.switch_vault(path);
+        }
+    }
+
+    /// [`App::open_vault`] after the question: with auto-save on the edits are
+    /// written first, and whatever cannot be written keeps the switch from
+    /// happening; with it off they are dropped, the user having said so.
+    pub fn switch_vault(&mut self, path: PathBuf) {
+        // Nothing is torn down until the new vault is known to open.
+        let scan = ScanOptions {
+            include_hidden: self.config.ui.show_hidden,
+            ..Default::default()
+        };
+        let built = VaultIndex::build(Vault::from_path(&path), scan);
+        if let Err(err) = &built {
+            self.error(format!("could not open vault: {err}"));
+            return;
+        }
+        if self.config.editor.auto_save && !self.save_modified_tabs("not switching vaults") {
+            return;
+        }
         // nvim runs in the old vault's folder and knows its notes by their
         // paths; the new vault gets a session of its own, started when a note
         // is edited. Not before the edits in it are safe.
@@ -1363,11 +1435,7 @@ impl App {
             self.error(format!("not switching vaults: {err}"));
             return;
         }
-        let scan = ScanOptions {
-            include_hidden: self.config.ui.show_hidden,
-            ..Default::default()
-        };
-        match VaultIndex::build(Vault::from_path(&path), scan) {
+        match built {
             Ok(index) => {
                 self.index = index;
                 self.tabs.clear();

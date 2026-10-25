@@ -2952,6 +2952,88 @@ mod familiar_tests {
     }
 
     #[test]
+    fn switching_vault_asks_about_unsaved_edits_of_the_built_in_editor() {
+        let vault = TempVault::new("familiar-switch-from");
+        vault.write("N.md", "# N\n");
+        let mut config = Config::default();
+        config.editor.auto_save = false;
+        let mut app = App::new(vault.vault(), config).expect("app");
+        let id = app.index.id_of_rel("N.md").expect("indexed");
+        app.open_note(id);
+        app.active_mut().expect("tab").mode = Mode::Editing;
+        app.editor_mut().expect("editor").insert_str("typed ");
+        let other = TempVault::new("familiar-switch-to");
+        other.write("O.md", "# O\n");
+
+        app.open_vault(other.path().to_path_buf());
+
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm(c)) if c.message.contains("unsaved")),
+            "modal was {:?}",
+            app.modal
+        );
+        assert_eq!(app.index.vault.path, vault.vault().path);
+        assert_eq!(app.tabs.len(), 1, "the tab with the text is still there");
+
+        // Cancelling changes nothing; confirming switches and drops the edit.
+        press(&mut app, KeyCode::Esc, NONE);
+        assert_eq!(app.index.vault.path, vault.vault().path);
+        assert!(app.tab_modified(0));
+        app.open_vault(other.path().to_path_buf());
+        match app.modal.take() {
+            Some(Modal::Confirm(confirm)) => crate::actions::confirm(&mut app, confirm.action),
+            unexpected => panic!("expected a confirmation, found {unexpected:?}"),
+        }
+        assert_eq!(app.index.vault.path, other.vault().path);
+        assert_eq!(vault.read("N.md"), "# N\n");
+    }
+
+    #[test]
+    fn switching_vault_with_autosave_saves_the_built_in_editors_edits() {
+        let vault = TempVault::new("familiar-switch-save");
+        vault.write("N.md", "# N\n");
+        let mut app = App::new(vault.vault(), Config::default()).expect("app");
+        assert!(app.config.editor.auto_save);
+        let id = app.index.id_of_rel("N.md").expect("indexed");
+        app.open_note(id);
+        app.active_mut().expect("tab").mode = Mode::Editing;
+        app.editor_mut().expect("editor").insert_str("typed ");
+        let other = TempVault::new("familiar-switch-saved-to");
+        other.write("O.md", "# O\n");
+
+        app.open_vault(other.path().to_path_buf());
+
+        assert!(app.modal.is_none());
+        assert_eq!(app.index.vault.path, other.vault().path);
+        assert!(vault.read("N.md").contains("typed"));
+    }
+
+    #[test]
+    fn closing_a_tab_with_unsaved_edits_asks_without_autosave() {
+        let vault = TempVault::new("familiar-close-dirty");
+        vault.write("N.md", "# N\n");
+        let mut config = Config::default();
+        config.editor.auto_save = false;
+        let mut app = App::new(vault.vault(), config).expect("app");
+        let id = app.index.id_of_rel("N.md").expect("indexed");
+        app.open_note(id);
+        app.active_mut().expect("tab").mode = Mode::Editing;
+        app.editor_mut().expect("editor").insert_str("typed ");
+
+        press(&mut app, KeyCode::F(3), NONE);
+
+        assert!(
+            matches!(&app.modal, Some(Modal::Confirm(c)) if c.message.contains("unsaved")),
+            "modal was {:?}",
+            app.modal
+        );
+        assert_eq!(app.tabs.len(), 1);
+        press(&mut app, KeyCode::Esc, NONE);
+        assert_eq!(app.tabs.len(), 1, "cancelling keeps the tab and its text");
+        assert!(app.tab_modified(0));
+    }
+
+    #[test]
     fn a_closed_tab_is_not_reopened_in_another_vault() {
         let (_v, mut app) = editing("linux", "x\n");
         press(&mut app, KeyCode::F(3), NONE);

@@ -1024,3 +1024,382 @@ fn nvim_crash_falls_back_to_reading() {
     });
     assert_ne!(app.nvim.as_ref().unwrap().pid(), pid);
 }
+
+// ---- leaving the vault, and every other way the session ends --------------
+//
+// One question for each: does it ask, or save, before the unsaved text is gone?
+
+fn other_vault() -> emeraldian_core::test_support::TempVault {
+    let other = emeraldian_core::test_support::TempVault::new("nvim-other-vault");
+    other.write("Other.md", "# Other\n");
+    other
+}
+
+fn still_in(app: &App, vault: &emeraldian_core::test_support::TempVault) -> bool {
+    app.index.vault.path == vault.vault().path
+}
+
+/// What a switch that has to ask leaves behind: the question, the old vault,
+/// the session.
+fn assert_switch_asks(app: &App, vault: &emeraldian_core::test_support::TempVault) {
+    assert!(
+        matches!(&app.modal, Some(Modal::Confirm(c)) if c.message.contains("unsaved")),
+        "modal was {:?}",
+        app.modal
+    );
+    assert!(
+        still_in(app, vault),
+        "the vault was switched before the answer"
+    );
+    assert!(
+        app.nvim.is_some(),
+        "the session was ended before the answer"
+    );
+    assert!(
+        !app.tabs.is_empty(),
+        "the tabs were dropped before the answer"
+    );
+}
+
+#[test]
+fn switching_vault_asks_before_dropping_unsaved_edits() {
+    let Some((vault, mut app)) =
+        nvim_app_configured(&[("Alpha.md", "# Alpha\n\nbody\n")], |config| {
+            config.editor.auto_save = false
+        })
+    else {
+        return;
+    };
+    let other = other_vault();
+    edit(&mut app, "hi ", "hi # Alpha");
+
+    actions::dispatch(&mut app, Action::OpenVault(other.path().to_path_buf()));
+
+    assert_switch_asks(&app, &vault);
+    assert_eq!(vault.read("Alpha.md"), "# Alpha\n\nbody\n");
+}
+
+#[test]
+fn cancelling_a_vault_switch_keeps_the_session_and_the_text() {
+    let Some((vault, mut app)) =
+        nvim_app_configured(&[("Alpha.md", "# Alpha\n\nbody\n")], |config| {
+            config.editor.auto_save = false
+        })
+    else {
+        return;
+    };
+    let other = other_vault();
+    edit(&mut app, "hi ", "hi # Alpha");
+    let pid = app.nvim.as_ref().unwrap().pid();
+    app.open_vault(other.path().to_path_buf());
+    assert_switch_asks(&app, &vault);
+
+    press(&mut app, KeyCode::Esc);
+
+    assert!(app.modal.is_none());
+    assert!(still_in(&app, &vault));
+    assert_eq!(app.nvim.as_ref().map(Session::pid), Some(pid));
+    assert_eq!(
+        buffer_text(&app, "Alpha.md").as_deref(),
+        Some("hi # Alpha\n\nbody\n")
+    );
+    // And the text can still be saved.
+    let tab = app.active_tab.expect("a tab");
+    assert!(app.try_save_tab(tab), "status was {:?}", app.status.text);
+    assert_eq!(vault.read("Alpha.md"), "hi # Alpha\n\nbody\n");
+}
+
+#[test]
+fn confirming_a_vault_switch_discards_the_edits_and_switches() {
+    let Some((vault, mut app)) =
+        nvim_app_configured(&[("Alpha.md", "# Alpha\n\nbody\n")], |config| {
+            config.editor.auto_save = false
+        })
+    else {
+        return;
+    };
+    let other = other_vault();
+    edit(&mut app, "hi ", "hi # Alpha");
+    let pid = app.nvim.as_ref().unwrap().pid();
+    app.open_vault(other.path().to_path_buf());
+
+    confirm_modal(&mut app);
+
+    assert!(
+        !still_in(&app, &vault),
+        "the destination was carried through"
+    );
+    assert!(app.index.id_of_rel("Other.md").is_some());
+    assert!(app.nvim.is_none());
+    assert!(process_is_gone(pid, Duration::from_secs(2)));
+    assert!(app.tabs.is_empty());
+    assert_eq!(vault.read("Alpha.md"), "# Alpha\n\nbody\n");
+}
+
+#[test]
+fn switching_vault_asks_about_a_dirty_tab_kept_in_reading_mode() {
+    let Some((vault, mut app)) =
+        nvim_app_configured(&[("Alpha.md", "# Alpha\n\nbody\n")], |config| {
+            config.editor.auto_save = false
+        })
+    else {
+        return;
+    };
+    let other = other_vault();
+    edit(&mut app, "hi ", "hi # Alpha");
+    keys::handle(&mut app, ctrl_e());
+    assert_eq!(app.active().map(|tab| tab.mode), Some(Mode::Reading));
+
+    app.open_vault(other.path().to_path_buf());
+
+    assert_switch_asks(&app, &vault);
+}
+
+#[test]
+fn switching_vault_asks_about_a_note_nvim_opened() {
+    let Some((vault, mut app)) = native_app() else {
+        return;
+    };
+    let other = other_vault();
+    native_dirty_beta(&mut app);
+
+    app.open_vault(other.path().to_path_buf());
+
+    assert_switch_asks(&app, &vault);
+    assert_eq!(vault.read("Beta.md"), "# Beta\n\nsecond\n");
+}
+
+#[test]
+fn switching_vault_asks_about_a_dirty_buffer_that_has_no_tab() {
+    let Some((vault, mut app)) = native_app() else {
+        return;
+    };
+    let other = other_vault();
+    app.focus = Focus::Note;
+    draw(&mut app, 100, 30);
+    settle(&mut app, 100, 30, |app| row(app, 0).starts_with("# Alpha"));
+    type_text(
+        &mut app,
+        &format!(":edit {}", vault.path().join("Fresh.md").display()),
+    );
+    press(&mut app, KeyCode::Enter);
+    type_text(&mut app, "ifresh text");
+    press(&mut app, KeyCode::Esc);
+    settle(&mut app, 100, 30, |app| {
+        row(app, 0).starts_with("fresh text")
+    });
+
+    app.open_vault(other.path().to_path_buf());
+
+    assert_switch_asks(&app, &vault);
+}
+
+#[test]
+fn switching_vault_with_nothing_unsaved_does_not_ask() {
+    let Some((vault, mut app)) =
+        nvim_app_configured(&[("Alpha.md", "# Alpha\n\nbody\n")], |config| {
+            config.editor.auto_save = false
+        })
+    else {
+        return;
+    };
+    let other = other_vault();
+    draw(&mut app, 100, 30);
+    settle(&mut app, 100, 30, |app| row(app, 0).starts_with("# Alpha"));
+
+    app.open_vault(other.path().to_path_buf());
+
+    assert!(app.modal.is_none(), "modal was {:?}", app.modal);
+    assert!(!still_in(&app, &vault));
+    assert!(app.nvim.is_none());
+}
+
+#[test]
+fn switching_vault_with_autosave_stays_when_a_note_cannot_be_written() {
+    let Some((vault, mut app)) = nvim_app() else {
+        return;
+    };
+    let other = other_vault();
+    let path = vault.path().join("Alpha.md");
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o444);
+    std::fs::set_permissions(&path, permissions.clone()).unwrap();
+    edit(&mut app, "hi ", "hi # Alpha");
+
+    app.open_vault(other.path().to_path_buf());
+
+    permissions.set_mode(0o644);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    assert!(still_in(&app, &vault));
+    assert!(app.nvim.is_some());
+    assert!(app.status.is_error, "status was {:?}", app.status.text);
+    assert_eq!(
+        buffer_text(&app, "Alpha.md").as_deref(),
+        Some("hi # Alpha\n\nbody\n")
+    );
+}
+
+#[test]
+fn a_vault_that_cannot_be_opened_leaves_the_session_alone() {
+    let Some((vault, mut app)) =
+        nvim_app_configured(&[("Alpha.md", "# Alpha\n\nbody\n")], |config| {
+            config.editor.auto_save = false
+        })
+    else {
+        return;
+    };
+    draw(&mut app, 100, 30);
+    settle(&mut app, 100, 30, |app| row(app, 0).starts_with("# Alpha"));
+    let gone = vault.path().join("no-such-vault");
+    let _ = std::fs::remove_dir_all(&gone);
+
+    app.open_vault(gone);
+
+    assert!(app.status.is_error, "status was {:?}", app.status.text);
+    assert!(still_in(&app, &vault));
+    assert!(
+        app.nvim.is_some(),
+        "the session went with a switch that failed"
+    );
+    assert!(!app.tabs.is_empty());
+}
+
+// ---- the other ways out ------------------------------------------------------
+
+/// A session whose swap files go to `dir`, as with the user's own config.
+fn with_swap_in(app: &mut App, vault: &std::path::Path, dir: &Path) {
+    let setting = format!("set swapfile directory={}//", dir.display());
+    app.nvim = Some(
+        Session::start_with(
+            &app.config.editor,
+            vault,
+            (40, 10),
+            &["--clean", "--cmd", &setting],
+        )
+        .expect("start nvim"),
+    );
+}
+
+fn swap_files(dir: &Path) -> usize {
+    std::fs::read_dir(dir).map_or(0, |entries| entries.flatten().count())
+}
+
+#[test]
+fn leaving_without_a_quit_keeps_the_swap_of_unsaved_text() {
+    let Some((vault, mut app)) =
+        nvim_app_configured(&[("Alpha.md", "# Alpha\n\nbody\n")], |config| {
+            config.editor.auto_save = false
+        })
+    else {
+        return;
+    };
+    let swaps = vault.path().join("swaps");
+    std::fs::create_dir_all(&swaps).unwrap();
+    with_swap_in(&mut app, vault.path(), &swaps);
+    edit(&mut app, "hi ", "hi # Alpha");
+
+    // The terminal went away: nobody was asked, nobody said discard.
+    shutdown(&mut app);
+
+    assert!(app.nvim.is_none());
+    assert_eq!(vault.read("Alpha.md"), "# Alpha\n\nbody\n");
+    assert_eq!(
+        swap_files(&swaps),
+        1,
+        "the swap file is how the text comes back"
+    );
+}
+
+#[test]
+fn a_confirmed_quit_discards_the_swap_with_the_text() {
+    let Some((vault, mut app)) =
+        nvim_app_configured(&[("Alpha.md", "# Alpha\n\nbody\n")], |config| {
+            config.editor.auto_save = false
+        })
+    else {
+        return;
+    };
+    let swaps = vault.path().join("swaps");
+    std::fs::create_dir_all(&swaps).unwrap();
+    with_swap_in(&mut app, vault.path(), &swaps);
+    edit(&mut app, "hi ", "hi # Alpha");
+
+    actions::dispatch(&mut app, Action::Quit);
+    confirm_modal(&mut app);
+    shutdown(&mut app);
+
+    assert!(app.quit);
+    assert_eq!(swap_files(&swaps), 0);
+}
+
+#[test]
+fn leaving_with_autosave_that_cannot_write_keeps_the_swap() {
+    let Some((vault, mut app)) = nvim_app() else {
+        return;
+    };
+    let swaps = vault.path().join("swaps");
+    std::fs::create_dir_all(&swaps).unwrap();
+    with_swap_in(&mut app, vault.path(), &swaps);
+    let path = vault.path().join("Alpha.md");
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o444);
+    std::fs::set_permissions(&path, permissions.clone()).unwrap();
+    edit(&mut app, "hi ", "hi # Alpha");
+
+    shutdown(&mut app);
+
+    permissions.set_mode(0o644);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    assert_eq!(swap_files(&swaps), 1);
+}
+
+#[test]
+fn reloading_the_vault_keeps_unsaved_edits() {
+    let Some((vault, mut app)) =
+        nvim_app_configured(&[("Alpha.md", "# Alpha\n\nbody\n")], |config| {
+            config.editor.auto_save = false
+        })
+    else {
+        return;
+    };
+    edit(&mut app, "hi ", "hi # Alpha");
+
+    actions::dispatch(&mut app, Action::Refresh);
+    settle(&mut app, 100, 30, |app| {
+        row(app, 0).starts_with("hi # Alpha")
+    });
+
+    assert!(app.nvim.is_some());
+    assert_eq!(
+        buffer_text(&app, "Alpha.md").as_deref(),
+        Some("hi # Alpha\n\nbody\n")
+    );
+    assert_eq!(vault.read("Alpha.md"), "# Alpha\n\nbody\n");
+    assert_eq!(app.unsaved_count(), 1);
+}
+
+#[test]
+fn a_crash_leaves_the_unsaved_tab_in_the_reading_view_not_closed() {
+    let wrapper = clean_nvim();
+    let Some((_vault, mut app)) =
+        nvim_app_configured(&[("Alpha.md", "# Alpha\n\nbody\n")], |config| {
+            config.editor.nvim = wrapper.clone();
+            config.editor.auto_save = false;
+        })
+    else {
+        return;
+    };
+    edit(&mut app, "hi ", "hi # Alpha");
+    let pid = app.nvim.as_ref().unwrap().pid();
+
+    std::process::Command::new("kill")
+        .args(["-9", &pid.to_string()])
+        .status()
+        .expect("kill");
+    settle(&mut app, 100, 30, |app| app.nvim.is_none());
+
+    // The text died with the process (its swap is what is left); the tab and
+    // the note do not, and the app says so.
+    assert_eq!(app.tabs.len(), 1);
+    assert!(app.status.is_error, "status was {:?}", app.status.text);
+}

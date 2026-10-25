@@ -417,7 +417,9 @@ pub fn before_agent_turn(app: &mut App) {
 /// Ends the nvim session, after writing what auto-save asks for. Nothing is
 /// ended when that fails: the session is where the unsaved edits are.
 ///
-/// For leaving a vault, where the session cannot carry on.
+/// For leaving a vault, where the session cannot carry on. Without auto-save
+/// the unsaved text goes with it, and its swap files too: the caller has
+/// asked first ([`App::confirm_unsaved`]).
 pub fn end_session(app: &mut App) -> Result<(), String> {
     if app.config.editor.auto_save
         && let Some(session) = app.nvim.as_mut()
@@ -431,12 +433,26 @@ pub fn end_session(app: &mut App) -> Result<(), String> {
 }
 
 /// Ends the nvim process at exit, after writing what auto-save asks for.
-/// Whatever that leaves unsaved is lost: the quit action refuses to get this
-/// far while a note cannot be written.
+///
+/// The text that is left unsaved is lost only when the user said so: a quit
+/// they confirmed (`app.quit`) without auto-save. Any other way out (the
+/// terminal went away, the event loop failed) or a note that could not be
+/// written leaves the swap files in place, which is how nvim gets it back.
 pub fn shutdown(app: &mut App) {
-    if end_session(app).is_err()
-        && let Some(session) = app.nvim.take()
-    {
+    let auto_save = app.config.editor.auto_save;
+    let discarded = app.quit && !auto_save;
+    let Some(mut session) = app.nvim.take() else {
+        return;
+    };
+    let saved = !auto_save || session.save_all().is_ok();
+    let at_risk = if auto_save {
+        !saved
+    } else {
+        !discarded && !session.modified_notes().is_empty()
+    };
+    if at_risk {
+        session.leave_for_recovery();
+    } else {
         session.shutdown();
     }
 }
