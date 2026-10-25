@@ -15,16 +15,20 @@
 //! window after any traffic, and [`poll_timeout`] is what the loop asks for the
 //! timeout. The 33 ms tick stays for everything else.
 
+use std::collections::BTreeSet;
+use std::path::Path;
 use std::time::Duration;
 
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{KeyEvent, MouseEvent, MouseEventKind};
+use emeraldian_core::index::{NoteId, VaultIndex};
 use ratatui::layout::Position;
 
-use crate::app::{App, Focus, Mode};
+use crate::app::{Action, App, Focus, Mode, SidePanel};
 
-// Parts of the client and the grid model wait for the bridge and lifecycle
-// work before anything outside the tests uses them.
+// Parts of the client and the grid model wait for the lifecycle work before
+// anything outside the tests uses them.
+pub mod bridge;
 #[allow(dead_code)]
 pub mod grid;
 #[allow(dead_code)]
@@ -35,6 +39,7 @@ pub mod rpc;
 #[allow(dead_code)]
 pub mod session;
 
+use bridge::{BridgeEvent, LinkTarget};
 use grid::CursorShape;
 use session::{Event, Session};
 
@@ -73,21 +78,32 @@ pub fn poll(app: &mut App) -> bool {
             open_error = Some(err.to_string());
         }
     }
+    // What `[[` completes to follows the index, which a write or a reload
+    // changes.
+    let revision = app.index.revision();
+    if session.notes_revision() != Some(revision) {
+        session.set_notes(revision, note_names(&app.index));
+    }
 
     // Drained even while a note is being read: nvim keeps running behind the
     // reading view, and its messages must not pile up or its exit go unseen.
     let mut exit = None;
+    let mut bridged = Vec::new();
     for event in session.poll() {
         match event {
             Event::Redraw => redraw |= editing,
             Event::Exited(code) => exit = Some(code),
-            Event::Bridge(event) => match event {},
+            Event::Bridge(event) => bridged.push(event),
         }
     }
 
     if let Some(err) = open_error {
         app.error(format!("could not open the note in nvim: {err}"));
         redraw = true;
+    }
+    // After the session's borrow ends: what nvim reports changes the app.
+    for event in bridged {
+        redraw |= handle_bridge(app, event);
     }
     if let Some(code) = exit {
         // Not a reason to give up on nvim: the notes go back to the reading
@@ -103,6 +119,164 @@ pub fn poll(app: &mut App) -> bool {
         redraw = true;
     }
     redraw
+}
+
+/// Acts on something nvim's bridge reported. `true` when the screen changed.
+fn handle_bridge(app: &mut App, event: BridgeEvent) -> bool {
+    match event {
+        BridgeEvent::Follow(target) => {
+            follow_link(app, target);
+            true
+        }
+        BridgeEvent::Written(path) => reindex(app, &path),
+        // Which buffers are dirty is read from nvim when it is asked (a tab
+        // close, a write tool); the lifecycle work will switch to this push.
+        BridgeEvent::Modified(..) => false,
+        BridgeEvent::Entered(path) => follow_nvim(app, &path),
+        BridgeEvent::Action(name) => run_action(app, &name),
+        BridgeEvent::LeaveEditing => leave_editing(app),
+    }
+}
+
+/// A link followed in nvim. The note it leads to opens in the editor too:
+/// `reading_mode` decides how a note opens from the explorer or the switcher,
+/// but pressing `<CR>` on a link while editing should not throw the user out
+/// of nvim into the reading view, with the jump to the heading lost.
+fn follow_link(app: &mut App, target: LinkTarget) {
+    let was_editing = app.nvim_editing();
+    crate::actions::dispatch(app, Action::FollowLink(target.clone()));
+    if !was_editing {
+        return;
+    }
+    if let Some(tab) = app.active_mut()
+        && tab.mode == Mode::Reading
+    {
+        tab.mode = Mode::Editing;
+        // The jump was not sent while the note was only read.
+        app.jump_to_anchor(&target);
+    }
+}
+
+/// The note the index knows under this absolute path, whether the path was
+/// spelled the way the vault is or as the file system resolves it.
+fn note_for_path(app: &App, path: &Path) -> Option<NoteId> {
+    let root = &app.index.vault.path;
+    let rel = path
+        .strip_prefix(root)
+        .map(Path::to_path_buf)
+        .ok()
+        .or_else(|| {
+            let root = std::fs::canonicalize(root).ok()?;
+            path.strip_prefix(root).map(Path::to_path_buf).ok()
+        })?;
+    app.index.id_of_rel(&rel.to_string_lossy())
+}
+
+/// A note was written from nvim: read it into the index again, so that
+/// backlinks, the outline, tags and the graph show what is on disk. A file the
+/// index does not know (a new one) is left to the next reload.
+fn reindex(app: &mut App, path: &Path) -> bool {
+    let Some(id) = note_for_path(app, path) else {
+        return false;
+    };
+    match app.index.refresh_note(id) {
+        Ok(()) => app.explorer.rebuild(&app.index),
+        Err(err) => app.error(format!("could not read {} again: {err}", path.display())),
+    }
+    true
+}
+
+/// nvim moved to another note by itself (`:e`, `:bnext`, a jump back): the tabs
+/// follow, so the history, the backlinks and the assistant's context are those
+/// of the note on screen.
+///
+/// Only while a note is being edited: with the reading view up, a late report
+/// of a buffer nvim left a moment ago must not drag the reading view along.
+fn follow_nvim(app: &mut App, path: &Path) -> bool {
+    if !app.nvim_editing() {
+        return false;
+    }
+    let Some(id) = note_for_path(app, path) else {
+        return false;
+    };
+    if app.active_note() == Some(id) {
+        return false;
+    }
+    app.open_note(id);
+    if let Some(tab) = app.active_mut() {
+        tab.mode = Mode::Editing;
+    }
+    // nvim is already there: `open` must not switch to the buffer again.
+    if let Some(session) = app.nvim.as_mut()
+        && let Some(note) = app.index.note(id)
+    {
+        session.note_shown(&note.meta.path);
+    }
+    true
+}
+
+/// `:q`, `:wq`, `:x` on the last window: back to the reading view. nvim and its
+/// buffers stay, so editing the note again picks up where it was left.
+fn leave_editing(app: &mut App) -> bool {
+    if !app.nvim_editing() {
+        return false;
+    }
+    if let Some(tab) = app.active_mut() {
+        tab.mode = Mode::Reading;
+    }
+    app.vim.reset();
+    true
+}
+
+/// `:Emeraldian <action>`: the app actions nvim's mappings can reach.
+fn run_action(app: &mut App, name: &str) -> bool {
+    use crate::actions::dispatch;
+
+    match name {
+        "switcher" => dispatch(app, Action::OpenSwitcher),
+        "search" => dispatch(app, Action::OpenSearch),
+        "graph" => dispatch(app, Action::OpenGraph),
+        "local_graph" => dispatch(app, Action::OpenLocalGraph),
+        // A key that opens the assistant should bring it to the keyboard, not
+        // close it on the second press while the focus is elsewhere.
+        "chat" if app.config.ui.show_chat && app.focus != Focus::Chat => {
+            dispatch(app, Action::FocusPane(Focus::Chat));
+        }
+        "chat" => dispatch(app, Action::ToggleChat),
+        "explorer" | "focus_left" => dispatch(app, Action::FocusPane(Focus::Explorer)),
+        "backlinks" => show_side_panel(app, SidePanel::Backlinks),
+        "outline" => show_side_panel(app, SidePanel::Outline),
+        "focus_right" if app.config.ui.show_right_sidebar => {
+            dispatch(app, Action::FocusPane(Focus::Sidebar));
+        }
+        "focus_right" if app.config.ui.show_chat => dispatch(app, Action::FocusPane(Focus::Chat)),
+        "focus_right" => app.info("no pane on the right"),
+        "new" => dispatch(app, Action::NewNote),
+        "daily" => dispatch(app, Action::DailyNote),
+        other => app.error(format!("unknown Emeraldian action: {other}")),
+    }
+    true
+}
+
+/// Opens the right sidebar on `panel` and gives it the keyboard.
+fn show_side_panel(app: &mut App, panel: SidePanel) {
+    app.side_panel = panel;
+    app.side_selected = 0;
+    app.config.ui.show_right_sidebar = true;
+    crate::actions::dispatch(app, Action::FocusPane(Focus::Sidebar));
+}
+
+/// The names a `[[` can be completed to: every note's file name and every
+/// alias — what the index can resolve a link to — once each, sorted.
+fn note_names(index: &VaultIndex) -> Vec<String> {
+    let names: BTreeSet<&str> = index
+        .notes()
+        .iter()
+        .flat_map(|note| {
+            std::iter::once(note.meta.stem.as_str()).chain(note.aliases.iter().map(String::as_str))
+        })
+        .collect();
+    names.into_iter().map(str::to_string).collect()
 }
 
 /// Starts nvim at the pane's size. Waits for the first frame, which is what
@@ -264,13 +438,19 @@ mod tests {
     /// and a clean nvim already attached (so no test reads or writes anyone's
     /// nvim config, shada or swap files). `None` without nvim.
     fn nvim_app() -> Option<(TempVault, App)> {
+        nvim_app_with(&[("Alpha.md", "# Alpha\n\nbody\n"), ("Beta.md", "# Beta\n")])
+    }
+
+    /// [`nvim_app`] over a vault made of `files`; `Alpha.md` must be one.
+    fn nvim_app_with(files: &[(&str, &str)]) -> Option<(TempVault, App)> {
         if !nvim_available() {
             eprintln!("skip: nvim not on PATH");
             return None;
         }
         let vault = TempVault::new("nvim-wiring");
-        vault.write("Alpha.md", "# Alpha\n\nbody\n");
-        vault.write("Beta.md", "# Beta\n");
+        for (name, text) in files {
+            vault.write(name, text);
+        }
         let mut config = Config::default();
         config.editor.backend = EditorBackend::Nvim;
         config.ui.reading_mode = false;
@@ -598,5 +778,364 @@ mod tests {
         assert!(app.nvim.is_none());
         let text = std::fs::read_to_string(vault.path().join("Alpha.md")).expect("read note");
         assert!(text.starts_with("hi # Alpha"), "file was {text:?}");
+    }
+
+    /// The title of the note the active tab shows.
+    fn active_title(app: &App) -> String {
+        app.active_note()
+            .map(|id| app.note_title(id))
+            .unwrap_or_default()
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        keys::handle(app, KeyEvent::new(code, KeyModifiers::NONE));
+    }
+
+    #[test]
+    fn bridge_action_switcher() {
+        let Some((_vault, mut app)) = nvim_app() else {
+            return;
+        };
+        app.focus = Focus::Note;
+        draw(&mut app, 100, 30);
+        settle(&mut app, 100, 30, |app| row(app, 0).starts_with("# Alpha"));
+        assert!(app.modal.is_none());
+
+        type_text(&mut app, ":Emeraldian switcher");
+        press(&mut app, KeyCode::Enter);
+
+        settle(&mut app, 100, 30, |app| app.modal.is_some());
+    }
+
+    #[test]
+    fn bridge_write_reindexes() {
+        let Some((vault, mut app)) = nvim_app() else {
+            return;
+        };
+        app.focus = Focus::Note;
+        draw(&mut app, 100, 30);
+        settle(&mut app, 100, 30, |app| row(app, 0).starts_with("# Alpha"));
+        let beta = app.index.id_of_rel("Beta.md").expect("indexed");
+        assert!(app.index.backlinks(beta).is_empty());
+
+        // A new link, written with `:w`.
+        type_text(&mut app, "Go[[Beta]]");
+        press(&mut app, KeyCode::Esc);
+        type_text(&mut app, ":w");
+        press(&mut app, KeyCode::Enter);
+
+        settle(&mut app, 100, 30, |app| {
+            !app.index.backlinks(beta).is_empty()
+        });
+        let alpha = app.index.id_of_rel("Alpha.md").expect("indexed");
+        assert_eq!(app.index.backlinks(beta)[0].source, alpha);
+        let text = std::fs::read_to_string(vault.path().join("Alpha.md")).expect("read");
+        assert!(text.contains("[[Beta]]"), "file was {text:?}");
+    }
+
+    #[test]
+    fn bridge_follow_opens_the_linked_note() {
+        let Some((_vault, mut app)) =
+            nvim_app_with(&[("Alpha.md", "see [[Beta]] now\n"), ("Beta.md", "# Beta\n")])
+        else {
+            return;
+        };
+        app.focus = Focus::Note;
+        draw(&mut app, 100, 30);
+        settle(&mut app, 100, 30, |app| {
+            row(app, 0).starts_with("see [[Beta]]")
+        });
+
+        type_text(&mut app, "f[");
+        press(&mut app, KeyCode::Enter);
+
+        settle(&mut app, 100, 30, |app| active_title(app) == "Beta");
+        settle(&mut app, 100, 30, |app| row(app, 0).starts_with("# Beta"));
+        assert_eq!(app.tabs.len(), 2, "the link opened a second tab");
+        assert_eq!(app.active().map(|tab| tab.mode), Some(Mode::Editing));
+    }
+
+    #[test]
+    fn bridge_follow_from_the_editor_stays_in_the_editor_and_jumps() {
+        let mut beta = String::from("# Beta\n");
+        for i in 0..40 {
+            beta.push_str(&format!("line {i}\n"));
+        }
+        beta.push_str("## Deep\ntext\n");
+        let Some((_vault, mut app)) =
+            nvim_app_with(&[("Alpha.md", "see [[Beta#Deep]] now\n"), ("Beta.md", &beta)])
+        else {
+            return;
+        };
+        // The default: notes open in the reading view. A link followed while
+        // editing must not throw the user out of nvim into it.
+        app.config.ui.reading_mode = true;
+        app.focus = Focus::Note;
+        draw(&mut app, 100, 30);
+        settle(&mut app, 100, 30, |app| {
+            row(app, 0).starts_with("see [[Beta#Deep]]")
+        });
+
+        type_text(&mut app, "f[");
+        press(&mut app, KeyCode::Enter);
+
+        settle(&mut app, 100, 30, |app| row(app, 0).starts_with("## Deep"));
+        assert_eq!(active_title(&app), "Beta");
+        assert_eq!(app.active().map(|tab| tab.mode), Some(Mode::Editing));
+    }
+
+    #[test]
+    fn bridge_entered_syncs_tab() {
+        let Some((_vault, mut app)) = nvim_app() else {
+            return;
+        };
+        app.focus = Focus::Note;
+        draw(&mut app, 100, 30);
+        settle(&mut app, 100, 30, |app| row(app, 0).starts_with("# Alpha"));
+
+        type_text(&mut app, ":e Beta.md");
+        press(&mut app, KeyCode::Enter);
+
+        settle(&mut app, 100, 30, |app| active_title(app) == "Beta");
+        settle(&mut app, 100, 30, |app| row(app, 0).starts_with("# Beta"));
+        assert_eq!(app.tabs.len(), 2);
+        // And going back through the app lands on the first note again.
+        app.cycle_tab(-1);
+        settle(&mut app, 100, 30, |app| row(app, 0).starts_with("# Alpha"));
+        assert_eq!(active_title(&app), "Alpha");
+    }
+
+    #[test]
+    fn bridge_entered_is_ignored_while_reading() {
+        let Some((vault, mut app)) = nvim_app() else {
+            return;
+        };
+        app.active_mut().expect("tab").mode = Mode::Reading;
+
+        let changed = handle_bridge(&mut app, BridgeEvent::Entered(vault.path().join("Beta.md")));
+
+        assert!(!changed);
+        assert_eq!(active_title(&app), "Alpha");
+        assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn bridge_leave_returns_to_reading_and_keeps_nvim() {
+        let Some((_vault, mut app)) = nvim_app() else {
+            return;
+        };
+        app.focus = Focus::Note;
+        draw(&mut app, 100, 30);
+        settle(&mut app, 100, 30, |app| row(app, 0).starts_with("# Alpha"));
+
+        type_text(&mut app, ":q");
+        press(&mut app, KeyCode::Enter);
+
+        settle(&mut app, 100, 30, |app| {
+            app.active().map(|tab| tab.mode) == Some(Mode::Reading)
+        });
+        assert!(
+            app.nvim.is_some(),
+            "nvim stays alive behind the reading view"
+        );
+        assert!(!app.status.is_error, "status was {:?}", app.status.text);
+    }
+
+    #[test]
+    fn follow_heading_anchor_jumps() {
+        let mut beta = String::from("# Beta\n");
+        for i in 0..40 {
+            beta.push_str(&format!("line {i}\n"));
+        }
+        beta.push_str("## Deep\ntext\n");
+        let Some((_vault, mut app)) =
+            nvim_app_with(&[("Alpha.md", "# Alpha\n"), ("Beta.md", &beta)])
+        else {
+            return;
+        };
+        draw(&mut app, 100, 30);
+        settle(&mut app, 100, 30, |app| row(app, 0).starts_with("# Alpha"));
+
+        crate::actions::dispatch(
+            &mut app,
+            crate::app::Action::FollowLink(bridge::LinkTarget {
+                note: "Beta".to_string(),
+                anchor: Some(bridge::Anchor::Heading("Deep".to_string())),
+                source: None,
+            }),
+        );
+
+        settle(&mut app, 100, 30, |app| row(app, 0).starts_with("## Deep"));
+        assert_eq!(active_title(&app), "Beta");
+    }
+
+    #[test]
+    fn follow_anchor_in_the_open_note_jumps_without_a_second_tab() {
+        let mut alpha = String::from("# Alpha\n");
+        for i in 0..40 {
+            alpha.push_str(&format!("line {i}\n"));
+        }
+        alpha.push_str("the block ^blk1\nend\n");
+        let Some((_vault, mut app)) = nvim_app_with(&[("Alpha.md", &alpha), ("Beta.md", "# B\n")])
+        else {
+            return;
+        };
+        draw(&mut app, 100, 30);
+        settle(&mut app, 100, 30, |app| row(app, 0).starts_with("# Alpha"));
+
+        crate::actions::dispatch(
+            &mut app,
+            crate::app::Action::FollowLink(bridge::LinkTarget {
+                note: "Alpha".to_string(),
+                anchor: Some(bridge::Anchor::Block("blk1".to_string())),
+                source: None,
+            }),
+        );
+
+        settle(&mut app, 100, 30, |app| {
+            row(app, 0).starts_with("the block")
+        });
+        assert_eq!(app.tabs.len(), 1);
+    }
+
+    #[test]
+    fn nvim_is_told_the_note_names_once_per_index_revision() {
+        let Some((_vault, mut app)) = nvim_app() else {
+            return;
+        };
+        draw(&mut app, 100, 30);
+
+        settle(&mut app, 100, 30, |app| {
+            app.nvim.as_ref().unwrap().notes_revision() == Some(app.index.revision())
+        });
+    }
+
+    #[test]
+    fn note_names_are_stems_and_aliases_without_duplicates() {
+        let vault = TempVault::new("nvim-names");
+        vault.write("Alpha.md", "---\naliases: [Al, Beta]\n---\n# A\n");
+        vault.write("sub/Beta.md", "# B\n");
+        vault.write("Gamma.md", "# G\n");
+        let app = App::new(vault.vault(), Config::default()).expect("app");
+
+        assert_eq!(note_names(&app.index), ["Al", "Alpha", "Beta", "Gamma"]);
+    }
+
+    /// A bare app, no nvim: the actions `:Emeraldian` can name.
+    fn plain_app() -> (TempVault, App) {
+        let vault = TempVault::new("nvim-actions");
+        vault.write("Alpha.md", "# Alpha\n");
+        let app = App::new(vault.vault(), Config::default()).expect("app");
+        (vault, app)
+    }
+
+    fn action(app: &mut App, name: &str) -> bool {
+        handle_bridge(app, BridgeEvent::Action(name.to_string()))
+    }
+
+    #[test]
+    fn bridge_actions_open_the_matching_views() {
+        let (_vault, mut app) = plain_app();
+
+        assert!(action(&mut app, "switcher"));
+        assert!(app.modal.is_some());
+
+        app.modal = None;
+        action(&mut app, "search");
+        assert!(app.modal.is_some());
+
+        app.modal = None;
+        action(&mut app, "graph");
+        assert_eq!(app.view, crate::app::View::Graph);
+    }
+
+    #[test]
+    fn bridge_actions_focus_panes_and_side_panels() {
+        let (_vault, mut app) = plain_app();
+        app.config.ui.show_left_sidebar = true;
+        app.config.ui.show_right_sidebar = false;
+        app.focus = Focus::Note;
+
+        action(&mut app, "explorer");
+        assert_eq!(app.focus, Focus::Explorer);
+
+        // Backlinks opens the right sidebar on its backlinks tab and focuses it.
+        action(&mut app, "backlinks");
+        assert!(app.config.ui.show_right_sidebar);
+        assert_eq!(app.side_panel, crate::app::SidePanel::Backlinks);
+        assert_eq!(app.focus, Focus::Sidebar);
+
+        action(&mut app, "outline");
+        assert_eq!(app.side_panel, crate::app::SidePanel::Outline);
+
+        action(&mut app, "focus_left");
+        assert_eq!(app.focus, Focus::Explorer);
+        action(&mut app, "focus_right");
+        assert_eq!(app.focus, Focus::Sidebar);
+    }
+
+    #[test]
+    fn bridge_chat_action_focuses_an_open_chat_instead_of_closing_it() {
+        let (_vault, mut app) = plain_app();
+        app.config.ui.show_chat = false;
+        app.focus = Focus::Note;
+
+        action(&mut app, "chat");
+        assert!(app.config.ui.show_chat);
+        assert_eq!(app.focus, Focus::Chat);
+
+        // Chat open, focus elsewhere: the key brings the focus back.
+        app.focus = Focus::Note;
+        action(&mut app, "chat");
+        assert!(app.config.ui.show_chat);
+        assert_eq!(app.focus, Focus::Chat);
+    }
+
+    #[test]
+    fn bridge_new_and_daily_actions_run() {
+        let (_vault, mut app) = plain_app();
+
+        action(&mut app, "new");
+        assert!(matches!(app.modal, Some(crate::modal::Modal::Prompt(_))));
+
+        app.modal = None;
+        action(&mut app, "daily");
+        assert!(
+            app.status.text.contains("created"),
+            "status was {:?}",
+            app.status.text
+        );
+    }
+
+    #[test]
+    fn bridge_every_listed_action_is_handled() {
+        for name in bridge::ACTIONS {
+            let (_vault, mut app) = plain_app();
+            action(&mut app, name);
+            assert!(
+                !app.status.is_error,
+                "`{name}` was not handled: {:?}",
+                app.status.text
+            );
+        }
+    }
+
+    #[test]
+    fn bridge_unknown_action_is_reported() {
+        let (_vault, mut app) = plain_app();
+
+        action(&mut app, "does_not_exist");
+
+        assert!(app.status.is_error);
+    }
+
+    #[test]
+    fn bridge_written_for_an_unknown_file_is_harmless() {
+        let (vault, mut app) = plain_app();
+
+        let changed = handle_bridge(&mut app, BridgeEvent::Written(vault.path().join("nope.md")));
+
+        assert!(!changed);
+        assert!(!app.status.is_error);
     }
 }

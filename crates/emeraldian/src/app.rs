@@ -19,6 +19,7 @@ use crate::agent::Chat;
 use crate::config::Config;
 use crate::editor::Editor;
 use crate::explorer::Explorer;
+use crate::nvim::bridge::LinkTarget;
 
 /// Which top-level surface is showing in the main pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -231,7 +232,7 @@ impl GraphView {
 pub enum Action {
     // Navigation
     OpenNote(NoteId),
-    FollowLink(String),
+    FollowLink(LinkTarget),
     RevealInExplorer,
     Back,
     /// Undoes a `Back`. Vim's `Ctrl+I`, against the note history.
@@ -745,25 +746,63 @@ impl App {
         self.vim.reset();
     }
 
-    /// Opens a note by name or vault-relative path, creating it if missing.
+    /// Opens the note a link leads to, creating it if missing.
     ///
     /// Following a link to a note that doesn't exist yet is how notes get
     /// written in Obsidian, so an unresolved target creates rather than errors.
-    pub fn open_or_create(&mut self, target: &str) {
-        if let Some(id) = self.index.resolve(target) {
+    /// A relative markdown link is read from the folder of the note it was
+    /// written in, and an anchor is jumped to once the note is being edited in
+    /// nvim.
+    pub fn open_or_create(&mut self, target: &LinkTarget) {
+        let relative = target.source.as_ref().and_then(|source| {
+            crate::nvim::bridge::relative_to(source, &self.index.vault.path, &target.note)
+        });
+        let name = match &relative {
+            Some(rel) if self.index.resolve(rel).is_some() => rel.clone(),
+            // Nothing there: a link such as `[x](Beta.md)` may still name a
+            // note elsewhere in the vault, which is how Obsidian reads it.
+            Some(rel) if self.index.resolve(&target.note).is_none() => rel.clone(),
+            _ => target.note.clone(),
+        };
+        if let Some(id) = self.index.resolve(&name) {
             self.open_note(id);
+            self.jump_to_anchor(target);
             return;
         }
         // The heading is the note's name, not its path — `Daily/2026-07-27`
         // should open with `# 2026-07-27`.
-        let title = target.rsplit('/').next().unwrap_or(target);
-        match self.index.create_note(target, &format!("# {title}\n\n")) {
+        let title = name.rsplit('/').next().unwrap_or(&name);
+        let title = title.strip_suffix(".md").unwrap_or(title);
+        match self.index.create_note(&name, &format!("# {title}\n\n")) {
             Ok(id) => {
                 self.explorer.rebuild(&self.index);
                 self.open_note(id);
-                self.info(format!("created {target}"));
+                self.info(format!("created {name}"));
             }
-            Err(err) => self.error(format!("could not create {target}: {err}")),
+            Err(err) => self.error(format!("could not create {name}: {err}")),
+        }
+    }
+
+    /// Moves the embedded nvim to the heading or block a link named, if the
+    /// note it opened is being edited there. A jump for a note that is only
+    /// read would sit queued until the next time it is edited, so it is not
+    /// sent.
+    pub fn jump_to_anchor(&mut self, target: &LinkTarget) {
+        let Some(anchor) = target.anchor.clone() else {
+            return;
+        };
+        if !self.nvim_editing() {
+            return;
+        }
+        let Some(path) = self
+            .active_note()
+            .and_then(|id| self.index.note(id))
+            .map(|note| note.meta.path.clone())
+        else {
+            return;
+        };
+        if let Some(session) = self.nvim.as_mut() {
+            session.goto(&path, anchor);
         }
     }
 
@@ -1268,7 +1307,7 @@ mod tests {
         let vault = sample();
         let mut app = app(&vault);
 
-        app.open_or_create("Brand New");
+        app.open_or_create(&LinkTarget::plain("Brand New"));
         assert!(vault.exists("Brand New.md"));
         assert_eq!(
             app.note_title(app.active_note().unwrap()),
@@ -1282,7 +1321,7 @@ mod tests {
         let vault = sample();
         let mut app = app(&vault);
 
-        app.open_or_create("Daily/2026-07-27");
+        app.open_or_create(&LinkTarget::plain("Daily/2026-07-27"));
         assert_eq!(
             vault.read("Daily/2026-07-27.md"),
             "# 2026-07-27\n\n",
@@ -1296,9 +1335,68 @@ mod tests {
         let mut app = app(&vault);
         let b = app.index.id_of_rel("B.md").unwrap();
 
-        app.open_or_create("B");
+        app.open_or_create(&LinkTarget::plain("B"));
         assert_eq!(app.active_note(), Some(b));
         assert_eq!(app.tabs.len(), 1, "nothing was created");
+    }
+
+    #[test]
+    fn follow_relative_md_link_resolves_from_source_folder() {
+        let vault = sample();
+        vault.write("sub/Gamma.md", "# Gamma\n");
+        vault.write("sub/B.md", "# Sub B\n");
+        let mut app = app(&vault);
+        let source = vault.path().join("sub/Gamma.md");
+        let sub_b = app.index.id_of_rel("sub/B.md").unwrap();
+        let root_b = app.index.id_of_rel("B.md").unwrap();
+
+        // `[x](B.md)` in sub/ means sub/B.md, not the B.md at the root...
+        app.open_or_create(&LinkTarget {
+            note: "B.md".to_string(),
+            anchor: None,
+            source: Some(source.clone()),
+        });
+        assert_eq!(app.active_note(), Some(sub_b));
+
+        // ... and `[x](../B.md)` is the one at the root.
+        app.open_or_create(&LinkTarget {
+            note: "../B.md".to_string(),
+            anchor: None,
+            source: Some(source),
+        });
+        assert_eq!(app.active_note(), Some(root_b));
+        assert_eq!(app.tabs.len(), 2, "nothing was created");
+    }
+
+    #[test]
+    fn a_relative_md_link_to_a_missing_note_creates_it_next_to_the_source() {
+        let vault = sample();
+        vault.write("sub/Gamma.md", "# Gamma\n");
+        let mut app = app(&vault);
+
+        app.open_or_create(&LinkTarget {
+            note: "Fresh.md".to_string(),
+            anchor: None,
+            source: Some(vault.path().join("sub/Gamma.md")),
+        });
+
+        assert_eq!(vault.read("sub/Fresh.md"), "# Fresh\n\n");
+        assert!(!vault.exists("Fresh.md"));
+    }
+
+    #[test]
+    fn a_relative_md_link_out_of_the_vault_falls_back_to_the_vault_lookup() {
+        let vault = sample();
+        let mut app = app(&vault);
+        let b = app.index.id_of_rel("B.md").unwrap();
+
+        app.open_or_create(&LinkTarget {
+            note: "../../B.md".to_string(),
+            anchor: None,
+            source: Some(vault.path().join("A.md")),
+        });
+
+        assert_eq!(app.active_note(), Some(b));
     }
 
     #[test]

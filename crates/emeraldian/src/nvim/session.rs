@@ -7,6 +7,7 @@
 //! Everything that needs the app (starting the session, following the active
 //! tab, reporting an exit) lives in `nvim::poll`.
 
+use super::bridge::{self, Anchor, BridgeEvent};
 use super::grid::Grid;
 use super::rpc::{Incoming, Rpc, Waker};
 use crate::config::EditorConfig;
@@ -49,16 +50,8 @@ pub enum Event {
     /// not ask for — a requested shutdown consumes the session instead.
     Exited(Option<i32>),
     /// Something nvim's injected bridge reported (links, saves, app actions).
-    /// Empty until the bridge lands, so nothing produces this yet.
     Bridge(BridgeEvent),
 }
-
-/// What the injected bridge tells emeraldian about the note being edited.
-///
-/// Filled in by the bridge task; the variant exists now so the session's event
-/// type does not change under the code that has to consume it.
-#[derive(Debug, Clone, PartialEq)]
-pub enum BridgeEvent {}
 
 /// A running embedded nvim, with the grid its UI is attached to.
 pub struct Session {
@@ -86,6 +79,14 @@ pub struct Session {
     latency_log: Option<std::fs::File>,
     /// Set once the reader saw nvim exit.
     exited: Option<Option<i32>>,
+    /// A jump to a heading or block that waits for its note to be on screen:
+    /// the path as [`Session::open`] will be given it, and where to go.
+    pending_anchor: Option<(PathBuf, Anchor)>,
+    /// The names `[[` can be completed to, answered to the bridge's
+    /// `emeraldian.notes` request.
+    notes: Vec<String>,
+    /// The index revision `notes` was built from.
+    notes_revision: Option<u64>,
 }
 
 impl Session {
@@ -126,6 +127,7 @@ impl Session {
         // pane replaced. `bufhidden = wipe` takes it out of the list as soon as
         // the first note hides it.
         discard_initial_buffer(&rpc)?;
+        inject_bridge(&rpc, vault_root, cfg.auto_save)?;
 
         let latency_log = std::env::var_os(LATENCY_LOG_ENV).and_then(|path| {
             std::fs::OpenOptions::new()
@@ -146,6 +148,9 @@ impl Session {
             input_at: None,
             latency_log,
             exited: None,
+            pending_anchor: None,
+            notes: Vec::new(),
+            notes_revision: None,
         })
     }
 
@@ -194,7 +199,66 @@ impl Session {
         self.shown = Some(path.to_path_buf());
         // A buffer switch always redraws.
         self.touch();
+        self.apply_anchor(path);
         Ok(())
+    }
+
+    /// Put the cursor on a heading or block of `path` once it is on screen:
+    /// at once when it already is, otherwise right after [`Session::open`]
+    /// switches to it. Only the latest request is kept.
+    pub fn goto(&mut self, path: &Path, anchor: Anchor) {
+        if self.exited.is_some() {
+            return;
+        }
+        self.pending_anchor = Some((path.to_path_buf(), anchor));
+        if self.shown.as_deref() == Some(path) {
+            self.apply_anchor(path);
+        }
+    }
+
+    /// Send the queued jump if it is for `path`. The command goes in the key
+    /// stream, right behind whatever switched buffers, so the order holds; its
+    /// text travels hex-encoded (see `goto_hex` in `bridge.lua`).
+    fn apply_anchor(&mut self, path: &Path) {
+        if self
+            .pending_anchor
+            .as_ref()
+            .map(|(for_path, _)| for_path.as_path())
+            != Some(path)
+        {
+            return;
+        }
+        let Some((_, anchor)) = self.pending_anchor.take() else {
+            return;
+        };
+        let (kind, text) = bridge::anchor_parts(&anchor);
+        let hex: String = text.bytes().map(|byte| format!("{byte:02x}")).collect();
+        let _ = self.rpc.notify(
+            "nvim_input",
+            vec![Value::from(format!(
+                "<Cmd>lua require('emeraldian').goto_hex('{kind}','{hex}')<CR>"
+            ))],
+        );
+        self.touch();
+    }
+
+    /// Record that nvim itself moved to `path` (reported as
+    /// [`BridgeEvent::Entered`]), so that [`Session::open`] does not switch to
+    /// the buffer it is already in.
+    pub fn note_shown(&mut self, path: &Path) {
+        self.shown = Some(path.to_path_buf());
+    }
+
+    /// The names `[[` completes to, built from the index at `revision`.
+    pub fn set_notes(&mut self, revision: u64, names: Vec<String>) {
+        self.notes = names;
+        self.notes_revision = Some(revision);
+    }
+
+    /// The index revision [`Session::set_notes`] was last given.
+    #[must_use]
+    pub fn notes_revision(&self) -> Option<u64> {
+        self.notes_revision
     }
 
     /// Tell nvim how large the pane is, when that changed.
@@ -282,17 +346,28 @@ impl Session {
                 Incoming::Notification { method, params } if method == "redraw" => {
                     redraw |= self.grid.apply(&params);
                 }
-                // The bridge's notifications. Nothing sends them yet, so they
-                // are dropped rather than guessed at.
-                Incoming::Notification { .. } => {}
-                Incoming::Request { id, .. } => {
-                    // Answering is what keeps nvim from waiting on emeraldian;
-                    // no request is served yet, and saying so is better than
-                    // leaving it to time out.
-                    let _ = self.rpc.respond(
-                        id,
-                        Err("emeraldian does not serve this request".to_string()),
-                    );
+                // The bridge's notifications; anything else is dropped rather
+                // than guessed at.
+                Incoming::Notification { method, params } => {
+                    if let Some(event) = bridge::parse_notification(&method, &params) {
+                        events.push(Event::Bridge(event));
+                    }
+                }
+                Incoming::Request { id, method, .. } => {
+                    // Answering is what keeps nvim from waiting on emeraldian,
+                    // so every request gets one, an error for what is not
+                    // served.
+                    let answer = if method == "emeraldian.notes" {
+                        Ok(Value::Array(
+                            self.notes
+                                .iter()
+                                .map(|name| Value::from(name.as_str()))
+                                .collect(),
+                        ))
+                    } else {
+                        Err(format!("emeraldian does not serve {method}"))
+                    };
+                    let _ = self.rpc.respond(id, answer);
                 }
                 Incoming::Exited(code) => {
                     self.exited = Some(code);
@@ -438,6 +513,22 @@ fn discard_initial_buffer(rpc: &Rpc) -> Result<()> {
         ],
         CALL,
     )?;
+    Ok(())
+}
+
+/// Load the bridge script into nvim. It needs the channel nvim knows this
+/// client by, to send its notifications to.
+fn inject_bridge(rpc: &Rpc, vault_root: &Path, auto_save: bool) -> Result<()> {
+    let info = rpc.request("nvim_get_api_info", Vec::new(), CALL)?;
+    let channel = info
+        .as_array()
+        .and_then(|info| info.first())
+        .cloned()
+        .ok_or_else(|| anyhow!("nvim_get_api_info answered {info}"))?;
+    // Buffer names are matched against this, and nvim names buffers by the
+    // resolved path (see `canonical`).
+    let args = bridge::inject_args(channel, &canonical(vault_root), auto_save);
+    rpc.request("nvim_exec_lua", vec![Value::from(bridge::LUA), args], CALL)?;
     Ok(())
 }
 

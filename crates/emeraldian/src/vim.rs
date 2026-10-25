@@ -1351,7 +1351,7 @@ pub fn run_ex(app: &mut App, line: &str) {
             if argument.is_empty() {
                 crate::actions::dispatch(app, Action::Refresh);
             } else {
-                app.open_or_create(argument);
+                app.open_or_create(&crate::nvim::bridge::LinkTarget::plain(argument));
             }
         }
         "h" | "help" => crate::actions::dispatch(app, Action::OpenHelp),

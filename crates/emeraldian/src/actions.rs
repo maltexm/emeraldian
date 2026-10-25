@@ -363,7 +363,7 @@ pub fn dispatch(app: &mut App, action: Action) {
         }
         Action::DailyNote => {
             let name = app.daily_note_name();
-            app.open_or_create(&name);
+            app.open_or_create(&crate::nvim::bridge::LinkTarget::plain(name));
         }
         Action::Save => {
             if let Some(index) = app.active_tab {

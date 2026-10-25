@@ -6,6 +6,8 @@
 //! so a test never loads, depends on or litters someone's real nvim setup.
 #![allow(dead_code)]
 
+#[path = "../src/nvim/bridge.rs"]
+pub mod bridge;
 #[path = "../src/config.rs"]
 mod config;
 #[path = "../src/nvim/grid.rs"]

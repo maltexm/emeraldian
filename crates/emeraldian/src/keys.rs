@@ -11,6 +11,7 @@ use crate::actions::{self, dispatch};
 use crate::agent;
 use crate::app::{Action, App, Focus, Mode, View};
 use crate::modal::{Modal, PickerKind, Prompt, PromptIntent};
+use crate::nvim::bridge::LinkTarget;
 use crate::ui::panes::{SidebarTarget, sidebar_targets};
 
 /// Columns moved per keypress when panning a wide table sideways.
@@ -713,7 +714,7 @@ fn follow_first_link(app: &mut App) {
     });
 
     match target {
-        Some(target) => dispatch(app, Action::FollowLink(target)),
+        Some(target) => dispatch(app, Action::FollowLink(LinkTarget::plain(target))),
         None => app.info("no links in this note"),
     }
 }
@@ -1158,7 +1159,7 @@ fn handle_graph(app: &mut App, key: KeyEvent) {
                 // Opening an unresolved node creates the note it stands for,
                 // which is the whole point of showing them.
                 Some((emeraldian_core::graph::NodeKind::Unresolved, label)) => {
-                    dispatch(app, Action::FollowLink(label));
+                    dispatch(app, Action::FollowLink(LinkTarget::plain(label)));
                 }
                 _ => app.info("select a node first; Tab cycles through them"),
             }

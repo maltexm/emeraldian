@@ -38,6 +38,7 @@ use crossterm::event::{self, Event};
 use crate::app::{Action, App, View};
 use crate::cli::{Args, Command};
 use crate::config::Config;
+use crate::nvim::bridge::LinkTarget;
 
 /// How long to wait for input before redrawing.
 ///
@@ -255,10 +256,10 @@ fn expand_home(path: PathBuf) -> PathBuf {
 fn apply_startup_args(app: &mut App, args: &Args) {
     if args.daily {
         let name = app.daily_note_name();
-        app.open_or_create(&name);
+        app.open_or_create(&LinkTarget::plain(name));
     }
     if let Some(note) = &args.note {
-        app.open_or_create(note);
+        app.open_or_create(&LinkTarget::plain(note.as_str()));
     }
     if args.graph {
         let focus = app.active_note();
