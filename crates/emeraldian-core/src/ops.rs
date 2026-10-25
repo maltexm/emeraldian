@@ -324,31 +324,7 @@ impl VaultIndex {
         old_rel: &str,
         new_rel: &str,
     ) -> Result<()> {
-        let file_name = |rel: &str| rel.rsplit('/').next().unwrap_or(rel).to_string();
-
-        let mut forms: Vec<(String, String)> = Vec::new();
-        if note::own_extension(old_rel).is_some() {
-            forms.push((old_rel.to_string(), new_rel.to_string()));
-            forms.push((file_name(old_rel), file_name(new_rel)));
-        } else {
-            let strip = |rel: &str| rel.strip_suffix(".md").unwrap_or(rel).to_string();
-            forms.push((strip(old_rel), strip(new_rel)));
-            // The filename form is checked second so a link written as a full
-            // path is rewritten as a full path.
-            forms.push((old_stem.to_string(), new_stem.to_string()));
-            forms.push((old_rel.to_string(), new_rel.to_string()));
-            forms.push((file_name(old_rel), file_name(new_rel)));
-        }
-
-        let mut replacements: Vec<(String, String)> = Vec::new();
-        for (old, new) in forms {
-            if old == new {
-                continue;
-            }
-            for close in ["]]", "|", "#", "\\|"] {
-                replacements.push((format!("[[{old}{close}"), format!("[[{new}{close}")));
-            }
-        }
+        let replacements = wikilink_replacements(old_stem, new_stem, old_rel, new_rel);
         if replacements.is_empty() {
             return Ok(());
         }
@@ -370,6 +346,62 @@ impl VaultIndex {
 
         Ok(())
     }
+}
+
+/// The text replacements that turn links to the note at `old_rel` into links to
+/// `new_rel`: the shapes [`VaultIndex::update_wikilinks`] documents.
+fn wikilink_replacements(
+    old_stem: &str,
+    new_stem: &str,
+    old_rel: &str,
+    new_rel: &str,
+) -> Vec<(String, String)> {
+    let file_name = |rel: &str| rel.rsplit('/').next().unwrap_or(rel).to_string();
+
+    let mut forms: Vec<(String, String)> = Vec::new();
+    if note::own_extension(old_rel).is_some() {
+        forms.push((old_rel.to_string(), new_rel.to_string()));
+        forms.push((file_name(old_rel), file_name(new_rel)));
+    } else {
+        let strip = |rel: &str| rel.strip_suffix(".md").unwrap_or(rel).to_string();
+        forms.push((strip(old_rel), strip(new_rel)));
+        // The filename form is checked second so a link written as a full
+        // path is rewritten as a full path.
+        forms.push((old_stem.to_string(), new_stem.to_string()));
+        forms.push((old_rel.to_string(), new_rel.to_string()));
+        forms.push((file_name(old_rel), file_name(new_rel)));
+    }
+
+    let mut replacements: Vec<(String, String)> = Vec::new();
+    for (old, new) in forms {
+        if old == new {
+            continue;
+        }
+        for close in ["]]", "|", "#", "\\|"] {
+            replacements.push((format!("[[{old}{close}"), format!("[[{new}{close}")));
+        }
+    }
+    replacements
+}
+
+/// What the text of a Markdown note becomes when the note `old_rel` (file stem
+/// `old_stem`) is renamed or moved to `new_rel` (`new_stem`): the rewrite a
+/// rename applies to every note's file, for text that is not in a file — an
+/// editor buffer with unsaved changes.
+///
+/// Not for the text of a diagram file, where `A[[Old]]` is a node and not a
+/// link; a rename leaves those alone and so must the caller.
+#[must_use]
+pub fn rewrite_wikilinks(
+    text: &str,
+    old_stem: &str,
+    new_stem: &str,
+    old_rel: &str,
+    new_rel: &str,
+) -> String {
+    wikilink_replacements(old_stem, new_stem, old_rel, new_rel)
+        .iter()
+        .fold(text.to_string(), |acc, (old, new)| acc.replace(old, new))
 }
 
 fn validate_name(name: &str) -> Result<()> {
@@ -816,5 +848,24 @@ mod tests {
         index.create_folder("Empty/Nested").expect("create folder");
         assert!(index.folders().contains(&"Empty/Nested".to_string()));
         assert!(vault.path().join("Empty/Nested").is_dir());
+    }
+
+    #[test]
+    fn rewriting_text_gives_what_a_rename_writes_to_a_file() {
+        // The same note text, once through a rename on disk and once through
+        // the function the editor uses for a buffer that is not on disk yet.
+        let text =
+            "[[Old]] [[Old|alias]] [[Old#Head]] [[Sub/Old]] [[Sub/Old|x]] [[Other]] [[Old\\|t]]\n";
+        let vault = TempVault::new("rewrite-text");
+        vault.write("Sub/Old.md", "# Old\n");
+        vault.write("A.md", text);
+        let mut index = vault.index();
+        let id = index.id_of_rel("Sub/Old.md").unwrap();
+
+        index.rename_note(id, "New").expect("rename");
+
+        let rewritten = rewrite_wikilinks(text, "Old", "New", "Sub/Old.md", "Sub/New.md");
+        assert_eq!(rewritten, vault.read("A.md"));
+        assert_ne!(rewritten, text, "something was rewritten");
     }
 }

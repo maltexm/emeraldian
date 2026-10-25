@@ -253,6 +253,94 @@ function M.notes()
   return ok and names or {}
 end
 
+-- Calls emeraldian makes on the buffers it tracks -----------------------------
+--
+-- Each runs inside one RPC request, so nothing can be typed between its steps.
+
+--- Writes the buffer. Errors are nvim's own (read-only, a file that changed on
+--- disk and needs an answer) and travel back to the caller.
+function M.save(buf)
+  vim.api.nvim_buf_call(buf, function()
+    vim.cmd("silent update")
+  end)
+end
+
+--- The note behind `buf` was moved to `name` on disk. The buffer follows it.
+---
+--- `:file` marks a buffer "not edited", and a write then stops at E13 because
+--- the file it is named for exists. A clean buffer is read again, which clears
+--- that; one with unsaved edits is written, so they are kept in the new file.
+function M.rename_buffer(buf, name)
+  local old = vim.api.nvim_buf_get_name(buf)
+  local modified = vim.bo[buf].modified
+  vim.api.nvim_buf_set_name(buf, name)
+  -- The old name stays behind as an unlisted buffer. A jump back to it would
+  -- open a note that is no longer there, and saving that would bring it back.
+  for _, other in ipairs(vim.api.nvim_list_bufs()) do
+    if other ~= buf and vim.api.nvim_buf_get_name(other) == old then
+      pcall(vim.api.nvim_buf_delete, other, { force = true })
+    end
+  end
+  vim.api.nvim_buf_call(buf, function()
+    vim.cmd(modified and "silent write!" or "silent edit!")
+  end)
+end
+
+--- Replaces the buffer's text and writes it. `!` because the file on disk may
+--- have been rewritten by the very operation this belongs to, which nvim would
+--- otherwise ask about.
+function M.set_lines(buf, lines)
+  if not vim.deep_equal(vim.api.nvim_buf_get_lines(buf, 0, -1, false), lines) then
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  end
+  vim.api.nvim_buf_call(buf, function()
+    vim.cmd("silent update!")
+  end)
+end
+
+--- Reloads every buffer without unsaved edits whose file changed on disk. A
+--- buffer with edits is left to nvim, which asks the user what to do; that
+--- question must not come up inside this call, where nobody can answer it.
+function M.checktime()
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(buf) and note_buf(buf) and not vim.bo[buf].modified then
+      vim.api.nvim_buf_call(buf, function()
+        vim.cmd("setlocal autoread")
+        pcall(vim.cmd, "silent! checktime " .. buf)
+        vim.cmd("setlocal autoread<")
+      end)
+    end
+  end
+end
+
+--- Removes the buffer; without `force`, a buffer with unsaved edits stays.
+function M.close_buffer(buf, force)
+  -- Not left to `nvim_buf_delete`, which reports E89 on the screen and waits
+  -- for a key, with nobody to press it.
+  if not force and vim.bo[buf].modified then
+    error("the note has unsaved changes", 0)
+  end
+  -- Forced means the edits are given up. Leaving them marked would have
+  -- auto-save write them as the buffer is left (`BufLeave`), which for a note
+  -- that was just deleted brings it back.
+  if force then
+    vim.bo[buf].modified = false
+  end
+  vim.api.nvim_buf_delete(buf, { force = force })
+end
+
+--- The names of all buffers that have one.
+function M.buffer_names()
+  local names = {}
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    local name = vim.api.nvim_buf_get_name(buf)
+    if name ~= "" then
+      names[#names + 1] = name
+    end
+  end
+  return names
+end
+
 -- Auto-save ------------------------------------------------------------------
 
 local timers = {}

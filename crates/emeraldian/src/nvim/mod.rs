@@ -33,6 +33,8 @@ pub mod bridge;
 pub mod grid;
 #[allow(dead_code)]
 pub mod input;
+#[cfg(test)]
+mod lifecycle_tests;
 pub mod render;
 #[allow(dead_code)]
 pub mod rpc;
@@ -129,9 +131,8 @@ fn handle_bridge(app: &mut App, event: BridgeEvent) -> bool {
             true
         }
         BridgeEvent::Written(path) => reindex(app, &path),
-        // Which buffers are dirty is read from nvim when it is asked (a tab
-        // close, a write tool); the lifecycle work will switch to this push.
-        BridgeEvent::Modified(..) => false,
+        // A buffer going dirty or clean changes the mark on its tab.
+        BridgeEvent::Modified(..) => true,
         BridgeEvent::Entered(path) => follow_nvim(app, &path),
         BridgeEvent::Action(name) => run_action(app, &name),
         BridgeEvent::LeaveEditing => leave_editing(app),
@@ -396,12 +397,46 @@ pub fn cursor_style(app: &App) -> Option<SetCursorStyle> {
     })
 }
 
-/// Writes what auto-save asks for and ends the nvim process.
+/// Before an assistant turn that may write: puts every buffer on disk, so that
+/// the assistant works on what is on screen and the write tools find nothing
+/// they have to refuse. Without auto-save the buffers stay as they are, and the
+/// tools refuse the notes with unsaved edits.
+pub fn before_agent_turn(app: &mut App) {
+    if !app.config.agent.allow_writes || !app.config.editor.auto_save {
+        return;
+    }
+    if let Some(session) = app.nvim.as_mut()
+        && let Err(err) = session.save_all()
+    {
+        app.error(format!(
+            "could not save the open notes before the assistant's turn: {err}"
+        ));
+    }
+}
+
+/// Ends the nvim session, after writing what auto-save asks for. Nothing is
+/// ended when that fails: the session is where the unsaved edits are.
+///
+/// For leaving a vault, where the session cannot carry on.
+pub fn end_session(app: &mut App) -> Result<(), String> {
+    if app.config.editor.auto_save
+        && let Some(session) = app.nvim.as_mut()
+    {
+        session.save_all().map_err(|err| err.to_string())?;
+    }
+    if let Some(session) = app.nvim.take() {
+        session.shutdown();
+    }
+    Ok(())
+}
+
+/// Ends the nvim process at exit, after writing what auto-save asks for.
+/// Whatever that leaves unsaved is lost: the quit action refuses to get this
+/// far while a note cannot be written.
 pub fn shutdown(app: &mut App) {
-    if let Some(mut session) = app.nvim.take() {
-        if app.config.editor.auto_save {
-            let _ = session.save_all();
-        }
+    if end_session(app).is_err()
+        && let Some(session) = app.nvim.take()
+    {
         session.shutdown();
     }
 }
@@ -424,9 +459,9 @@ mod tests {
     use crate::nvim::session::Session;
     use crate::ui;
 
-    const LIMIT: Duration = Duration::from_secs(10);
+    pub(super) const LIMIT: Duration = Duration::from_secs(10);
 
-    fn nvim_available() -> bool {
+    pub(super) fn nvim_available() -> bool {
         std::process::Command::new("nvim")
             .arg("--version")
             .output()
@@ -437,12 +472,20 @@ mod tests {
     /// The app over a temp vault with the nvim backend, `Alpha.md` open in it,
     /// and a clean nvim already attached (so no test reads or writes anyone's
     /// nvim config, shada or swap files). `None` without nvim.
-    fn nvim_app() -> Option<(TempVault, App)> {
+    pub(super) fn nvim_app() -> Option<(TempVault, App)> {
         nvim_app_with(&[("Alpha.md", "# Alpha\n\nbody\n"), ("Beta.md", "# Beta\n")])
     }
 
     /// [`nvim_app`] over a vault made of `files`; `Alpha.md` must be one.
-    fn nvim_app_with(files: &[(&str, &str)]) -> Option<(TempVault, App)> {
+    pub(super) fn nvim_app_with(files: &[(&str, &str)]) -> Option<(TempVault, App)> {
+        nvim_app_configured(files, |_| {})
+    }
+
+    /// [`nvim_app_with`] after `configure` changed the settings.
+    pub(super) fn nvim_app_configured(
+        files: &[(&str, &str)],
+        configure: impl FnOnce(&mut Config),
+    ) -> Option<(TempVault, App)> {
         if !nvim_available() {
             eprintln!("skip: nvim not on PATH");
             return None;
@@ -454,6 +497,7 @@ mod tests {
         let mut config = Config::default();
         config.editor.backend = EditorBackend::Nvim;
         config.ui.reading_mode = false;
+        configure(&mut config);
         let mut app = App::new(vault.vault(), config).expect("app");
         let alpha = app.index.id_of_rel("Alpha.md").expect("indexed");
         app.open_note(alpha);
@@ -470,7 +514,7 @@ mod tests {
     }
 
     /// Draw one frame at `width` x `height`; returns the screen as text.
-    fn draw(app: &mut App, width: u16, height: u16) -> Vec<String> {
+    pub(super) fn draw(app: &mut App, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
         terminal.draw(|frame| ui::draw(frame, app)).expect("draw");
         let buffer = terminal.backend().buffer().clone();
@@ -484,7 +528,12 @@ mod tests {
     }
 
     /// Poll (and redraw) until `done` holds, or fail after [`LIMIT`].
-    fn settle(app: &mut App, width: u16, height: u16, mut done: impl FnMut(&App) -> bool) {
+    pub(super) fn settle(
+        app: &mut App,
+        width: u16,
+        height: u16,
+        mut done: impl FnMut(&App) -> bool,
+    ) {
         let deadline = Instant::now() + LIMIT;
         loop {
             poll(app);
@@ -502,7 +551,7 @@ mod tests {
         }
     }
 
-    fn row(app: &App, row: usize) -> String {
+    pub(super) fn row(app: &App, row: usize) -> String {
         let grid = app.nvim.as_ref().expect("session").grid();
         let width = usize::from(grid.width);
         grid.cells[row * width..(row + 1) * width]
@@ -511,7 +560,7 @@ mod tests {
             .collect()
     }
 
-    fn type_text(app: &mut App, text: &str) {
+    pub(super) fn type_text(app: &mut App, text: &str) {
         for ch in text.chars() {
             keys::handle(app, KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
         }
@@ -781,13 +830,13 @@ mod tests {
     }
 
     /// The title of the note the active tab shows.
-    fn active_title(app: &App) -> String {
+    pub(super) fn active_title(app: &App) -> String {
         app.active_note()
             .map(|id| app.note_title(id))
             .unwrap_or_default()
     }
 
-    fn press(app: &mut App, code: KeyCode) {
+    pub(super) fn press(app: &mut App, code: KeyCode) {
         keys::handle(app, KeyEvent::new(code, KeyModifiers::NONE));
     }
 

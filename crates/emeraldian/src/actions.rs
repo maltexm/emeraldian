@@ -372,7 +372,7 @@ pub fn dispatch(app: &mut App, action: Action) {
         }
         Action::SaveAll => {
             for index in 0..app.tabs.len() {
-                if app.tabs[index].is_modified() {
+                if app.tab_modified(index) {
                     app.save_tab(index);
                 }
             }
@@ -412,6 +412,7 @@ pub fn dispatch(app: &mut App, action: Action) {
 
         // ---- tabs -------------------------------------------------------
         Action::CloseTab => app.close_tab(),
+        Action::DiscardAndCloseTab => app.close_tab_discarding(),
         Action::NextTab => app.cycle_tab(1),
         Action::PreviousTab => app.cycle_tab(-1),
 
@@ -419,14 +420,16 @@ pub fn dispatch(app: &mut App, action: Action) {
         Action::ToggleMode => {
             // Switching out of the editor saves, so the reading view never
             // shows something different from what's on disk.
-            let should_save = app
-                .active()
-                .is_some_and(|t| t.mode == Mode::Editing && t.is_modified());
+            let should_save = app.config.editor.auto_save
+                && app.active().is_some_and(|t| t.mode == Mode::Editing)
+                && app.active_tab.is_some_and(|index| app.tab_modified(index));
             if should_save
-                && app.config.editor.auto_save
                 && let Some(index) = app.active_tab
+                && !app.try_save_tab(index)
             {
-                app.save_tab(index);
+                // Staying where the unsaved text is on screen, and the reason
+                // in the status bar, beats hiding it behind the reading view.
+                return;
             }
             if let Some(tab) = app.active_mut() {
                 tab.mode = match tab.mode {
@@ -744,7 +747,9 @@ pub fn dispatch(app: &mut App, action: Action) {
         Action::Quit => {
             // Quitting is one keystroke away from every pane, so it asks first
             // — and says what's at stake when there's unsaved work.
-            let unsaved = app.tabs.iter().filter(|t| t.is_modified()).count();
+            let unsaved = (0..app.tabs.len())
+                .filter(|&index| app.tab_modified(index))
+                .count();
             let message = match unsaved {
                 0 => "Quit emeraldian?".to_string(),
                 1 => "Quit emeraldian? 1 note has unsaved changes.".to_string(),
@@ -756,11 +761,17 @@ pub fn dispatch(app: &mut App, action: Action) {
             }));
         }
         Action::ForceQuit => {
-            // Unsaved work is written out rather than silently dropped.
+            // Unsaved work is written out rather than silently dropped, and a
+            // note that cannot be written keeps emeraldian from quitting on it.
             if app.config.editor.auto_save {
                 for index in 0..app.tabs.len() {
-                    if app.tabs[index].is_modified() {
-                        app.save_tab(index);
+                    if app.tab_modified(index) && !app.try_save_tab(index) {
+                        let title = app.note_title(app.tabs[index].note);
+                        app.error(format!(
+                            "not quitting: \"{title}\" could not be saved ({})",
+                            app.status.text
+                        ));
+                        return;
                     }
                 }
             }
@@ -776,13 +787,8 @@ pub fn confirm(app: &mut App, action: Action) {
         Action::DeleteNote => {
             let Some(id) = app.active_note() else { return };
             let title = app.note_title(id);
-            match app.index.delete_note(id) {
-                Ok(_) => {
-                    app.tabs.retain(|t| t.note != id);
-                    app.active_tab = if app.tabs.is_empty() { None } else { Some(0) };
-                    app.refresh();
-                    app.info(format!("moved \"{title}\" to trash"));
-                }
+            match app.delete_note(id) {
+                Ok(_) => app.info(format!("moved \"{title}\" to trash")),
                 Err(err) => app.error(format!("delete failed: {err}")),
             }
         }
@@ -801,7 +807,7 @@ pub fn submit_prompt(app: &mut App, prompt: Prompt) {
                 return;
             }
             let content = format!("# {}\n\n", value.rsplit('/').next().unwrap_or(&value));
-            match app.index.create_note(&value, &content) {
+            match app.create_note(&value, &content) {
                 Ok(id) => {
                     app.explorer.rebuild(&app.index);
                     app.open_note(id);
@@ -832,12 +838,11 @@ pub fn submit_prompt(app: &mut App, prompt: Prompt) {
             if value.is_empty() {
                 return;
             }
-            match app.index.rename_note(id, &value) {
-                Ok(_) => {
-                    app.refresh();
-                    app.explorer.rebuild(&app.index);
-                    app.info(format!("renamed to {value}"));
-                }
+            match app.rename_note(id, &value) {
+                Ok(renamed) => match renamed.warning {
+                    Some(warning) => app.error(format!("renamed to {value}, but {warning}")),
+                    None => app.info(format!("renamed to {value}")),
+                },
                 Err(err) => app.error(format!("rename failed: {err}")),
             }
         }

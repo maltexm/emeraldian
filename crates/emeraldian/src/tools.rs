@@ -559,7 +559,7 @@ fn create_note(app: &mut App, args: &Value) -> ToolOutcome {
         Err(err) => return ToolOutcome::error(format!("invalid name `{name}`: {err}")),
     };
 
-    match app.index.create_note(&rel, content) {
+    match app.create_note(&rel, content) {
         Ok(id) => {
             app.explorer.rebuild(&app.index);
             app.open_note(id);
@@ -580,6 +580,9 @@ fn append_note(app: &mut App, args: &Value) -> ToolOutcome {
     let name = arg!(args, "name");
     let addition = arg!(args, "text");
     let id = note!(app, name);
+    if let Some(refusal) = refuse_unsaved_edits(app, id) {
+        return refusal;
+    }
 
     match app.index.append_note(id, &addition) {
         Ok(()) => {
@@ -598,6 +601,9 @@ fn replace_note(app: &mut App, args: &Value) -> ToolOutcome {
     let name = arg!(args, "name");
     let content = arg!(args, "content");
     let id = note!(app, name);
+    if let Some(refusal) = refuse_unsaved_edits(app, id) {
+        return refusal;
+    }
 
     match app.index.write_note(id, &content) {
         Ok(()) => {
@@ -616,7 +622,9 @@ fn link_notes(app: &mut App, args: &Value) -> ToolOutcome {
     let from = arg!(args, "from");
     let to = arg!(args, "to");
     let from_id = note!(app, from);
-
+    if let Some(refusal) = refuse_unsaved_edits(app, from_id) {
+        return refusal;
+    }
     // The target need not exist: an unresolved link is a real graph node and a
     // legitimate way to plan a note that isn't written yet.
     let target_name = app
@@ -651,20 +659,25 @@ fn rename_note(app: &mut App, args: &Value) -> ToolOutcome {
     let name = arg!(args, "name");
     let new_name = arg!(args, "new_name");
     let id = note!(app, name);
+    if let Some(refusal) = refuse_unsaved_edits(app, id) {
+        return refusal;
+    }
 
-    match app.index.rename_note(id, &new_name) {
-        Ok(new_id) => {
-            // A rename renumbers every note, so open tabs must be re-resolved.
-            app.refresh();
-            app.explorer.rebuild(&app.index);
+    // A rename renumbers every note; the app re-resolves its tabs.
+    match app.rename_note(id, &new_name) {
+        Ok(renamed) => {
             let rel = app
                 .index
-                .note(new_id)
+                .note(renamed.id)
                 .map_or(new_name, |n| n.meta.rel.clone());
-            ToolOutcome::ok(
-                format!("renamed to {rel}"),
-                format!("Renamed `{name}` to `{rel}` and updated every wikilink to it."),
-            )
+            let mut content =
+                format!("Renamed `{name}` to `{rel}` and updated every wikilink to it.");
+            if let Some(warning) = renamed.warning {
+                content.push_str(&format!(
+                    " The editor did not follow completely: {warning}."
+                ));
+            }
+            ToolOutcome::ok(format!("renamed to {rel}"), content)
         }
         Err(err) => ToolOutcome::error(format!("could not rename: {err}")),
     }
@@ -673,26 +686,41 @@ fn rename_note(app: &mut App, args: &Value) -> ToolOutcome {
 fn delete_note(app: &mut App, args: &Value) -> ToolOutcome {
     let name = arg!(args, "name");
     let id = note!(app, name);
+    if let Some(refusal) = refuse_unsaved_edits(app, id) {
+        return refusal;
+    }
     let rel = app
         .index
         .note(id)
         .map_or_else(|| name.clone(), |n| n.meta.rel.clone());
 
-    match app.index.delete_note(id) {
-        Ok(trashed) => {
-            app.tabs.retain(|t| t.note != id);
-            app.active_tab = if app.tabs.is_empty() { None } else { Some(0) };
-            app.refresh();
-            ToolOutcome::ok(
-                format!("deleted {rel}"),
-                format!(
-                    "Moved `{rel}` to the vault trash ({}). It can be restored from there.",
-                    trashed.display()
-                ),
-            )
-        }
+    match app.delete_note(id) {
+        Ok(trashed) => ToolOutcome::ok(
+            format!("deleted {rel}"),
+            format!(
+                "Moved `{rel}` to the vault trash ({}). It can be restored from there.",
+                trashed.display()
+            ),
+        ),
         Err(err) => ToolOutcome::error(format!("could not delete: {err}")),
     }
+}
+
+/// The reply to a write on a note whose editor holds changes that are not on
+/// disk. Writing to the file anyway would put one version under the other, and
+/// whoever saves second wins without knowing; the model is told to come back.
+fn refuse_unsaved_edits(app: &App, id: NoteId) -> Option<ToolOutcome> {
+    if !app.nvim_buffer_modified(id) {
+        return None;
+    }
+    let way_out = if app.config.editor.auto_save {
+        "They are saved automatically within a second: wait, then retry."
+    } else {
+        "Ask the user to save the note, then retry."
+    };
+    Some(ToolOutcome::error(format!(
+        "note has unsaved edits in the editor; nothing was changed. {way_out}"
+    )))
 }
 
 /// Reloads an open tab after the agent changed the file underneath it.
@@ -700,6 +728,11 @@ fn delete_note(app: &mut App, args: &Value) -> ToolOutcome {
 /// Without this the user would keep editing stale text and silently overwrite
 /// the agent's change on the next save.
 fn reload_open_tab(app: &mut App, id: NoteId) {
+    // nvim reloads what has no unsaved edits; those that have were refused
+    // before anything was written.
+    if let Some(session) = app.nvim.as_mut() {
+        session.checktime();
+    }
     let Some(position) = app.tabs.iter().position(|t| t.note == id) else {
         return;
     };

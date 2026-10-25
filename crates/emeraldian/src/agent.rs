@@ -221,6 +221,26 @@ fn char_to_byte(text: &str, chars: usize) -> usize {
         .map_or(text.len(), |(byte, _)| byte)
 }
 
+/// The open note as the assistant is shown it: its path in the vault and its
+/// body, without the frontmatter.
+pub fn active_note_text(app: &App) -> Option<(String, String)> {
+    let id = app.active_note()?;
+    let note = app.index.note(id)?;
+    // What is on screen, unsaved edits and all, when nvim holds the note: the
+    // file may be a second behind (auto-save) or a long way (without it).
+    let unsaved = app
+        .nvim
+        .as_ref()
+        .and_then(|session| session.buffer_text(&note.meta.path));
+    let body = match unsaved {
+        Some(text) => emeraldian_core::note::split_frontmatter(&text)
+            .1
+            .to_string(),
+        None => app.index.read_body(id).ok()?,
+    };
+    Some((note.meta.rel.clone(), body))
+}
+
 /// Starts a turn with the text currently in the input box.
 ///
 /// A free function rather than a method because sending needs the vault (for
@@ -235,14 +255,16 @@ pub fn send(app: &mut App) {
     app.chat.follow = true;
     app.chat.transcript.push(Entry::User(text.clone()));
 
+    // A turn that may write works on what is on screen: the open notes are
+    // put on disk first.
+    crate::nvim::before_agent_turn(app);
+
     // The open note travels with the message so "summarize this" works without
     // the user naming the note.
     let mut prompt = text;
     if app.config.agent.include_active_note
-        && let Some(id) = app.active_note()
-        && let (Some(note), Ok(body)) = (app.index.note(id), app.index.read_body(id))
+        && let Some((rel, body)) = active_note_text(app)
     {
-        let rel = note.meta.rel.clone();
         let clipped: String = body.chars().take(8_000).collect();
         app.chat
             .transcript

@@ -19,6 +19,7 @@ use crate::agent::Chat;
 use crate::config::Config;
 use crate::editor::Editor;
 use crate::explorer::Explorer;
+use crate::modal::{Confirm, Modal};
 use crate::nvim::bridge::LinkTarget;
 
 /// Which top-level surface is showing in the main pane.
@@ -102,6 +103,44 @@ impl Tab {
 pub struct Status {
     pub text: String,
     pub is_error: bool,
+}
+
+/// The notes the tabs showed, by path in the vault, from before an operation
+/// that renumbers the index. See [`App::tab_snapshot`].
+struct TabSnapshot {
+    /// Per tab; `None` for a note the index did not know.
+    notes: Vec<Option<String>>,
+    active: Option<usize>,
+    /// The back and forward trails, the same way.
+    history: Vec<Option<String>>,
+    forward: Vec<Option<String>>,
+}
+
+/// What a note is called, as the rename rewrites links.
+struct NoteName {
+    rel: String,
+    stem: String,
+    path: PathBuf,
+}
+
+impl NoteName {
+    fn of(meta: &emeraldian_core::note::NoteMeta) -> Self {
+        Self {
+            rel: meta.rel.clone(),
+            stem: meta.stem.clone(),
+            path: meta.path.clone(),
+        }
+    }
+}
+
+/// The result of [`App::rename_note`].
+pub struct Renamed {
+    /// The note's id after the rename: ids are positions, and a rename moves
+    /// them.
+    pub id: NoteId,
+    /// Set when the note was renamed but nvim could not follow in every
+    /// respect.
+    pub warning: Option<String>,
 }
 
 /// The graph view's simulation and viewport.
@@ -252,6 +291,9 @@ pub enum Action {
 
     // Tabs
     CloseTab,
+    /// Closes the open tab and drops the unsaved edits in it: what a "close it
+    /// anyway" confirmation runs.
+    DiscardAndCloseTab,
     NextTab,
     PreviousTab,
 
@@ -662,6 +704,46 @@ impl App {
             && self.editing()
     }
 
+    /// Whether the tab at `index` has changes that are not on disk.
+    ///
+    /// Asks nvim when it holds the note, so it is right at the moment a close,
+    /// a quit or a write is decided; drawing uses [`App::tab_marked_modified`].
+    #[must_use]
+    pub fn tab_modified(&self, index: usize) -> bool {
+        let Some(tab) = self.tabs.get(index) else {
+            return false;
+        };
+        tab.is_modified() || self.nvim_buffer_modified(tab.note)
+    }
+
+    /// [`App::tab_modified`] for drawing: cheap, and a few milliseconds behind
+    /// what nvim holds.
+    #[must_use]
+    pub fn tab_marked_modified(&self, index: usize) -> bool {
+        let Some(tab) = self.tabs.get(index) else {
+            return false;
+        };
+        tab.is_modified()
+            || self
+                .note_path(tab.note)
+                .zip(self.nvim.as_ref())
+                .is_some_and(|(path, session)| session.shows_modified(&path))
+    }
+
+    /// Whether nvim holds unsaved edits to the note. The built-in editor's
+    /// edits are not asked about here: its tabs carry them themselves.
+    #[must_use]
+    pub fn nvim_buffer_modified(&self, id: NoteId) -> bool {
+        self.note_path(id)
+            .zip(self.nvim.as_ref())
+            .is_some_and(|(path, session)| session.is_modified(&path))
+    }
+
+    /// The file behind a note.
+    fn note_path(&self, id: NoteId) -> Option<PathBuf> {
+        self.index.note(id).map(|note| note.meta.path.clone())
+    }
+
     #[must_use]
     pub fn note_title(&self, id: NoteId) -> String {
         self.index
@@ -773,7 +855,7 @@ impl App {
         // should open with `# 2026-07-27`.
         let title = name.rsplit('/').next().unwrap_or(&name);
         let title = title.strip_suffix(".md").unwrap_or(title);
-        match self.index.create_note(&name, &format!("# {title}\n\n")) {
+        match self.create_note(&name, &format!("# {title}\n\n")) {
             Ok(id) => {
                 self.explorer.rebuild(&self.index);
                 self.open_note(id);
@@ -806,12 +888,53 @@ impl App {
         }
     }
 
+    /// Closes the open tab. A note with unsaved edits is saved first when
+    /// auto-save is on and stays open if that fails; without auto-save the
+    /// edits nvim holds are asked about (see [`Action::DiscardAndCloseTab`]).
     pub fn close_tab(&mut self) {
         let Some(index) = self.active_tab else {
             return;
         };
-        if self.tabs[index].is_modified() && self.config.editor.auto_save {
-            self.save_tab(index);
+        if self.tab_modified(index) {
+            if self.config.editor.auto_save {
+                if !self.try_save_tab(index) {
+                    return;
+                }
+            } else if self.tab_is_in_nvim(index) {
+                let title = self.note_title(self.tabs[index].note);
+                self.modal = Some(Modal::Confirm(Confirm {
+                    message: format!("\"{title}\" has unsaved changes. Close it and discard them?"),
+                    action: Action::DiscardAndCloseTab,
+                }));
+                return;
+            }
+        }
+        self.remove_tab(index, false);
+    }
+
+    /// Closes the open tab and drops its unsaved edits, for after the user
+    /// said so.
+    pub fn close_tab_discarding(&mut self) {
+        if let Some(index) = self.active_tab {
+            self.remove_tab(index, true);
+        }
+    }
+
+    /// Whether nvim, and not the built-in editor, is what edits the tab.
+    fn tab_is_in_nvim(&self, index: usize) -> bool {
+        self.nvim.is_some() && self.tabs.get(index).is_some_and(|tab| tab.editor.is_none())
+    }
+
+    fn remove_tab(&mut self, index: usize, discard: bool) {
+        // The buffer goes first: if nvim keeps it (edits typed since the check),
+        // so does the tab, and nothing is written back to the note later by a
+        // buffer nobody can see.
+        if let Some(path) = self.note_path(self.tabs[index].note)
+            && let Some(session) = self.nvim.as_mut()
+            && let Err(err) = session.close(&path, discard)
+        {
+            self.error(format!("could not close the note in nvim: {err}"));
+            return;
         }
         let closed = self.tabs.remove(index);
         if let Some(note) = self.index.note(closed.note) {
@@ -859,12 +982,21 @@ impl App {
     }
 
     pub fn save_tab(&mut self, index: usize) {
+        self.try_save_tab(index);
+    }
+
+    /// Writes the tab's note. `true` when there is nothing left unsaved in it:
+    /// it was written, or there was nothing to write.
+    pub fn try_save_tab(&mut self, index: usize) -> bool {
         let Some(tab) = self.tabs.get(index) else {
-            return;
+            return true;
         };
         let note = tab.note;
+        if self.tab_is_in_nvim(index) {
+            return self.save_nvim_note(note);
+        }
         let Some(text) = tab.editor.as_ref().map(Editor::text) else {
-            return;
+            return true;
         };
         match self.index.write_note(note, &text) {
             Ok(()) => {
@@ -874,9 +1006,36 @@ impl App {
                 let title = self.note_title(note);
                 self.info(format!("saved {title}"));
                 self.explorer.rebuild(&self.index);
+                true
             }
-            Err(err) => self.error(format!("save failed: {err}")),
+            Err(err) => {
+                self.error(format!("save failed: {err}"));
+                false
+            }
         }
+    }
+
+    /// Has nvim write the note's buffer and reads the file into the index, so
+    /// that the reading view, the backlinks and the graph show what was typed.
+    fn save_nvim_note(&mut self, note: NoteId) -> bool {
+        let Some(path) = self.note_path(note) else {
+            return true;
+        };
+        let Some(session) = self.nvim.as_mut() else {
+            return true;
+        };
+        if let Err(err) = session.save(&path) {
+            self.error(format!("save failed: {err}"));
+            return false;
+        }
+        if let Err(err) = self.index.refresh_note(note) {
+            self.error(format!("saved, but could not read the note again: {err}"));
+            return true;
+        }
+        let title = self.note_title(note);
+        self.info(format!("saved {title}"));
+        self.explorer.rebuild(&self.index);
+        true
     }
 
     // ---- graph -----------------------------------------------------------
@@ -960,17 +1119,7 @@ impl App {
 
     /// Re-reads the whole vault from disk.
     pub fn refresh(&mut self) {
-        // Note ids are positional, so anything holding one must be re-resolved
-        // against the rebuilt index or it will point at the wrong note.
-        let open: Vec<String> = self
-            .tabs
-            .iter()
-            .filter_map(|t| self.index.note(t.note).map(|n| n.meta.rel.clone()))
-            .collect();
-        let active_rel = self
-            .active_note()
-            .and_then(|id| self.index.note(id).map(|n| n.meta.rel.clone()));
-
+        let snapshot = self.tab_snapshot();
         if let Err(err) = self.index.rebuild() {
             self.error(format!("refresh failed: {err}"));
             return;
@@ -978,31 +1127,217 @@ impl App {
         // A reload is the one moment the user has said the files on disk have
         // changed, so it is also when an edited picture should be read again.
         self.images.forget();
-
-        self.tabs.retain(|_| true);
-        let mut rebuilt = Vec::new();
-        for (rel, tab) in open.iter().zip(std::mem::take(&mut self.tabs)) {
-            if let Some(id) = self.index.id_of_rel(rel) {
-                rebuilt.push(Tab { note: id, ..tab });
-            }
-        }
-        self.tabs = rebuilt;
-        self.active_tab = active_rel
-            .and_then(|rel| self.index.id_of_rel(&rel))
-            .and_then(|id| self.tabs.iter().position(|t| t.note == id))
-            .or(if self.tabs.is_empty() { None } else { Some(0) });
-
-        // Ids are positions, and a rebuilt index can put another note at one.
+        self.after_renumbering(snapshot, None);
+        // A reload can bring in notes the trail never knew; it starts over.
         self.history.clear();
         self.forward.clear();
+        // And the notes nvim shows: those without unsaved edits show the files
+        // again.
+        if let Some(session) = self.nvim.as_mut() {
+            session.checktime();
+        }
+    }
+
+    /// The notes the tabs show, by their path in the vault.
+    ///
+    /// Note ids are positions in the sorted list, so anything holding one must
+    /// be re-resolved after an operation that rebuilds or reshapes the index,
+    /// or it points at whatever note moved into its place. Taken *before* that
+    /// operation: afterwards the ids can no longer be told what they were.
+    fn tab_snapshot(&self) -> TabSnapshot {
+        let rel_of = |id: &NoteId| self.index.note(*id).map(|n| n.meta.rel.clone());
+        TabSnapshot {
+            notes: self.tabs.iter().map(|tab| rel_of(&tab.note)).collect(),
+            active: self.active_tab,
+            history: self.history.iter().map(rel_of).collect(),
+            forward: self.forward.iter().map(rel_of).collect(),
+        }
+    }
+
+    /// Puts the tabs and the back/forward trail back on the notes `snapshot`
+    /// names, with the ids the index has now. `renamed` is a note whose path
+    /// changed, `(from, to)`; a note that is gone loses its tab and its place
+    /// in the trail.
+    fn restore_tabs(&mut self, snapshot: TabSnapshot, renamed: Option<(&str, &str)>) {
+        let resolve = |index: &VaultIndex, rel: String| {
+            let rel = match renamed {
+                Some((from, to)) if rel == from => to.to_string(),
+                _ => rel,
+            };
+            index.id_of_rel(&rel)
+        };
+        let mut tabs: Vec<Tab> = Vec::new();
+        let mut active = None;
+        for (position, (tab, rel)) in std::mem::take(&mut self.tabs)
+            .into_iter()
+            .zip(snapshot.notes)
+            .enumerate()
+        {
+            let Some(id) = rel.and_then(|rel| resolve(&self.index, rel)) else {
+                continue;
+            };
+            if snapshot.active == Some(position) {
+                active = Some(tabs.len());
+            }
+            tabs.push(Tab { note: id, ..tab });
+        }
+        self.active_tab = active.or(if tabs.is_empty() { None } else { Some(0) });
+        self.tabs = tabs;
+        self.history = snapshot
+            .history
+            .into_iter()
+            .filter_map(|rel| resolve(&self.index, rel?))
+            .collect();
+        self.forward = snapshot
+            .forward
+            .into_iter()
+            .filter_map(|rel| resolve(&self.index, rel?))
+            .collect();
+    }
+
+    /// Everything that holds note ids, after the index was rebuilt.
+    fn after_renumbering(&mut self, snapshot: TabSnapshot, renamed: Option<(&str, &str)>) {
+        self.restore_tabs(snapshot, renamed);
         self.explorer.rebuild(&self.index);
         if self.graph.is_some() {
             self.refresh_graph();
         }
     }
 
+    /// Creates a note. Notes are kept sorted, so one that sorts before the open
+    /// tabs' notes moves their ids; the tabs are put back on their notes.
+    pub fn create_note(
+        &mut self,
+        name: &str,
+        content: &str,
+    ) -> emeraldian_core::error::Result<NoteId> {
+        let snapshot = self.tab_snapshot();
+        let id = self.index.create_note(name, content)?;
+        self.restore_tabs(snapshot, None);
+        Ok(id)
+    }
+
+    /// Renames a note and everything that shows it: the tabs follow it, links
+    /// to it are rewritten in the files and in the buffers nvim holds, and the
+    /// note's own buffer moves to the new path.
+    pub fn rename_note(&mut self, id: NoteId, new_name: &str) -> Result<Renamed, String> {
+        let Some(old) = self.index.note(id).map(|note| NoteName::of(&note.meta)) else {
+            return Err("that note no longer exists".to_string());
+        };
+        let snapshot = self.tab_snapshot();
+        // Taken now: what a rename rewrites in the files cannot reach text
+        // that only exists in nvim.
+        let unsaved = self.unsaved_texts();
+
+        let new_id = self
+            .index
+            .rename_note(id, new_name)
+            .map_err(|err| err.to_string())?;
+        let Some(new) = self.index.note(new_id).map(|note| NoteName::of(&note.meta)) else {
+            return Err("the renamed note is gone".to_string());
+        };
+        if new.rel == old.rel {
+            return Ok(Renamed {
+                id: new_id,
+                warning: None,
+            });
+        }
+        self.after_renumbering(snapshot, Some((&old.rel, &new.rel)));
+        let warning = self.move_nvim_buffers(&old, &new, unsaved);
+        Ok(Renamed {
+            id: new_id,
+            warning,
+        })
+    }
+
+    /// The text of every note nvim holds unsaved edits to: where it is, and
+    /// what it says.
+    fn unsaved_texts(&self) -> Vec<(String, PathBuf, String)> {
+        let Some(session) = self.nvim.as_ref() else {
+            return Vec::new();
+        };
+        self.tabs
+            .iter()
+            .filter_map(|tab| {
+                let note = &self.index.note(tab.note)?.meta;
+                let text = session
+                    .is_modified(&note.path)
+                    .then(|| session.buffer_text(&note.path))??;
+                Some((note.rel.clone(), note.path.clone(), text))
+            })
+            .collect()
+    }
+
+    /// After a rename on disk: has nvim follow it. The renamed note's buffer
+    /// takes the new name, links to it are rewritten in the buffers with unsaved
+    /// edits (the files were rewritten, the buffers cannot be), and the buffers
+    /// without are reloaded. `Some(text)` when nvim could not do all of it.
+    fn move_nvim_buffers(
+        &mut self,
+        old: &NoteName,
+        new: &NoteName,
+        unsaved: Vec<(String, PathBuf, String)>,
+    ) -> Option<String> {
+        let session = self.nvim.as_mut()?;
+        let mut problems = Vec::new();
+        if let Err(err) = session.rename(&old.path, &new.path) {
+            problems.push(format!("could not move the note's buffer: {err}"));
+        }
+        for (rel, path, text) in unsaved {
+            // A diagram's source has no wikilinks in it; `A[[Old]]` is a node.
+            if emeraldian_core::note::own_extension(&rel).is_some() {
+                continue;
+            }
+            let path = if rel == old.rel {
+                new.path.clone()
+            } else {
+                path
+            };
+            let rewritten = emeraldian_core::ops::rewrite_wikilinks(
+                &text, &old.stem, &new.stem, &old.rel, &new.rel,
+            );
+            if rewritten != text
+                && let Err(err) = session.set_lines(&path, &rewritten)
+            {
+                problems.push(format!("could not rewrite the links in {rel}: {err}"));
+            }
+        }
+        session.checktime();
+        (!problems.is_empty()).then(|| problems.join("; "))
+    }
+
+    /// Moves a note to the vault's trash and closes everything that showed it.
+    pub fn delete_note(&mut self, id: NoteId) -> Result<std::path::PathBuf, String> {
+        let Some(path) = self.note_path(id) else {
+            return Err("that note no longer exists".to_string());
+        };
+        let snapshot = self.tab_snapshot();
+        let trashed = self.index.delete_note(id).map_err(|err| err.to_string())?;
+        // The note is gone, and so are the edits in it: the buffer must not
+        // survive to write it back.
+        let closed = self
+            .nvim
+            .as_mut()
+            .map_or(Ok(()), |session| session.close(&path, true));
+        self.after_renumbering(snapshot, None);
+        match closed {
+            Ok(()) => Ok(trashed),
+            Err(err) => {
+                self.error(format!("moved to trash, but nvim kept the buffer: {err}"));
+                Ok(trashed)
+            }
+        }
+    }
+
     /// Switches to another vault, keeping settings and theme.
     pub fn open_vault(&mut self, path: PathBuf) {
+        // nvim runs in the old vault's folder and knows its notes by their
+        // paths; the new vault gets a session of its own, started when a note
+        // is edited. Not before the edits in it are safe.
+        if let Err(err) = crate::nvim::end_session(self) {
+            self.error(format!("not switching vaults: {err}"));
+            return;
+        }
         let scan = ScanOptions {
             include_hidden: self.config.ui.show_hidden,
             ..Default::default()
@@ -1572,5 +1907,94 @@ mod tests {
         assert_eq!(civil_from_days(19_723), (2024, 1, 1));
         // A leap day, which is where naive date math usually breaks.
         assert_eq!(civil_from_days(19_782), (2024, 2, 29));
+    }
+
+    // ---- ids are positions in the sorted list -----------------------------
+    //
+    // An operation that adds, renames or removes a note moves the ids of the
+    // notes after it. Everything that holds one has to follow, or a tab shows
+    // another note than it says.
+
+    fn titled(app: &App) -> Vec<String> {
+        app.tabs
+            .iter()
+            .map(|tab| app.note_title(tab.note))
+            .collect()
+    }
+
+    fn reorderable() -> TempVault {
+        let vault = TempVault::new("app-ids");
+        vault.write("Alpha.md", "# Alpha\n");
+        vault.write("Control.md", "# Control\n");
+        vault.write("Omega.md", "# Omega\n");
+        vault
+    }
+
+    #[test]
+    fn creating_a_note_keeps_the_open_tabs_on_their_notes() {
+        let vault = reorderable();
+        let mut app = app(&vault);
+        let omega = app.index.id_of_rel("Omega.md").unwrap();
+        app.open_note(omega);
+
+        // Sorts before Omega, so Omega's id moves up by one.
+        app.open_or_create(&LinkTarget::plain("Beta"));
+
+        assert_eq!(titled(&app), ["Omega", "Beta"]);
+        assert_eq!(
+            app.active_note().map(|id| app.note_title(id)).as_deref(),
+            Some("Beta")
+        );
+    }
+
+    #[test]
+    fn creating_a_note_keeps_the_history() {
+        let vault = reorderable();
+        let mut app = app(&vault);
+        let omega = app.index.id_of_rel("Omega.md").unwrap();
+        app.open_note(omega);
+        app.open_or_create(&LinkTarget::plain("Beta"));
+
+        // Back goes to Omega, not to whatever now has Omega's old id.
+        let back: Vec<String> = app.history.iter().map(|&id| app.note_title(id)).collect();
+        assert_eq!(back, ["Omega"]);
+    }
+
+    #[test]
+    fn renaming_a_note_to_a_later_name_keeps_the_tabs_on_their_notes() {
+        let vault = reorderable();
+        let mut app = app(&vault);
+        for rel in ["Alpha.md", "Control.md", "Omega.md", "Control.md"] {
+            let id = app.index.id_of_rel(rel).unwrap();
+            app.open_note(id);
+        }
+
+        let control = app.index.id_of_rel("Control.md").unwrap();
+        let renamed = app.rename_note(control, "Zulu").expect("rename");
+
+        assert_eq!(titled(&app), ["Alpha", "Zulu", "Omega"]);
+        assert_eq!(app.active_note(), Some(renamed.id));
+        assert_eq!(app.note_title(renamed.id), "Zulu");
+        let back: Vec<String> = app.history.iter().map(|&id| app.note_title(id)).collect();
+        assert_eq!(
+            back,
+            ["Alpha", "Zulu", "Omega"],
+            "history follows the rename"
+        );
+    }
+
+    #[test]
+    fn deleting_a_note_keeps_the_other_tabs_on_their_notes() {
+        let vault = reorderable();
+        let mut app = app(&vault);
+        for rel in ["Alpha.md", "Control.md", "Omega.md"] {
+            let id = app.index.id_of_rel(rel).unwrap();
+            app.open_note(id);
+        }
+        let alpha = app.index.id_of_rel("Alpha.md").unwrap();
+
+        app.delete_note(alpha).expect("delete");
+
+        assert_eq!(titled(&app), ["Control", "Omega"]);
     }
 }

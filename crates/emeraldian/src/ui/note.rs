@@ -282,13 +282,14 @@ fn draw_tab_bar(
             spans.push(Span::styled(format!(" {title}"), style));
         }
         // Obsidian marks an unsaved tab with a dot where the close button goes.
+        let modified = app.tab_marked_modified(index);
         spans.push(Span::styled(
-            if tab.is_modified() {
+            if modified {
                 format!(" {} ", icons::MODIFIED)
             } else {
                 "  ".to_string()
             },
-            style.fg(if tab.is_modified() {
+            style.fg(if modified {
                 palette.tab_modified
             } else {
                 palette.tab_inactive_fg

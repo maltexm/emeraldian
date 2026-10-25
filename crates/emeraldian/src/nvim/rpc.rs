@@ -244,6 +244,11 @@ impl Rpc {
         self.waker.clone()
     }
 
+    /// The process id of the child.
+    pub fn pid(&self) -> u32 {
+        lock(&self.child).id()
+    }
+
     /// Whether the channel is closed (nvim exited).
     pub fn is_closed(&self) -> bool {
         self.shared.closed.load(Ordering::Acquire)

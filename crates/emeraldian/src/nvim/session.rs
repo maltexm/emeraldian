@@ -13,7 +13,7 @@ use super::rpc::{Incoming, Rpc, Waker};
 use crate::config::EditorConfig;
 use anyhow::{Result, anyhow};
 use rmpv::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -87,6 +87,9 @@ pub struct Session {
     notes: Vec<String>,
     /// The index revision `notes` was built from.
     notes_revision: Option<u64>,
+    /// Buffers the bridge last reported as having unsaved edits, by canonical
+    /// path.
+    modified: HashSet<PathBuf>,
 }
 
 impl Session {
@@ -151,6 +154,7 @@ impl Session {
             pending_anchor: None,
             notes: Vec::new(),
             notes_revision: None,
+            modified: HashSet::new(),
         })
     }
 
@@ -350,6 +354,14 @@ impl Session {
                 // than guessed at.
                 Incoming::Notification { method, params } => {
                     if let Some(event) = bridge::parse_notification(&method, &params) {
+                        if let BridgeEvent::Modified(path, dirty) = &event {
+                            let path = canonical(path);
+                            if *dirty {
+                                self.modified.insert(path);
+                            } else {
+                                self.modified.remove(&path);
+                            }
+                        }
                         events.push(Event::Bridge(event));
                     }
                 }
@@ -407,25 +419,28 @@ impl Session {
 
     /// Whether the buffer for `path` has unsaved changes.
     ///
-    /// Read from nvim rather than cached: the answer has to be right at the
-    /// moment a write tool or a tab close asks, and the bridge that will push
-    /// these as notifications does not exist yet.
+    /// Asked of nvim rather than read from the reports of the bridge: this is
+    /// what a write tool, a tab close or a quit decides on, and a report can
+    /// trail a keystroke. When nvim cannot answer, the buffer counts as
+    /// modified — unless nvim is gone, which takes its buffers with it.
     pub fn is_modified(&self, path: &Path) -> bool {
-        self.buffer(path)
-            .and_then(|buffer| {
-                self.rpc
-                    .request(
-                        "nvim_get_option_value",
-                        vec![
-                            Value::from("modified"),
-                            Value::Map(vec![(Value::from("buf"), buffer)]),
-                        ],
-                        CALL,
-                    )
-                    .ok()
-            })
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false)
+        let Some(buffer) = self.buffer(path) else {
+            return false;
+        };
+        if self.exited.is_some() {
+            return false;
+        }
+        match self.rpc.request(
+            "nvim_get_option_value",
+            vec![
+                Value::from("modified"),
+                Value::Map(vec![(Value::from("buf"), buffer)]),
+            ],
+            CALL,
+        ) {
+            Ok(value) => value.as_bool().unwrap_or(true),
+            Err(_) => !self.rpc.is_closed(),
+        }
     }
 
     /// The buffer's text, unsaved edits included; `None` when nvim has not
@@ -456,6 +471,127 @@ impl Session {
         Some(text)
     }
 
+    /// The process id of the nvim child.
+    #[must_use]
+    pub fn pid(&self) -> u32 {
+        self.rpc.pid()
+    }
+
+    /// Whether the last `modified` report for `path` said it was dirty: cheap,
+    /// for drawing the tab bar. Anything that decides about data asks
+    /// [`Session::is_modified`] instead, because a report can trail a keystroke
+    /// by a few milliseconds.
+    #[must_use]
+    pub fn shows_modified(&self, path: &Path) -> bool {
+        self.modified.contains(&canonical(path))
+    }
+
+    /// Reload every buffer without unsaved edits whose file changed on disk.
+    ///
+    /// For after emeraldian or its assistant wrote a file: the buffer of a note
+    /// that is not being edited must show what is there now. A buffer with
+    /// unsaved edits is left alone (see `checktime` in `bridge.lua`).
+    pub fn checktime(&mut self) {
+        let _ = self.bridge_call("checktime", Vec::new());
+    }
+
+    /// The note at `from` was moved to `to` on disk: its buffer follows, with
+    /// unsaved edits (written to the new file) and its place in the text. The
+    /// old name is gone from nvim, so nothing can write the old file back.
+    ///
+    /// A path nvim has no buffer for is no error: there is nothing to move.
+    pub fn rename(&mut self, from: &Path, to: &Path) -> Result<()> {
+        let Some(buffer) = self.buffers.remove(&canonical(from)) else {
+            return Ok(());
+        };
+        let name = canonical(to);
+        let moved = self.bridge_call(
+            "rename_buffer",
+            vec![
+                buffer.clone(),
+                Value::from(name.to_string_lossy().into_owned()),
+            ],
+        );
+        if let Err(err) = moved {
+            // Whatever nvim did, it is still the same buffer.
+            self.buffers.insert(canonical(from), buffer);
+            return Err(err);
+        }
+        self.buffers.insert(name, buffer);
+        self.modified.remove(&canonical(from));
+        if self.shown.as_deref() == Some(from) {
+            self.shown = Some(to.to_path_buf());
+        }
+        if let Some((path, _)) = self.pending_anchor.as_mut()
+            && path == from
+        {
+            *path = to.to_path_buf();
+        }
+        Ok(())
+    }
+
+    /// Replace the buffer's text with `text` and write it. This is how a note
+    /// with unsaved edits gets its links rewritten: through the buffer, not
+    /// under it. A path nvim has no buffer for is left alone.
+    pub fn set_lines(&mut self, path: &Path, text: &str) -> Result<()> {
+        let Some(buffer) = self.buffer(path) else {
+            return Ok(());
+        };
+        let body = text.strip_suffix('\n').unwrap_or(text);
+        let lines: Vec<Value> = if text.is_empty() {
+            Vec::new()
+        } else {
+            body.split('\n').map(Value::from).collect()
+        };
+        self.bridge_call("set_lines", vec![buffer, Value::Array(lines)])?;
+        Ok(())
+    }
+
+    /// Write the buffer for `path`, if there is one. Fails the way `:w` does,
+    /// and when nvim stops to ask something (the file changed on disk since it
+    /// was read) the call times out with the question still on nvim's screen.
+    pub fn save(&mut self, path: &Path) -> Result<()> {
+        let Some(buffer) = self.buffer(path) else {
+            return Ok(());
+        };
+        self.bridge_call("save", vec![buffer])?;
+        Ok(())
+    }
+
+    /// Drop the buffer for `path`, so that opening the note reads the file
+    /// again. With `discard` unsaved edits go with it; without, they make this
+    /// fail and the buffer stays.
+    pub fn close(&mut self, path: &Path, discard: bool) -> Result<()> {
+        let key = canonical(path);
+        let Some(buffer) = self.buffers.get(&key).cloned() else {
+            return Ok(());
+        };
+        self.bridge_call("close_buffer", vec![buffer, Value::from(discard)])?;
+        self.buffers.remove(&key);
+        self.modified.remove(&key);
+        if self.shown.as_deref() == Some(path) {
+            // nvim moved its window to some other buffer.
+            self.shown = None;
+        }
+        Ok(())
+    }
+
+    /// The names of nvim's buffers, as nvim spells them.
+    #[must_use]
+    pub fn buffer_names(&self) -> Vec<PathBuf> {
+        self.bridge_call("buffer_names", Vec::new())
+            .ok()
+            .and_then(|names| {
+                names.as_array().map(|names| {
+                    names
+                        .iter()
+                        .filter_map(|name| name.as_str().map(PathBuf::from))
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    }
+
     /// Write every modified buffer.
     pub fn save_all(&mut self) -> Result<()> {
         self.request("nvim_command", vec![Value::from("wall")])?;
@@ -479,6 +615,24 @@ impl Session {
             return Err(anyhow!("nvim is not running"));
         }
         self.rpc.request(method, args, CALL)
+    }
+
+    /// A function of `bridge.lua`, called with `args`. Its errors come back as
+    /// the text the script raised, without nvim's `Lua:` prefix and traceback.
+    fn bridge_call(&self, function: &str, args: Vec<Value>) -> Result<Value> {
+        self.request(
+            "nvim_exec_lua",
+            vec![
+                Value::from(format!("return require('emeraldian').{function}(...)")),
+                Value::Array(args),
+            ],
+        )
+        .map_err(|err| {
+            let text = err.to_string();
+            let text = text.strip_prefix("Lua: ").unwrap_or(&text);
+            let text = text.split("\nstack traceback").next().unwrap_or(text);
+            anyhow!("{}", text.trim())
+        })
     }
 
     /// Note that nvim was handed work and owes the pane a redraw for it.
@@ -533,7 +687,16 @@ fn inject_bridge(rpc: &Rpc, vault_root: &Path, auto_save: bool) -> Result<()> {
 }
 
 /// The path as nvim knows it: resolved, so that `/tmp` and a symlinked `/tmp`
-/// are one buffer and not two.
+/// are one buffer and not two. A file that is gone (a note that was just moved)
+/// is resolved through its folder.
 fn canonical(path: &Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => std::fs::canonicalize(parent)
+            .map(|parent| parent.join(name))
+            .unwrap_or_else(|_| path.to_path_buf()),
+        _ => path.to_path_buf(),
+    }
 }
