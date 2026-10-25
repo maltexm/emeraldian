@@ -652,6 +652,46 @@ mod tests {
         assert_eq!(app.active().map(|tab| tab.mode), Some(Mode::Reading));
     }
 
+    /// `Ctrl+Shift+G` is the local graph in every view. In the nvim pane it
+    /// used to reach nvim as `<C-S-g>`, which nothing maps, so nothing happened.
+    #[test]
+    fn ctrl_shift_g_opens_the_local_graph_from_the_nvim_pane() {
+        use crate::app::View;
+
+        for (ch, label) in [('g', "Ctrl+Shift+g"), ('G', "Ctrl+Shift+G")] {
+            let Some((_vault, mut app)) = nvim_app() else {
+                return;
+            };
+            app.focus = Focus::Note;
+            draw(&mut app, 100, 30);
+            settle(&mut app, 100, 30, |app| row(app, 0).starts_with("# Alpha"));
+
+            // `Ctrl+G` alone is nvim's file info and must stay there.
+            keys::handle(
+                &mut app,
+                KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            );
+            assert_eq!(app.view, View::Notes, "plain Ctrl+G opened the graph");
+
+            keys::handle(
+                &mut app,
+                KeyEvent::new(
+                    KeyCode::Char(ch),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                ),
+            );
+
+            assert_eq!(app.view, View::Graph, "{label} did not open the graph");
+            let alpha = app.index.id_of_rel("Alpha.md").expect("indexed");
+            let graph = app.graph.as_ref().expect("graph built");
+            assert_eq!(
+                graph.local_root,
+                Some(alpha),
+                "{label} did not open the local graph of the open note"
+            );
+        }
+    }
+
     #[test]
     fn nvim_click_moves_the_cursor() {
         let Some((_vault, mut app)) = nvim_app() else {
