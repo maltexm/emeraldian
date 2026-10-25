@@ -1,0 +1,5 @@
+# Hermetic by default: the Obsidian CLI launches a real app window whenever none
+# is running, so tests and `cargo run` must never reach it. Not `force`d, so a
+# developer who really wants it can still `OBSIDIAN_CLI=/path/to/obsidian cargo run`.
+[env]
+OBSIDIAN_CLI = "off"
